@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
 import type { BatchDetail, CredentialSummary, UseCase } from '../lib/events';
 import { formatDuration } from '../lib/format';
+import { CredentialsPanel } from './CredentialsPanel';
 import { UseCaseSteps } from './UseCaseSteps';
 
 interface Props {
@@ -212,6 +213,13 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </div>
       )}
 
+      <Blockers
+        useCase={useCase}
+        blockedScripts={blockedScripts.length}
+        credentialCount={credentials.length}
+        vaultAvailable={vaultAvailable}
+      />
+
       <div className="filters" style={{ marginBottom: 16 }}>
         <button
           type="button"
@@ -309,28 +317,31 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       )}
 
       {mode !== 'review' && (
-        <div className="card">
-          <h3>Credentials</h3>
-          {!vaultAvailable && (
-            <div className="banner warn">
-              Credential storage is off because <code>CREDENTIALS_KEY</code> is not set in the
-              backend's environment. Set it and restart to sign in from a use case.
-            </div>
+        <>
+          <div className="card">
+            <h3>Sign in as</h3>
+            <select value={credentialId} onChange={(e) => setCredentialId(e.target.value)}>
+              <option value="">(no credential)</option>
+              {credentials.map((credential) => (
+                <option key={credential.id} value={credential.id}>
+                  {credential.name} — {credential.slots.join(', ')}
+                </option>
+              ))}
+            </select>
+            {missingSlots.length > 0 && (
+              <p className="hint" style={{ color: 'var(--danger)' }}>
+                This use case still needs: {missingSlots.join(', ')}. Add them below.
+              </p>
+            )}
+          </div>
+
+          {(missingSlots.length > 0 || credentials.length === 0 || !vaultAvailable) && (
+            <CredentialsPanel
+              requiredSlots={useCase.secrets.map((s) => s.name)}
+              onChange={load}
+            />
           )}
-          <select value={credentialId} onChange={(e) => setCredentialId(e.target.value)}>
-            <option value="">(no credential)</option>
-            {credentials.map((credential) => (
-              <option key={credential.id} value={credential.id}>
-                {credential.name} — {credential.slots.join(', ')}
-              </option>
-            ))}
-          </select>
-          {missingSlots.length > 0 && (
-            <p className="hint" style={{ color: 'var(--danger)' }}>
-              This use case still needs: {missingSlots.join(', ')}
-            </p>
-          )}
-        </div>
+        </>
       )}
 
       {mode === 'single' && (
@@ -494,6 +505,72 @@ function BatchProgressPanel({
           </p>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Everything standing between this use case and a batch, in one place.
+ *
+ * A draft that cannot be published, or a published one that cannot be run,
+ * is otherwise a dead end with no explanation: the buttons are simply
+ * disabled and nothing says why.
+ */
+function Blockers({
+  useCase,
+  blockedScripts,
+  credentialCount,
+  vaultAvailable,
+}: {
+  useCase: UseCase;
+  blockedScripts: number;
+  credentialCount: number;
+  vaultAvailable: boolean;
+}) {
+  const items: { text: string; fix: string }[] = [];
+
+  if (blockedScripts > 0) {
+    items.push({
+      text: `${blockedScripts} step(s) run raw JavaScript and are not enabled`,
+      fix: 'Read the code under "Steps", then choose "I have read the code — enable scripts".',
+    });
+  }
+  if (useCase.status === 'draft') {
+    items.push({
+      text: 'It is still a draft',
+      fix: 'Review the steps, then press Publish. Nothing runs a draft.',
+    });
+  }
+  if (useCase.secrets.length > 0 && !vaultAvailable) {
+    items.push({
+      text: 'It signs in, but credential storage is switched off in the backend',
+      fix: 'Set CREDENTIALS_KEY in .env and restart the backend. See "Credentials" below.',
+    });
+  } else if (useCase.secrets.length > 0 && credentialCount === 0) {
+    items.push({
+      text: `It needs credentials (${useCase.secrets.map((s) => s.name).join(', ')}) and none are stored`,
+      fix: 'Add one under "Run one" or "Run a file".',
+    });
+  }
+  if (useCase.setup_steps.concat(useCase.row_steps).every((s) => s.action !== 'assert')) {
+    items.push({
+      text: 'Nothing verifies that a row worked',
+      fix: 'Without an assertion a batch reports success even when a row silently did nothing.',
+    });
+  }
+
+  if (items.length === 0) return null;
+
+  return (
+    <div className="banner warn">
+      <strong>Before this can run</strong>
+      <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+        {items.map((item, index) => (
+          <li key={index} style={{ marginBottom: 4 }}>
+            {item.text}. <span style={{ opacity: 0.85 }}>{item.fix}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

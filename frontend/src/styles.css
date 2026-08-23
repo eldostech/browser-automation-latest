@@ -790,3 +790,17 @@ button.link.danger {
   color: var(--danger);
   margin-left: auto;
 }
+
+/* Setup instructions shown when the credential vault has no key. */
+.snippet {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  margin: 6px 0 0;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--text-dim);
+}
