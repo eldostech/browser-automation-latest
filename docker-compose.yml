@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# The backend image ships Node (for `npx @playwright/mcp`), Python, and the
+# Playwright browser binaries, because in stdio mode the MCP server is a child
+# process of the backend. Switch MCP_TRANSPORT=http and uncomment the `mcp`
+# service to run the browser in its own container instead.
+# ---------------------------------------------------------------------------
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+      DATABASE_PATH: /app/data/runs.db
+      ARTIFACTS_DIR: /app/artifacts
+      CORS_ORIGINS: http://localhost:5173,http://localhost:4173
+      # AWS credentials for Bedrock. These pass through from your shell when
+      # set and are simply absent otherwise, so the same file works for local
+      # keys, SSO, and an IAM task role (where none of them are needed).
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+      # Read-only mount of the host AWS config, so profiles and SSO caches work
+      # inside the container. Harmless when the directory does not exist, and
+      # unnecessary when the host uses an IAM role -- comment it out then.
+      - ~/.aws:/root/.aws:ro
+    # Chromium needs a bigger /dev/shm than Docker's 64MB default or it will
+    # crash on content-heavy pages.
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  # Optional: run the Playwright MCP server as its own service.
+  # Set MCP_TRANSPORT=http and MCP_SERVER_URL=http://mcp:8931/sse in .env.
+  # mcp:
+  #   image: mcr.microsoft.com/playwright:v1.49.0-noble
+  #   command: npx -y @playwright/mcp@latest --port 8931 --host 0.0.0.0 --headless --isolated
+  #   ports:
+  #     - "8931:8931"
+  #   shm_size: "1gb"

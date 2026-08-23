@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+.tools/
+*.tsbuildinfo
+
+# Runtime data
+data/
+artifacts/
+# Playwright MCP writes session output here when run with a relative output dir
+.playwright-mcp/
+backend/.playwright-mcp/
+.env
+*.db
+*.db-journal
+*.sqlite3
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

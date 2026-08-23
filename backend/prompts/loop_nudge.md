@@ -1,0 +1,1 @@
+You have now called $tool_name with identical arguments $repeats times and the page has not changed. Stop repeating this action. Take a fresh snapshot, try a different element, or explain why the task cannot be completed.

@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Requires Python 3.11+ (3.11, 3.12 and 3.13 are supported).
+#
+# Versions are bounded rather than hard-pinned: a lower bound for the APIs this
+# code actually uses, and an upper bound at the next major so a breaking
+# release cannot silently land. Run `make lock` after installing to produce
+# backend/requirements.lock.txt with exact versions for reproducible deploys.
+# ---------------------------------------------------------------------------
+
+# Web framework + server
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<0.1
+
+# Settings / validation
+pydantic>=2.8,<3.0
+pydantic-settings>=2.4,<3.0
+python-dotenv>=1.0,<2.0
+
+# Model Context Protocol client (stdio + SSE + streamable HTTP transports)
+mcp>=1.9,<2.0
+
+# LLM provider. The [bedrock] extra pulls in boto3/botocore for SigV4 signing
+# and AWS credential resolution. The floor is the version this project was
+# verified against -- AsyncAnthropicBedrockMantle does not exist in older ones.
+anthropic[bedrock]>=0.125,<1.0
+
+# Storage
+aiosqlite>=0.20,<1.0
+
+# HTTP client (used by the health probe and the tests)
+httpx>=0.27,<1.0
+
+# --- test-only -------------------------------------------------------------
+pytest>=8.0,<9.0
+pytest-asyncio>=0.24,<1.0
