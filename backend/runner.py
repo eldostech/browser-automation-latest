@@ -28,6 +28,7 @@ from events import (
     ApprovalRequired,
     ErrorEvent,
     RunFinished,
+    RunStarted,
     RunStatus,
     dump_event,
 )
@@ -35,7 +36,9 @@ from llm import LLMClient, build_llm
 from logging_setup import bind_run_id
 from mcp_client import MCPBrowserSession, MCPConfig, MCPConnectionError
 from redaction import NULL_REDACTOR, Redactor
+from replay import RowResult, UseCaseExecutor, emit_replay_error
 from store import Store
+from usecase import UseCase
 
 log = logging.getLogger(__name__)
 
@@ -466,3 +469,205 @@ class _TrackingSink:
         self, data: bytes, *, seq: int, mime: str = "image/png"
     ) -> tuple[str, str] | None:
         return await self._inner.save_screenshot(data, seq=seq, mime=mime)
+
+
+# ---------------------------------------------------------------------------
+# Use-case execution (no LLM)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionBusy(RuntimeError):
+    """Something already holds the single execution slot."""
+
+    def __init__(self, holder: dict[str, Any]) -> None:
+        super().__init__(
+            f"another use-case execution is already running ({holder.get('label')}). "
+            "One at a time: they share the browser."
+        )
+        self.holder = holder
+
+
+@dataclass(slots=True)
+class ExecutionRequest:
+    usecase: UseCase
+    version: int
+    inputs: dict[str, Any] = field(default_factory=dict)
+    secrets: dict[str, str] = field(default_factory=dict)
+    headless: bool | None = None
+    browser: str | None = None
+
+
+class ReplayManager:
+    """Runs stored use cases. Deliberately has no LLM client of any kind.
+
+    A single slot guards execution because every run drives a real browser and
+    the design settled on one at a time. Holding it explicitly -- and reporting
+    who holds it -- beats queueing invisibly or letting two runs fight over the
+    same session.
+    """
+
+    def __init__(self, store: Store, settings: Settings, bus: EventBus) -> None:
+        self.store = store
+        self.settings = settings
+        self.bus = bus
+        self._slot: dict[str, Any] | None = None
+        self._task: asyncio.Task | None = None
+
+    # -- the single slot ----------------------------------------------------
+    @property
+    def active(self) -> dict[str, Any] | None:
+        """What holds the execution slot, if anything."""
+        if self._task is not None and self._task.done():
+            self._slot = None
+            self._task = None
+        return self._slot
+
+    def _claim(self, label: str, **fields: Any) -> None:
+        holder = self.active
+        if holder is not None:
+            raise ExecutionBusy(holder)
+        self._slot = {"label": label, "started_at": _iso_now(), **fields}
+
+    def _release(self) -> None:
+        self._slot = None
+        self._task = None
+
+    async def cancel_active(self) -> bool:
+        if self._task is None or self._task.done():
+            return False
+        self._task.cancel()
+        return True
+
+    # -- single-row execution ----------------------------------------------
+    async def execute_once(self, request: ExecutionRequest) -> dict[str, Any]:
+        """Run setup plus one row, and return the outcome.
+
+        This is the same code path a batch uses, one row wide, so the two
+        cannot drift apart.
+        """
+        usecase = request.usecase
+        run_id = uuid.uuid4().hex
+        execution_id = uuid.uuid4().hex
+
+        self._claim(
+            f"{usecase.name} (single row)", run_id=run_id, usecase_id=usecase.id, rows=1
+        )
+        try:
+            await self.store.create_run(
+                run_id,
+                f"Replay: {usecase.name}",
+                None,
+                {"usecase_id": usecase.id, "version": request.version, "replay": True},
+            )
+            await self.store.create_execution(
+                execution_id,
+                usecase.id,
+                request.version,
+                run_id=run_id,
+                inputs=request.inputs,
+            )
+            await self.store.mark_started(run_id)
+
+            result = await self._drive(request, run_id)
+
+            await self.store.finish_execution(
+                execution_id,
+                "succeeded" if result.ok else "failed",
+                outputs=result.outputs,
+                failed_step_id=result.failed_step_id,
+                error=result.error,
+                duration_ms=result.duration_ms,
+            )
+            await self.store.finish_run(
+                run_id,
+                "succeeded" if result.ok else "failed",
+                steps=len(result.steps),
+                duration_ms=result.duration_ms,
+                summary=None if result.ok else result.error,
+                result={"outputs": result.outputs, "llm_tokens": 0},
+                error=result.error,
+            )
+            return {
+                "execution_id": execution_id,
+                "run_id": run_id,
+                "status": "succeeded" if result.ok else "failed",
+                **result.to_dict(),
+            }
+        finally:
+            self._release()
+
+    async def _drive(self, request: ExecutionRequest, run_id: str) -> RowResult:
+        """Open one session, run setup, run one row, tear down."""
+        redactor = Redactor(request.secrets.values())
+        sink = RunEventSink(run_id, self.store, self.bus, redactor=redactor)
+        mcp_config = MCPConfig.from_settings(
+            self.settings, headless=request.headless, browser=request.browser
+        )
+
+        await sink.emit(
+            RunStarted(
+                run_id=run_id,
+                seq=sink.reserve_seq(),
+                task=f"Replay: {request.usecase.name}",
+                options={
+                    "usecase_id": request.usecase.id,
+                    "version": request.version,
+                    "replay": True,
+                    "llm_calls": 0,
+                },
+            )
+        )
+
+        result = RowResult(ok=False, error="replay did not start")
+        try:
+            async with MCPBrowserSession(mcp_config) as mcp:
+                executor = UseCaseExecutor(
+                    request.usecase,
+                    mcp,
+                    sink,
+                    run_id=run_id,
+                    secrets=request.secrets,
+                    redactor=redactor,
+                    step_timeout=self.settings.replay_step_timeout,
+                )
+                setup = await executor.run_setup()
+                if not setup.ok:
+                    await emit_replay_error(
+                        sink, run_id, "setup_failed", setup.error or "setup failed"
+                    )
+                    result = setup
+                else:
+                    result = await executor.run_row(request.inputs)
+                    await executor.run_teardown()
+                    if not result.ok:
+                        await emit_replay_error(
+                            sink, run_id, "row_failed", result.error or "row failed"
+                        )
+        except MCPConnectionError as exc:
+            await emit_replay_error(sink, run_id, "mcp_unavailable", str(exc))
+            result = RowResult(ok=False, error=str(exc))
+        finally:
+            # Shielded like the agent's own finaliser: a cancelled replay must
+            # still close the run, or the dashboard's socket waits forever.
+            await asyncio.shield(
+                sink.emit(
+                    RunFinished(
+                        run_id=run_id,
+                        seq=sink.reserve_seq(),
+                        status="succeeded" if result.ok else "failed",
+                        steps=len(result.steps),
+                        duration_ms=result.duration_ms,
+                        summary="replay finished" if result.ok else None,
+                        # The number this whole feature exists to produce.
+                        result={"outputs": result.outputs, "llm_calls": 0, "llm_tokens": 0},
+                        error=result.error,
+                    )
+                )
+            )
+        return result
+
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()

@@ -112,6 +112,36 @@ class ApprovalResolved(BaseEvent):
     note: str | None = None
 
 
+class StepStarted(BaseEvent):
+    """A recorded use-case step is about to run. Replay only.
+
+    The agent loop emits ``thinking`` before acting; a replay has nothing to
+    think, so this is what gives the timeline something to show.
+    """
+
+    type: Literal["step_started"] = "step_started"
+    step: int
+    step_id: str
+    action: str
+    description: str = ""
+    phase: Literal["setup", "row", "reset", "teardown"] = "row"
+
+
+class StepFinished(BaseEvent):
+    type: Literal["step_finished"] = "step_finished"
+    step: int
+    step_id: str
+    ok: bool
+    duration_ms: int
+    #: Which rung of the locator ladder matched. Falling through to the later
+    #: rungs is the early warning that a site has drifted.
+    matched_locator: str | None = None
+    locator_rung: int | None = None
+    assertion: str | None = None
+    message: str = ""
+    skipped: bool = False
+
+
 class ErrorEvent(BaseEvent):
     type: Literal["error"] = "error"
     step: int | None = None
@@ -141,6 +171,8 @@ AgentEvent = Annotated[
         ToolCall,
         ToolResult,
         Screenshot,
+        StepStarted,
+        StepFinished,
         ApprovalRequired,
         ApprovalResolved,
         ErrorEvent,
@@ -157,6 +189,8 @@ EVENT_TYPES: tuple[str, ...] = (
     "tool_call",
     "tool_result",
     "screenshot",
+    "step_started",
+    "step_finished",
     "approval_required",
     "approval_resolved",
     "error",

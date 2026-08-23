@@ -86,10 +86,56 @@ CREATE TABLE IF NOT EXISTS usecase_versions (
     PRIMARY KEY (usecase_id, version)
 );
 
+-- Values are Fernet ciphertext; there is no code path that returns them over
+-- HTTP. See credentials.py.
+CREATE TABLE IF NOT EXISTS credentials (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    slots        TEXT NOT NULL DEFAULT '[]',
+    ciphertext   BLOB NOT NULL,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS batches (
+    id            TEXT PRIMARY KEY,
+    usecase_id    TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    status        TEXT NOT NULL,
+    total         INTEGER NOT NULL DEFAULT 0,
+    succeeded     INTEGER NOT NULL DEFAULT 0,
+    failed        INTEGER NOT NULL DEFAULT 0,
+    credential_id TEXT,
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    finished_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS executions (
+    id             TEXT PRIMARY KEY,
+    batch_id       TEXT,
+    usecase_id     TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    run_id         TEXT,
+    row_index      INTEGER,
+    inputs         TEXT NOT NULL DEFAULT '{}',
+    outputs        TEXT,
+    status         TEXT NOT NULL,
+    failed_step_id TEXT,
+    error          TEXT,
+    llm_calls      INTEGER NOT NULL DEFAULT 0,
+    llm_tokens     INTEGER NOT NULL DEFAULT 0,
+    duration_ms    INTEGER,
+    created_at     TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_run_seq ON events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_runs_status    ON runs (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run  ON artifacts (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_usecases_status ON usecases (status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_executions_batch ON executions (batch_id, row_index);
+CREATE INDEX IF NOT EXISTS idx_executions_usecase ON executions (usecase_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_batches_usecase ON batches (usecase_id, created_at DESC);
 """
 
 #: Schema revision this build expects. ``CREATE TABLE IF NOT EXISTS`` above
@@ -97,7 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_usecases_status ON usecases (status, updated_at D
 #: nothing when a table exists with an older shape -- so an ``ALTER`` or a
 #: backfill needs somewhere to hang. :data:`MIGRATIONS` is that place, and
 #: ``user_version`` records how far a given file has been brought forward.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: ``{target_version: (sql_statement, ...)}``, applied in ascending order to
 #: any database whose ``user_version`` is below the target. Statements must be
@@ -110,6 +156,8 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     # the entry exists to record that this database has been seen by a build
     # that knows about those tables.
     2: (),
+    # v3 adds credentials, batches and executions. Same reasoning as v2.
+    3: (),
 }
 
 ORPHAN_MESSAGE = "Backend restarted while this run was in flight."
@@ -542,6 +590,166 @@ class Store:
     async def delete_usecase(self, usecase_id: str) -> bool:
         """Archive rather than delete: a batch's history references the id."""
         return await self.set_usecase_status(usecase_id, "archived")
+
+
+    # -- credentials --------------------------------------------------------
+    async def save_credential(
+        self, credential_id: str, name: str, slots: list[str], ciphertext: bytes
+    ) -> str:
+        """Store an encrypted credential bundle. Re-saving a name replaces it.
+
+        Only ciphertext lands here; see ``credentials.py`` for why there is no
+        method to read a value back out over HTTP.
+        """
+        await self.db.execute(
+            "INSERT INTO credentials (id, name, slots, ciphertext, created_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET slots=excluded.slots,"
+            " ciphertext=excluded.ciphertext",
+            (credential_id, name, json.dumps(slots), ciphertext, _now()),
+        )
+        await self.db.commit()
+        async with self.db.execute("SELECT id FROM credentials WHERE name=?", (name,)) as cursor:
+            row = await cursor.fetchone()
+        return row["id"]
+
+    async def get_credential_ciphertext(self, credential_id: str) -> bytes | None:
+        async with self.db.execute(
+            "SELECT ciphertext FROM credentials WHERE id=?", (credential_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["ciphertext"] if row else None
+
+    async def list_credentials(self) -> list[dict[str, Any]]:
+        """Names and slot lists only -- never a value."""
+        async with self.db.execute(
+            "SELECT id, name, slots, created_at, last_used_at FROM credentials ORDER BY name"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "slots": _loads(row["slots"], []),
+                "created_at": row["created_at"],
+                "last_used_at": row["last_used_at"],
+            }
+            for row in rows
+        ]
+
+    async def touch_credential(self, credential_id: str) -> None:
+        await self.db.execute(
+            "UPDATE credentials SET last_used_at=? WHERE id=?", (_now(), credential_id)
+        )
+        await self.db.commit()
+
+    async def delete_credential(self, credential_id: str) -> bool:
+        cursor = await self.db.execute("DELETE FROM credentials WHERE id=?", (credential_id,))
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    # -- executions ---------------------------------------------------------
+    async def create_execution(
+        self,
+        execution_id: str,
+        usecase_id: str,
+        version: int,
+        *,
+        run_id: str | None = None,
+        batch_id: str | None = None,
+        row_index: int | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> None:
+        await self.db.execute(
+            "INSERT INTO executions (id, batch_id, usecase_id, version, run_id, row_index,"
+            " inputs, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                execution_id,
+                batch_id,
+                usecase_id,
+                version,
+                run_id,
+                row_index,
+                json.dumps(inputs or {}),
+                _now(),
+            ),
+        )
+        await self.db.commit()
+
+    async def finish_execution(
+        self,
+        execution_id: str,
+        status: str,
+        *,
+        outputs: dict[str, Any] | None = None,
+        failed_step_id: str | None = None,
+        error: str | None = None,
+        duration_ms: int | None = None,
+        llm_calls: int = 0,
+        llm_tokens: int = 0,
+    ) -> None:
+        await self.db.execute(
+            "UPDATE executions SET status=?, outputs=?, failed_step_id=?, error=?,"
+            " duration_ms=?, llm_calls=?, llm_tokens=? WHERE id=?",
+            (
+                status,
+                json.dumps(outputs) if outputs is not None else None,
+                failed_step_id,
+                error,
+                duration_ms,
+                llm_calls,
+                llm_tokens,
+                execution_id,
+            ),
+        )
+        await self.db.commit()
+
+    async def get_execution(self, execution_id: str) -> dict[str, Any] | None:
+        async with self.db.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_execution(row) if row else None
+
+    async def list_executions(
+        self, *, batch_id: str | None = None, usecase_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM executions"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if batch_id:
+            clauses.append("batch_id=?")
+            params.append(batch_id)
+        if usecase_id:
+            clauses.append("usecase_id=?")
+            params.append(usecase_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY COALESCE(row_index, 0) ASC, created_at ASC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_execution(row) for row in rows]
+
+    @staticmethod
+    def _row_to_execution(row: aiosqlite.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "batch_id": row["batch_id"],
+            "usecase_id": row["usecase_id"],
+            "version": row["version"],
+            "run_id": row["run_id"],
+            "row_index": row["row_index"],
+            "inputs": _loads(row["inputs"], {}),
+            "outputs": _loads(row["outputs"]),
+            "status": row["status"],
+            "failed_step_id": row["failed_step_id"],
+            "error": row["error"],
+            "llm_calls": row["llm_calls"],
+            "llm_tokens": row["llm_tokens"],
+            "duration_ms": row["duration_ms"],
+            "created_at": row["created_at"],
+        }
 
     # -- artifacts ----------------------------------------------------------
     async def save_artifact(

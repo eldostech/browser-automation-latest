@@ -27,12 +27,26 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent import RunOptions
 from config import Settings, settings
+from credentials import (
+    NO_KEY_MESSAGE,
+    Vault,
+    VaultError,
+    VaultUnavailable,
+    new_credential_id,
+)
 from distill import DistillationError, distill
 from events import TERMINAL_STATUSES, dump_event
 from llm import llm_health
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
-from runner import EventBus, RunManager, RunRequest
+from runner import (
+    EventBus,
+    ExecutionBusy,
+    ExecutionRequest,
+    ReplayManager,
+    RunManager,
+    RunRequest,
+)
 from store import Store
 from usecase import UseCase
 
@@ -130,6 +144,13 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.bus = EventBus()
     app.state.manager = RunManager(store, settings, bus=app.state.bus)
+    app.state.vault = Vault(settings.credentials_key or None)
+    app.state.replays = ReplayManager(store, settings, bus=app.state.bus)
+    if not app.state.vault.available:
+        log.warning(
+            "credential storage is disabled: CREDENTIALS_KEY is not set. "
+            "Use cases that need a login cannot be executed until it is."
+        )
     app.state.health = {"checked_at": 0.0, "result": None}
 
     # Probe MCP once at startup so the tool list is visible in the logs and
@@ -524,6 +545,176 @@ async def archive_usecase(
     if not await store.delete_usecase(usecase_id):
         raise HTTPException(status_code=404, detail="use case not found")
     return {"usecase_id": usecase_id, "status": "archived"}
+
+
+# ---------------------------------------------------------------------------
+# Credentials (write-only)
+# ---------------------------------------------------------------------------
+
+
+class CredentialRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    #: ``{slot: value}`` matching the use case's declared secrets. Write-only:
+    #: no endpoint returns these, and nothing in the dashboard needs them back.
+    values: dict[str, str] = Field(min_length=1)
+
+
+def get_vault(request: Request) -> Vault:
+    return request.app.state.vault
+
+
+def get_replays(request: Request) -> ReplayManager:
+    return request.app.state.replays
+
+
+@app.post("/api/credentials", status_code=201)
+async def create_credential(
+    body: CredentialRequest,
+    store: Store = Depends(get_store),
+    vault: Vault = Depends(get_vault),
+) -> dict[str, Any]:
+    if not vault.available:
+        raise HTTPException(status_code=503, detail=NO_KEY_MESSAGE)
+    try:
+        ciphertext = vault.seal(body.values)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    credential_id = await store.save_credential(
+        new_credential_id(), body.name, Vault.slots_of(body.values), ciphertext
+    )
+    log.info("stored a credential", extra={"credential_id": credential_id, "slots": len(body.values)})
+    return {"id": credential_id, "name": body.name, "slots": Vault.slots_of(body.values)}
+
+
+@app.get("/api/credentials")
+async def list_credentials(
+    store: Store = Depends(get_store), vault: Vault = Depends(get_vault)
+) -> dict[str, Any]:
+    """Names and slot lists. Never a value."""
+    return {"credentials": await store.list_credentials(), "vault_available": vault.available}
+
+
+@app.delete("/api/credentials/{credential_id}")
+async def delete_credential(
+    credential_id: str, store: Store = Depends(get_store)
+) -> dict[str, Any]:
+    if not await store.delete_credential(credential_id):
+        raise HTTPException(status_code=404, detail="credential not found")
+    return {"id": credential_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Executing a use case (zero LLM calls)
+# ---------------------------------------------------------------------------
+
+
+class ExecuteRequest(BaseModel):
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    #: Bind stored credentials by id, or pass values inline for a one-off.
+    credential_id: str | None = None
+    secrets: dict[str, str] | None = None
+    version: int | None = None
+    headless: bool | None = None
+    browser: str | None = None
+
+
+async def _resolve_secrets(
+    body: ExecuteRequest, store: Store, vault: Vault
+) -> dict[str, str]:
+    """Decrypt the bound credential, or take inline values for a one-off.
+
+    Whatever comes back is registered with the run's redactor before anything
+    is emitted, so a value cannot reach the event log even if a tool echoes it.
+    """
+    if body.credential_id:
+        ciphertext = await store.get_credential_ciphertext(body.credential_id)
+        if ciphertext is None:
+            raise HTTPException(status_code=404, detail="credential not found")
+        try:
+            values = vault.open(ciphertext)
+        except VaultUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except VaultError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await store.touch_credential(body.credential_id)
+        return {**values, **(body.secrets or {})}
+    return dict(body.secrets or {})
+
+
+@app.get("/api/executions/active")
+async def active_execution(replays: ReplayManager = Depends(get_replays)) -> dict[str, Any]:
+    """What holds the single execution slot, if anything."""
+    return {"active": replays.active}
+
+
+@app.post("/api/usecases/{usecase_id}/execute", status_code=201)
+async def execute_usecase(
+    usecase_id: str,
+    body: ExecuteRequest,
+    store: Store = Depends(get_store),
+    vault: Vault = Depends(get_vault),
+    replays: ReplayManager = Depends(get_replays),
+) -> dict[str, Any]:
+    """Run one input row against a stored use case. **No LLM call is made.**"""
+    definition = await store.get_usecase(usecase_id, body.version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+
+    try:
+        use_case = UseCase.model_validate(definition)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
+
+    if use_case.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"this use case is {use_case.status!r}. Review it and publish it before "
+                "running it -- a distilled recording is a best guess until a person has "
+                "checked it."
+            ),
+        )
+
+    secrets = await _resolve_secrets(body, store, vault)
+
+    missing_secrets = use_case.missing_secrets(secrets)
+    if missing_secrets:
+        raise HTTPException(
+            status_code=422,
+            detail=f"missing required credential slot(s): {', '.join(missing_secrets)}",
+        )
+
+    values = use_case.with_defaults(body.inputs)
+    missing_inputs = use_case.missing_inputs(values)
+    if missing_inputs:
+        raise HTTPException(
+            status_code=422,
+            detail=f"missing required input(s): {', '.join(missing_inputs)}",
+        )
+
+    try:
+        return await replays.execute_once(
+            ExecutionRequest(
+                usecase=use_case,
+                version=int(definition.get("version") or 1),
+                inputs=values,
+                secrets=secrets,
+                headless=body.headless,
+                browser=body.browser,
+            )
+        )
+    except ExecutionBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/usecases/{usecase_id}/executions")
+async def list_usecase_executions(
+    usecase_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    return {"executions": await store.list_executions(usecase_id=usecase_id, limit=limit)}
 
 
 @app.get("/api/artifacts/{artifact_id}")

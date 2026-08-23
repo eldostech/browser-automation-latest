@@ -108,6 +108,26 @@ class Settings(BaseSettings):
     # Oldest tool results are trimmed once history exceeds this many messages.
     agent_max_history_messages: int = 60
 
+    # --- Credentials -------------------------------------------------------
+    #: Fernet key encrypting stored credentials. Generate one with:
+    #:     python -c "from cryptography.fernet import Fernet;
+    #:                print(Fernet.generate_key().decode())"
+    #: Left unset, credential storage is DISABLED -- deliberately, rather than
+    #: falling back to writing passwords in the clear. Losing the key makes
+    #: existing stored credentials unreadable.
+    credentials_key: str = ""
+
+    # --- Replay ------------------------------------------------------------
+    #: Rows per batch run in sequence on one shared browser session; this is
+    #: the delay between them. Politeness, and it keeps a fast use case from
+    #: looking like a denial-of-service to the target site.
+    replay_row_delay_seconds: float = 0.3
+    #: Abort a batch after this many consecutive row failures. Ten minutes of a
+    #: broken selector failing 400 rows is worse than stopping and saying so.
+    replay_failure_streak_limit: int = 5
+    #: Per-step wall clock ceiling inside a replay.
+    replay_step_timeout: float = 30.0
+
     # --- Server ------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8000

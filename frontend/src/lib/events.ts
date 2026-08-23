@@ -69,6 +69,30 @@ export interface ScreenshotEvent extends BaseEvent {
   page_url: string | null;
 }
 
+/** Replay only. A recorded use-case step is about to run. */
+export interface StepStartedEvent extends BaseEvent {
+  type: 'step_started';
+  step: number;
+  step_id: string;
+  action: string;
+  description: string;
+  phase: 'setup' | 'row' | 'reset' | 'teardown';
+}
+
+export interface StepFinishedEvent extends BaseEvent {
+  type: 'step_finished';
+  step: number;
+  step_id: string;
+  ok: boolean;
+  duration_ms: number;
+  /** Which rung of the locator ladder matched; later rungs mean the site drifted. */
+  matched_locator: string | null;
+  locator_rung: number | null;
+  assertion: string | null;
+  message: string;
+  skipped: boolean;
+}
+
 export interface ApprovalRequiredEvent extends BaseEvent {
   type: 'approval_required';
   step: number;
@@ -115,6 +139,8 @@ export type AgentEvent =
   | ToolCallEvent
   | ToolResultEvent
   | ScreenshotEvent
+  | StepStartedEvent
+  | StepFinishedEvent
   | ApprovalRequiredEvent
   | ApprovalResolvedEvent
   | ErrorEvent
@@ -128,6 +154,8 @@ export const EVENT_TYPES: AgentEventType[] = [
   'tool_call',
   'tool_result',
   'screenshot',
+  'step_started',
+  'step_finished',
   'approval_required',
   'approval_resolved',
   'error',
