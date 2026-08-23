@@ -170,6 +170,22 @@ export const api = {
   activeExecution: () =>
     request<{ active: Record<string, unknown> | null }>('/api/executions/active'),
 
+  /**
+   * Mend a use case that failed, using the page as it was when it broke.
+   * One LLM call; the result is a new draft version awaiting review.
+   */
+  repairUseCase: (id: string, payload: { execution_id?: string; run_id?: string }) =>
+    request<{
+      usecase_id: string;
+      repaired: boolean;
+      version?: number;
+      diagnosis: string;
+      confidence: string;
+      applied?: string[];
+      unfixable_reason?: string;
+      llm_tokens: number;
+    }>(`/api/usecases/${id}/repair`, { method: 'POST', body: JSON.stringify(payload) }),
+
   // --- batches ---------------------------------------------------------------
 
   startBatch: (

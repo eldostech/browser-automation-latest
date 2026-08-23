@@ -35,6 +35,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
   const [batch, setBatch] = useState<BatchDetail | null>(null);
+  const [lastFailure, setLastFailure] = useState<{ execution_id: string; error: string } | null>(
+    null,
+  );
 
   const load = useCallback(async () => {
     try {
@@ -123,12 +126,18 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         credential_id: credentialId || null,
         headless: !watch,
       });
-      setNotice(
-        result.status === 'succeeded'
-          ? `Succeeded using ${result.llm_tokens} LLM tokens. Outputs: ${JSON.stringify(result.outputs)}`
-          : `Failed: ${result.error}`,
-      );
-      onOpenRun(result.run_id);
+      if (result.status === 'succeeded') {
+        setLastFailure(null);
+        setNotice(
+          `Succeeded using ${result.llm_tokens} LLM tokens. ` +
+            `Outputs: ${JSON.stringify(result.outputs)}`,
+        );
+        onOpenRun(result.run_id);
+        return;
+      }
+      // Stay on this screen when it fails: the repair button is here.
+      setLastFailure({ execution_id: result.execution_id, error: result.error ?? 'it failed' });
+      setError(`Failed: ${result.error}`);
     });
 
   const runBatch = () =>
@@ -148,6 +157,29 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const resumed = await api.resumeBatch(batch.batch.id, credentialId || null);
       setBatch(await api.getBatch(resumed.batch_id));
       setNotice(`Re-running ${resumed.rows} row(s) that had not succeeded.`);
+    });
+
+  const fixIt = (executionId?: string) =>
+    act(async () => {
+      const result = await api.repairUseCase(usecaseId, { execution_id: executionId });
+      if (!result.repaired) {
+        setError(
+          `${result.diagnosis} ${result.unfixable_reason ?? ''} ` +
+            `(${result.llm_tokens} tokens, ${result.confidence} confidence)`,
+        );
+        return;
+      }
+      setLastFailure(null);
+      setMode('review');
+      setNotice(
+        [
+          result.diagnosis,
+          ...(result.applied ?? []).map((line) => `• ${line}`),
+          `Saved as v${result.version}, back to draft for you to review. ` +
+            `${result.llm_tokens} tokens, ${result.confidence} confidence.`,
+        ].join('\n'),
+      );
+      await load();
     });
 
   const archive = () =>
@@ -225,8 +257,22 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </button>
       </div>
 
-      {error && <div className="banner error">{error}</div>}
-      {notice && <div className="banner">{notice}</div>}
+      {error && (
+        <div className="banner error">
+          <div style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
+          {lastFailure && (
+            <p style={{ margin: '8px 0 0' }}>
+              <button type="button" onClick={() => fixIt(lastFailure.execution_id)} disabled={busy}>
+                {busy ? 'Looking at it...' : 'Fix it with AI'}
+              </button>
+              <span className="hint" style={{ display: 'inline', marginLeft: 8 }}>
+                Reads the page as it was when it broke and proposes a repair. One LLM call.
+              </span>
+            </p>
+          )}
+        </div>
+      )}
+      {notice && <div className="banner" style={{ whiteSpace: 'pre-wrap' }}>{notice}</div>}
 
       {useCase.warnings.length > 0 && (
         <div className="banner warn">

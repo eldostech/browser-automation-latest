@@ -193,3 +193,21 @@ def test_reload_picks_up_an_edited_file(tmp_path, monkeypatch):
     # Leave the shared cache clean for the rest of the session.
     monkeypatch.undo()
     prompt_loader.reload()
+
+
+def test_a_prompt_may_use_a_placeholder_called_name():
+    """`render(name, /, ...)` — without positional-only, `$name` is unrenderable."""
+    import prompt_loader
+
+    assert prompt_loader.render("repair_request", **{
+        "name": "Book a demo",
+        "error": "e",
+        "failed_step": "s",
+        "failed_step_id": "s1",
+        "failed_action": "fill",
+        "wanted": "w",
+        "page_url": "u",
+        "allowed_domains": "d",
+        "steps": "x",
+        "candidates": "c",
+    }).startswith("Use case: Book a demo")

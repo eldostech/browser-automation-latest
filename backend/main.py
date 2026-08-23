@@ -40,6 +40,14 @@ from events import TERMINAL_STATUSES, dump_event
 from llm import llm_health
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
+from repair import (
+    RepairError,
+    UseCaseDoctor,
+    apply_fixes,
+    candidates,
+    gather_context,
+    validate_patched,
+)
 from runner import (
     BatchRequest,
     EventBus,
@@ -972,6 +980,113 @@ async def list_usecase_batches(
     usecase_id: str, store: Store = Depends(get_store)
 ) -> dict[str, Any]:
     return {"batches": await store.list_batches(usecase_id=usecase_id)}
+
+
+class RepairRequest(BaseModel):
+    """Which failure to mend. Either is enough to find the rest."""
+
+    execution_id: str | None = None
+    run_id: str | None = None
+
+
+@app.post("/api/usecases/{usecase_id}/repair", status_code=201)
+async def repair_usecase(
+    usecase_id: str,
+    body: RepairRequest,
+    store: Store = Depends(get_store),
+    manager: RunManager = Depends(get_manager),
+) -> dict[str, Any]:
+    """Mend a use case that failed, using the page as it was when it broke.
+
+    One LLM call. The result is saved as a new **draft** version -- existing
+    versions are untouched and a person publishes it, which is the same gate a
+    freshly distilled use case passes through.
+    """
+    definition = await store.get_usecase(usecase_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+
+    execution = await _find_failed_execution(usecase_id, body, store)
+    events = await store.get_events(execution["run_id"]) if execution.get("run_id") else []
+
+    try:
+        use_case = UseCase.model_validate({**definition, "status": "draft"})
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
+
+    context = gather_context(use_case, execution, events)
+    doctor = UseCaseDoctor(manager.llm)
+    try:
+        proposal = await doctor.diagnose(context)
+    except RepairError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if not proposal.actionable:
+        return {
+            "usecase_id": usecase_id,
+            "repaired": False,
+            "diagnosis": proposal.diagnosis,
+            "unfixable_reason": proposal.unfixable_reason
+            or "the model had no edit to suggest for this failure",
+            "confidence": proposal.confidence,
+            "llm_tokens": proposal.tokens,
+        }
+
+    patched, applied = apply_fixes(definition, proposal, candidates(context.snapshot))
+    try:
+        validate_patched(patched)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "the proposed repair does not produce a valid use case, so nothing was "
+                f"saved: {exc}"
+            ),
+        ) from exc
+
+    patched["status"] = "draft"
+    _, version = await store.save_usecase(patched, created_by="repair")
+    await store.set_usecase_status(usecase_id, "draft")
+
+    log.info(
+        "repaired a use case",
+        extra={"usecase_id": usecase_id, "version": version, "fixes": len(applied)},
+    )
+    return {
+        "usecase_id": usecase_id,
+        "repaired": True,
+        "version": version,
+        "diagnosis": proposal.diagnosis,
+        "confidence": proposal.confidence,
+        "applied": applied,
+        "llm_tokens": proposal.tokens,
+    }
+
+
+async def _find_failed_execution(
+    usecase_id: str, body: RepairRequest, store: Store
+) -> dict[str, Any]:
+    """The failure to repair: the one named, or the most recent."""
+    executions = await store.list_executions(usecase_id=usecase_id, limit=200)
+    if body.execution_id:
+        match = next((e for e in executions if e["id"] == body.execution_id), None)
+    elif body.run_id:
+        match = next((e for e in executions if e["run_id"] == body.run_id), None)
+    else:
+        match = next(
+            (e for e in sorted(executions, key=lambda e: e["created_at"], reverse=True)
+             if e["status"] == "failed"),
+            None,
+        )
+
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no failed run found for this use case; run it once so there is a failure to look at",
+        )
+    if match["status"] != "failed":
+        raise HTTPException(status_code=409, detail="that run did not fail, so there is nothing to repair")
+    return match
 
 
 @app.get("/api/artifacts/{artifact_id}")

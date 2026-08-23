@@ -73,6 +73,9 @@ RETRY_BACKOFF = (0.4, 1.2)
 #: How often an assertion re-checks while waiting for its timeout.
 POLL_INTERVAL = 0.5
 
+#: Cap on the page snapshot stored alongside a failure, for later repair.
+FAILURE_SNAPSHOT_CHARS = 12_000
+
 _URL_RE = re.compile(r"(?:Page URL|url)\s*:\s*(\S+)", re.IGNORECASE)
 _TITLE_RE = re.compile(r"Page Title:\s*(.*)", re.IGNORECASE)
 
@@ -356,6 +359,7 @@ class UseCaseExecutor:
             outcome.skipped = True
             return outcome
 
+        await self._record_failure_context(step.id, outcome.message)
         raise StepFailed(step.id, f"step {step.id!r} ({step.summary()}) failed: {outcome.message}")
 
     async def _heal(
@@ -825,6 +829,32 @@ class UseCaseExecutor:
             self._last_page_url = match.group(1)
         elif parsed.page_url:
             self._last_page_url = parsed.page_url
+
+    async def _record_failure_context(self, step_id: str, message: str) -> None:
+        """Persist the page as it was when a step failed.
+
+        Repairing a use case later needs to know what was actually on screen,
+        and the snapshots taken while resolving locators are internal -- they
+        never reach the event log. Recording one here means a repair can be
+        proposed from history alone, with no second browser session.
+        """
+        await self.sink.emit(
+            ErrorEvent(
+                run_id=self.run_id,
+                seq=self.sink.reserve_seq(),
+                step=self.step_number,
+                kind="step_failed",
+                message=self.redactor.text(message),
+                recoverable=True,
+                detail={
+                    "step_id": step_id,
+                    "page_url": self._last_page_url,
+                    # Capped: a huge page must not bloat the event log, and the
+                    # interactive nodes a repair needs are near the top.
+                    "snapshot": self.redactor.text(self._last_snapshot_text[:FAILURE_SNAPSHOT_CHARS]),
+                },
+            )
+        )
 
     async def _capture_failure(self) -> str | None:
         """Screenshot at the moment of failure. Never fails the row."""

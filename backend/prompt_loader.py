@@ -38,6 +38,8 @@ EMPTY_TOOL_RESULT = "empty_tool_result"
 DISTILL = "distill"
 HEAL = "heal"
 HEAL_REQUEST = "heal_request"
+REPAIR = "repair"
+REPAIR_REQUEST = "repair_request"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
@@ -52,6 +54,8 @@ REQUIRED_PROMPTS: tuple[str, ...] = (
     DISTILL,
     HEAL,
     HEAL_REQUEST,
+    REPAIR,
+    REPAIR_REQUEST,
 )
 
 _BLANK_RUN = re.compile(r"\n{3,}")
@@ -79,8 +83,13 @@ def load(name: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def render(name: str, **values: object) -> str:
+def render(name: str, /, **values: object) -> str:
     """Fill a prompt's ``$placeholders``.
+
+    ``name`` is positional-only on purpose: without it, a prompt containing a
+    ``$name`` placeholder could not be rendered at all, because the keyword
+    would collide with this parameter. That is a trap worth closing once here
+    rather than renaming placeholders around it forever.
 
     Runs of blank lines are collapsed to one, so an optional line that renders
     empty (``$start_url_line`` when there is no start URL) does not leave a

@@ -347,3 +347,128 @@ async def test_headless_defaults_to_the_server_setting(client: TestClient):
         assert "--headless" in seen[0].command_line()
     finally:
         runner_module.MCPBrowserSession = FakeReplaySession
+
+
+# --- repairing a failure instead of re-recording ---------------------------
+
+
+class RepairLLM:
+    """Proposes a fixed repair and counts the calls."""
+
+    model = "fake"
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    async def run_turn(self, *, system, messages, tools, on_text_delta=None, timeout=None):
+        self.calls += 1
+        from llm import LLMTurn, ToolCallRequest
+
+        return LLMTurn(
+            tool_calls=[ToolCallRequest(id="t1", name="propose_repair", input=self.payload)],
+            stop_reason="tool_use",
+            usage={"input_tokens": 800, "output_tokens": 40},
+        )
+
+
+BROKEN = {
+    **USE_CASE,
+    "id": "uc-broken",
+    "row_steps": [
+        {
+            "id": "s1",
+            "action": "click",
+            "description": "Submit button",
+            # Not on the signed-in page, so the row fails.
+            "locators": [{"strategy": "role", "role": "button", "name": "Nonexistent"}],
+        }
+    ],
+    "outputs": [],
+}
+
+
+async def test_a_failed_run_can_be_repaired_without_re_recording(client: TestClient):
+    store = client.app.state.store
+    usecase_id, _ = await store.save_usecase(BROKEN)
+
+    failure = client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"},
+              "secrets": {"username": "u", "password": "p"}},
+    ).json()
+    assert failure["status"] == "failed"
+
+    llm = RepairLLM(
+        {
+            "diagnosis": "The button is now called Submit.",
+            "confidence": "high",
+            # The candidate list is in document order: 0 is the "Welcome back"
+            # heading, 1 is the Submit button.
+            "fixes": [
+                {"kind": "replace_locator", "step_id": "s1", "element_index": 1,
+                 "reason": "same control, new label"}
+            ],
+        }
+    )
+    client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
+
+    repaired = client.post(
+        f"/api/usecases/{usecase_id}/repair", json={"execution_id": failure["execution_id"]}
+    )
+
+    assert repaired.status_code == 201, repaired.text
+    body = repaired.json()
+    assert body["repaired"] is True
+    assert body["llm_tokens"] == 840
+    assert llm.calls == 1, "one call to mend it"
+    assert any("s1" in line for line in body["applied"])
+
+    # Saved as a new draft version; the original is untouched and review is
+    # required before it can run again.
+    detail = client.get(f"/api/usecases/{usecase_id}").json()
+    assert detail["definition"]["status"] == "draft"
+    assert detail["definition"]["version"] == 2
+    assert detail["definition"]["row_steps"][0]["locators"][0]["name"] == "Submit"
+    assert detail["definition"]["row_steps"][0]["locators"][1]["name"] == "Nonexistent"
+    original = client.get(f"/api/usecases/{usecase_id}", params={"version": 1}).json()
+    assert original["definition"]["row_steps"][0]["locators"][0]["name"] == "Nonexistent"
+
+
+async def test_a_repair_the_model_declines_reports_why_and_changes_nothing(client: TestClient):
+    store = client.app.state.store
+    usecase_id, _ = await store.save_usecase({**BROKEN, "id": "uc-unfixable"})
+
+    failure = client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"},
+              "secrets": {"username": "u", "password": "p"}},
+    ).json()
+
+    client.app.state.manager._llm = RepairLLM(  # noqa: SLF001
+        {
+            "diagnosis": "The per-row work needs a value worked out from the page.",
+            "fixes": [],
+            "unfixable_reason": "this task needs reasoning on every row",
+            "confidence": "high",
+        }
+    )
+
+    body = client.post(
+        f"/api/usecases/{usecase_id}/repair", json={"execution_id": failure["execution_id"]}
+    ).json()
+
+    assert body["repaired"] is False
+    assert "reasoning on every row" in body["unfixable_reason"]
+    assert client.get(f"/api/usecases/{usecase_id}").json()["definition"]["version"] == 1
+
+
+async def test_repairing_with_no_failure_to_look_at_is_a_404(client: TestClient):
+    usecase_id = await seed(client)
+    response = client.post(f"/api/usecases/{usecase_id}/repair", json={})
+    assert response.status_code == 404
+    assert "no failed run" in response.json()["detail"]
+
+
+async def test_repairing_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.post("/api/usecases/nope/repair", json={}).status_code == 404
