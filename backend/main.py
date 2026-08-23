@@ -263,6 +263,20 @@ async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONRe
     db_ok = await store.ping()
     llm = llm_health(app_state.settings)
 
+    # A deep probe checks the models can actually be called. A model the
+    # account lacks otherwise only shows up one step into a run, as a 403.
+    if deep:
+        manager: RunManager = app_state.manager
+        roles = {
+            "driver": manager.llm,
+            "distiller": manager.distill_llm,
+            "repair": manager.repair_llm,
+        }
+        checks = await asyncio.gather(*(client.check_access() for client in roles.values()))
+        llm = {**llm, "access": dict(zip(roles, checks))}
+        if any(not check["ok"] for check in checks):
+            llm = {**llm, "configured": False}
+
     healthy = db_ok and llm["configured"] and mcp_result.get("ok") is not False
     body = {
         "status": "ok" if healthy else "degraded",

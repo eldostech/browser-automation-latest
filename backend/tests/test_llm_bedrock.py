@@ -333,3 +333,98 @@ def test_an_injected_client_serves_every_role(tmp_path):
     assert manager.llm is scripted
     assert manager.repair_llm is scripted
     assert manager.distill_llm is scripted
+
+
+# --- a model the account cannot use ----------------------------------------
+#
+# Regression: Bedrock returned 403 "anthropic.claude-sonnet-5 is not available
+# for this account" and the run died as "agent run crashed" with a traceback.
+# The message even names an ID the operator never typed -- the region prefix
+# of the inference profile is stripped -- so it reads like a wrong model ID.
+
+
+class _Boom(Exception):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _client(model: str = "us.anthropic.claude-sonnet-5"):
+    return build_llm(settings(llm_model=model))
+
+
+@pytest.mark.parametrize(
+    ("status", "expected", "names_model"),
+    [
+        # 403/404 are about the model, so the message names it. 401 is about
+        # the credentials, where naming the model would only mislead.
+        (403, "cannot use", True),
+        (404, "has no model", True),
+        (401, "credentials were rejected", False),
+    ],
+)
+def test_access_failures_become_an_actionable_error(status, expected, names_model):
+    from llm import LLMAccessError
+
+    translated = _client()._translate(_Boom(status, "provider detail"))  # noqa: SLF001
+    message = str(translated)
+
+    assert isinstance(translated, LLMAccessError)
+    assert expected in message
+    assert ("us.anthropic.claude-sonnet-5" in message) is names_model
+    assert "provider detail" in message, "keeps what the provider said"
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, None])
+def test_other_failures_are_passed_through_untouched(status):
+    from llm import LLMAccessError
+
+    original = _Boom(status, "something else") if status else ValueError("no status")
+    translated = _client()._translate(original)  # noqa: SLF001
+
+    assert translated is original
+    assert not isinstance(translated, LLMAccessError)
+
+
+async def test_check_access_reports_a_missing_model_without_raising(monkeypatch):
+    client = _client()
+
+    async def deny(**kwargs):
+        raise _Boom(403, "not available for this account")
+
+    monkeypatch.setattr(client._client.messages, "create", deny)  # noqa: SLF001
+    result = await client.check_access()
+
+    assert result["ok"] is False
+    assert result["access_problem"] is True
+    assert result["model"] == "us.anthropic.claude-sonnet-5"
+
+
+async def test_check_access_reports_success(monkeypatch):
+    client = _client()
+
+    async def allow(**kwargs):
+        return object()
+
+    monkeypatch.setattr(client._client.messages, "create", allow)  # noqa: SLF001
+    assert (await client.check_access())["ok"] is True
+
+
+async def test_a_run_fails_cleanly_rather_than_crashing(spec, mcp, sink):
+    """The run must report a configuration problem, not 'agent run crashed'."""
+    from agent import BrowserAgent
+    from conftest import AutoApprovalGate
+    from llm import LLMAccessError
+
+    class DeniedLLM:
+        model = "us.anthropic.claude-sonnet-5"
+
+        async def run_turn(self, **kwargs):
+            raise LLMAccessError("this account cannot use 'us.anthropic.claude-sonnet-5'")
+
+    outcome = await BrowserAgent(spec, mcp, DeniedLLM(), sink, AutoApprovalGate()).run()
+
+    assert outcome.status == "failed"
+    assert "cannot use" in outcome.error
+    errors = sink.of_type("error")
+    assert errors and errors[-1].kind == "llm_unavailable", "not 'internal_error'"

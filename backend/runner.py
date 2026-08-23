@@ -34,7 +34,7 @@ from events import (
     RunStatus,
     dump_event,
 )
-from llm import LLMClient, build_llm
+from llm import LLMAccessError, LLMClient, build_llm
 from logging_setup import bind_run_id
 from mcp_client import MCPBrowserSession, MCPConfig, MCPConnectionError
 from redaction import NULL_REDACTOR, Redactor
@@ -380,7 +380,7 @@ class RunManager:
         except asyncio.CancelledError:
             cancelled = True
             log.info("run cancelled")
-        except MCPConnectionError as exc:
+        except (MCPConnectionError, LLMAccessError) as exc:
             outcome = AgentOutcome(
                 status="failed",
                 steps=agent.step if agent else 0,
@@ -391,7 +391,11 @@ class RunManager:
                 ErrorEvent(
                     run_id=run_id,
                     seq=sink.reserve_seq(),
-                    kind="mcp_unavailable",
+                    kind=(
+                        "llm_unavailable"
+                        if isinstance(exc, LLMAccessError)
+                        else "mcp_unavailable"
+                    ),
                     message=str(exc),
                     recoverable=False,
                 )

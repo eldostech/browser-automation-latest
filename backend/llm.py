@@ -31,6 +31,20 @@ log = logging.getLogger(__name__)
 
 TextDeltaHandler = Callable[[str], Awaitable[None]]
 
+
+class LLMAccessError(RuntimeError):
+    """The configured model cannot be used: no access, no such model, bad key.
+
+    A configuration problem wearing a provider exception's clothes. Raised as
+    its own type so a run fails with something an operator can act on, instead
+    of the generic "agent run crashed" and a stack trace ending in a 403.
+    """
+
+
+#: Provider status codes that mean "your configuration is wrong", not "the
+#: request was bad" -- retrying cannot help, and the fix is in .env.
+_ACCESS_STATUSES = frozenset({401, 403, 404})
+
 #: Environment variable holding a Bedrock API key (bearer token). When it is
 #: set, the Anthropic SDK authenticates with it *instead of* SigV4 -- and
 #: rejects the request outright if AWS credential arguments are also passed.
@@ -117,15 +131,18 @@ class _MessagesAPILLM:
         if timeout is not None:
             kwargs["timeout"] = timeout
 
-        async with self._client.messages.stream(**kwargs) as stream:
-            async for event in stream:
-                if (
-                    on_text_delta is not None
-                    and event.type == "content_block_delta"
-                    and getattr(event.delta, "type", None) == "text_delta"
-                ):
-                    await on_text_delta(event.delta.text)
-            final = await stream.get_final_message()
+        try:
+            async with self._client.messages.stream(**kwargs) as stream:
+                async for event in stream:
+                    if (
+                        on_text_delta is not None
+                        and event.type == "content_block_delta"
+                        and getattr(event.delta, "type", None) == "text_delta"
+                    ):
+                        await on_text_delta(event.delta.text)
+                final = await stream.get_final_message()
+        except Exception as exc:  # noqa: BLE001 - re-raised, narrowed below
+            raise self._translate(exc) from exc
 
         text_parts: list[str] = []
         tool_calls: list[ToolCallRequest] = []
@@ -161,8 +178,53 @@ class _MessagesAPILLM:
             usage=usage,
         )
 
+    def _translate(self, exc: Exception) -> Exception:
+        """Turn a provider access failure into something an operator can fix.
+
+        Bedrock's own wording -- "anthropic.claude-sonnet-5 is not available
+        for this account" -- names a model ID the operator never typed (the
+        region prefix is stripped), arrives as a traceback, and says nothing
+        about which of three configured models it was or where to change it.
+        """
+        status = getattr(exc, "status_code", None)
+        if status not in _ACCESS_STATUSES:
+            return exc
+
+        detail = str(exc)
+        if status == 404:
+            reason = f"the provider has no model {self.model!r}"
+        elif status == 401:
+            reason = "the credentials were rejected"
+        else:
+            reason = f"this account cannot use {self.model!r}"
+
+        return LLMAccessError(
+            f"{reason} on {self.provider}. Nothing will run until the model or the "
+            f"credentials change. Provider said: {detail[:300]}"
+        )
+
     def describe(self) -> dict[str, Any]:
         return {"provider": self.provider, "model": self.model}
+
+    async def check_access(self) -> dict[str, Any]:
+        """Can this client actually call its model? One tiny request.
+
+        Used by the deep health probe so an unusable model is found before a
+        run rather than one step into one.
+        """
+        try:
+            await self._client.messages.create(
+                model=self.model, max_tokens=1, messages=[{"role": "user", "content": "hi"}]
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe must never raise
+            translated = self._translate(exc)
+            return {
+                "model": self.model,
+                "ok": False,
+                "access_problem": isinstance(translated, LLMAccessError),
+                "error": str(translated)[:300],
+            }
+        return {"model": self.model, "ok": True}
 
 
 # ---------------------------------------------------------------------------

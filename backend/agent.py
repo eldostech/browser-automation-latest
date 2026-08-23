@@ -43,7 +43,7 @@ from events import (
     ToolCall,
     ToolResult,
 )
-from llm import LLMClient, ToolCallRequest
+from llm import LLMAccessError, LLMClient, ToolCallRequest
 from mcp_client import MCPBrowserSession, MCPConnectionError, MCPToolError
 from policy import Decision, check_navigation, classify
 from prompt_loader import (
@@ -219,6 +219,9 @@ class BrowserAgent:
             return await self._fail("loop_detected", str(exc))
         except PolicyViolation as exc:
             return await self._fail("allowlist_blocked", str(exc))
+        except LLMAccessError as exc:
+            # A configuration problem, not a crash. Say so plainly.
+            return await self._fail("llm_unavailable", str(exc))
         except MCPConnectionError as exc:
             return await self._fail("mcp_unavailable", str(exc))
         except Exception as exc:  # noqa: BLE001 - anything else fails the run cleanly
