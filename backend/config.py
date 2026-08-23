@@ -55,11 +55,31 @@ class Settings(BaseSettings):
     #: "bedrock" (AWS credential chain, no API key) or "anthropic" (API key).
     llm_provider: Literal["bedrock", "anthropic"] = "bedrock"
 
-    #: On Bedrock this must be a Bedrock model ID. Current Claude models are
-    #: only offered through cross-region inference profiles, so the ID carries
-    #: a region prefix ("us." / "eu." / "apac." / "global."). Invoking the bare
-    #: foundation-model ID fails with "on-demand throughput isn't supported".
-    llm_model: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    #: The DRIVER model: the agent loop that records a use case by actually
+    #: driving the browser. Every step of a recording costs tokens here, so it
+    #: is the one worth keeping fast.
+    #:
+    #: On Bedrock this must be a Bedrock model ID. With BEDROCK_API=invoke,
+    #: current Claude models are only offered through cross-region inference
+    #: profiles, so the ID carries a region prefix ("us." / "eu." / "apac." /
+    #: "global."). Invoking the bare foundation-model ID fails with
+    #: "on-demand throughput isn't supported". With BEDROCK_API=mantle the ID
+    #: is the short "anthropic.claude-sonnet-5" form instead.
+    llm_model: str = "us.anthropic.claude-sonnet-5"
+
+    #: The REPAIR model: self-healing mid-run, and repairing a failed use case
+    #: afterwards. Both are one-shot judgement calls on a page the model has
+    #: never seen, run rarely, where a wrong answer gets written back into a
+    #: use case and then repeats silently on every future row -- so they are
+    #: worth more capability than the driver.
+    llm_repair_model: str = "us.anthropic.claude-opus-5"
+
+    #: The DISTILLER model: the single call that turns a recording into a use
+    #: case. Blank means "use the driver model". Split out because it is one
+    #: call per use case rather than per step, so it can be pointed at a
+    #: stronger model without materially changing cost.
+    llm_distill_model: str = ""
+
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
 
@@ -175,6 +195,20 @@ class Settings(BaseSettings):
     @property
     def extra_mcp_args(self) -> list[str]:
         return self.mcp_extra_args.split() if self.mcp_extra_args else []
+
+    @property
+    def distill_model(self) -> str:
+        """Model for the one distillation call. Falls back to the driver."""
+        return self.llm_distill_model.strip() or self.llm_model
+
+    @property
+    def models_in_use(self) -> dict[str, str]:
+        """Which model does what. Surfaced by /healthz and /api/config."""
+        return {
+            "driver": self.llm_model,
+            "distiller": self.distill_model,
+            "repair": self.llm_repair_model,
+        }
 
     def resolve_npx(self) -> str:
         """Absolute path to npx.

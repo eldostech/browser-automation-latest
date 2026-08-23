@@ -76,17 +76,17 @@ def test_bedrock_is_the_default_provider():
     assert Settings().llm_provider == "bedrock"
 
 
-def test_default_model_is_an_inference_profile_not_a_bare_model_id():
-    """Current Claude models on Bedrock are inference-profile only.
+@pytest.mark.parametrize("field", ["llm_model", "llm_repair_model"])
+def test_default_models_are_inference_profiles_not_bare_model_ids(field):
+    """With BEDROCK_API=invoke, current Claude models are profile-only.
 
     The bare foundation-model ID is rejected at invoke time with
-    "on-demand throughput isn't supported", so the default must carry a
-    region prefix.
+    "on-demand throughput isn't supported", so every default must carry a
+    region prefix. `_env_file=None` so this asserts on the code rather than on
+    whatever the operator happens to have configured.
     """
-    model = Settings().llm_model
-    assert "haiku" in model
+    model = getattr(Settings(_env_file=None), field)
     assert model.startswith(("us.", "eu.", "apac.", "global.")), model
-    assert model.endswith("-v1:0"), model
 
 
 def test_no_api_key_is_required_for_bedrock(monkeypatch):
@@ -258,3 +258,78 @@ def test_both_providers_satisfy_the_llm_client_protocol():
         assert isinstance(llm.model, str) and llm.model
         assert callable(llm.run_turn)
         assert isinstance(llm.describe(), dict)
+
+
+# --- one process, three models ---------------------------------------------
+#
+# The driver runs on every step of a recording, so it is the one worth keeping
+# fast. Repair is rare, one-shot, and its answers get written back into a use
+# case -- so it is worth more capability.
+
+
+def test_the_three_roles_have_their_own_models():
+    s = Settings(_env_file=None)
+    assert s.llm_model == "us.anthropic.claude-sonnet-5"
+    assert s.llm_repair_model == "us.anthropic.claude-opus-5"
+    assert s.models_in_use == {
+        "driver": "us.anthropic.claude-sonnet-5",
+        "distiller": "us.anthropic.claude-sonnet-5",
+        "repair": "us.anthropic.claude-opus-5",
+    }
+
+
+def test_the_distiller_follows_the_driver_unless_told_otherwise():
+    assert Settings(_env_file=None).distill_model == "us.anthropic.claude-sonnet-5"
+    pinned = Settings(_env_file=None, llm_distill_model="us.anthropic.claude-opus-5")
+    assert pinned.distill_model == "us.anthropic.claude-opus-5"
+    assert pinned.llm_model == "us.anthropic.claude-sonnet-5", "the driver is unaffected"
+
+
+def test_a_blank_distill_model_falls_back_rather_than_being_used():
+    assert Settings(_env_file=None, llm_distill_model="   ").distill_model == (
+        "us.anthropic.claude-sonnet-5"
+    )
+
+
+def test_build_llm_takes_a_model_override():
+    driver = build_llm(settings())
+    repair = build_llm(settings(), "us.anthropic.claude-opus-5")
+
+    assert driver.model == settings().llm_model
+    assert repair.model == "us.anthropic.claude-opus-5"
+    assert isinstance(repair, BedrockLLM)
+
+
+def test_health_reports_every_role():
+    health = llm_health(settings())
+    assert health["model"] == settings().llm_model, "unchanged for old consumers"
+    assert health["models"]["driver"] == settings().llm_model
+    assert health["models"]["repair"] == "us.anthropic.claude-opus-5"
+
+
+def test_the_manager_builds_a_different_client_per_role(tmp_path):
+    from runner import EventBus, RunManager
+    from store import Store
+
+    config = settings()
+    manager = RunManager(Store(tmp_path / "x.db", tmp_path / "a"), config, EventBus())
+
+    assert manager.llm.model == config.llm_model
+    assert manager.repair_llm.model == "us.anthropic.claude-opus-5"
+    assert manager.distill_llm.model == config.llm_model
+    assert manager.llm.model != manager.repair_llm.model, "different clients, different models"
+    assert manager.repair_llm is manager.repair_llm, "built once and cached"
+
+
+def test_an_injected_client_serves_every_role(tmp_path):
+    """So a scripted model in a test still covers all three."""
+    from runner import EventBus, RunManager
+    from store import Store
+
+    scripted = object()
+    manager = RunManager(
+        Store(tmp_path / "x.db", tmp_path / "a"), settings(), EventBus(), llm=scripted
+    )
+    assert manager.llm is scripted
+    assert manager.repair_llm is scripted
+    assert manager.distill_llm is scripted

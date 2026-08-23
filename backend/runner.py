@@ -213,17 +213,49 @@ class RunManager:
         self.store = store
         self.settings = settings
         self.bus = bus or EventBus()
+        #: An explicit override, when one is supplied. It serves EVERY role,
+        #: so a test that scripts one client still covers all three.
         self._llm = llm
+        #: Lazily built, one per role. Kept separate from `_llm` -- building
+        #: the driver into that slot would have silently made every other role
+        #: return the driver.
+        self._driver_llm: LLMClient | None = None
+        self._distill_llm: LLMClient | None = None
+        self._repair_llm: LLMClient | None = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._approvals: dict[str, dict[str, PendingApproval]] = {}
         self._pending_events: dict[str, ApprovalRequired] = {}
 
     # -- llm ----------------------------------------------------------------
+    #
+    # Three roles, built lazily and cached. A test that injects `_llm` gets
+    # that client for every role, so a scripted model still covers all of them.
     @property
     def llm(self) -> LLMClient:
-        if self._llm is None:
-            self._llm = build_llm(self.settings)
-        return self._llm
+        """The driver: the agent loop that records a use case."""
+        if self._llm is not None:
+            return self._llm
+        if self._driver_llm is None:
+            self._driver_llm = build_llm(self.settings)
+        return self._driver_llm
+
+    @property
+    def distill_llm(self) -> LLMClient:
+        """The single call that turns a recording into a use case."""
+        if self._llm is not None:
+            return self._llm
+        if self._distill_llm is None:
+            self._distill_llm = build_llm(self.settings, self.settings.distill_model)
+        return self._distill_llm
+
+    @property
+    def repair_llm(self) -> LLMClient:
+        """Self-healing mid-run, and repairing a failed use case afterwards."""
+        if self._llm is not None:
+            return self._llm
+        if self._repair_llm is None:
+            self._repair_llm = build_llm(self.settings, self.settings.llm_repair_model)
+        return self._repair_llm
 
     # -- defaults -----------------------------------------------------------
     def default_options(self) -> RunOptions:

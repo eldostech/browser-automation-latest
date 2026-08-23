@@ -138,7 +138,7 @@ async def lifespan(app: FastAPI):
         "starting backend",
         extra={
             "llm_provider": settings.llm_provider,
-            "model": settings.llm_model,
+            "models": settings.models_in_use,
             "mcp_transport": settings.mcp_transport,
             "allowed_domains": settings.agent_allowed_domains,
         },
@@ -158,7 +158,7 @@ async def lifespan(app: FastAPI):
     # The healer is the only route from a replay to a model, and it is handed
     # over lazily and only when healing is switched on.
     app.state.replays = ReplayManager(
-        store, settings, bus=app.state.bus, llm_factory=lambda: app.state.manager.llm
+        store, settings, bus=app.state.bus, llm_factory=lambda: app.state.manager.repair_llm
     )
     if not app.state.vault.available:
         log.warning(
@@ -295,6 +295,7 @@ async def get_config(settings_dep: Settings = Depends(get_settings_dep)) -> dict
             "browser": settings_dep.mcp_browser,
         },
         "model": settings_dep.llm_model,
+        "models": settings_dep.models_in_use,
         "provider": settings_dep.llm_provider,
         "transport": settings_dep.mcp_transport,
     }
@@ -459,7 +460,9 @@ async def distill_run(
 
     events = await store.get_events(run_id)
     try:
-        use_case = await distill(events, task=run.task, llm=manager.llm, source_run_id=run_id)
+        use_case = await distill(
+            events, task=run.task, llm=manager.distill_llm, source_run_id=run_id
+        )
     except DistillationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValidationError as exc:
@@ -1015,7 +1018,7 @@ async def repair_usecase(
         raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
 
     context = gather_context(use_case, execution, events)
-    doctor = UseCaseDoctor(manager.llm)
+    doctor = UseCaseDoctor(manager.repair_llm)
     try:
         proposal = await doctor.diagnose(context)
     except RepairError as exc:

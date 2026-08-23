@@ -368,7 +368,13 @@ def llm_health(settings: Any) -> dict[str, Any]:
     without calling AWS, so ``/healthz`` stays safe to poll.
     """
     provider = (settings.llm_provider or "bedrock").lower()
-    base: dict[str, Any] = {"provider": provider, "model": settings.llm_model}
+    base: dict[str, Any] = {
+        "provider": provider,
+        # `model` stays the driver, so existing consumers keep working.
+        "model": settings.llm_model,
+        # Which model does what -- three roles can differ.
+        "models": getattr(settings, "models_in_use", {"driver": settings.llm_model}),
+    }
 
     if provider == "bedrock":
         auth = bedrock_auth_status(settings.aws_profile)
@@ -386,13 +392,19 @@ def llm_health(settings: Any) -> dict[str, Any]:
     return {**base, "configured": False, "error": f"unknown provider {provider!r}"}
 
 
-def build_llm(settings: Any) -> LLMClient:
-    """Construct the configured provider. Add new providers here."""
+def build_llm(settings: Any, model: str | None = None) -> LLMClient:
+    """Construct the configured provider. Add new providers here.
+
+    ``model`` overrides ``settings.llm_model`` so one process can run several
+    models at once -- a fast driver for the agent loop, a more capable one for
+    the rare repair calls -- without a second Settings object.
+    """
     provider = (settings.llm_provider or "bedrock").lower()
+    model = model or settings.llm_model
 
     if provider == "bedrock":
         return BedrockLLM(
-            model=settings.llm_model,
+            model=model,
             max_tokens=settings.llm_max_tokens,
             temperature=settings.llm_temperature,
             region=settings.aws_region,
@@ -403,7 +415,7 @@ def build_llm(settings: Any) -> LLMClient:
     if provider == "anthropic":
         return AnthropicLLM(
             api_key=settings.anthropic_api_key,
-            model=settings.llm_model,
+            model=model,
             max_tokens=settings.llm_max_tokens,
             temperature=settings.llm_temperature,
         )
