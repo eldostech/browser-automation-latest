@@ -35,6 +35,7 @@ LOOP_NUDGE = "loop_nudge"
 APPROVAL_REJECTED = "approval_rejected"
 NAVIGATION_BLOCKED = "navigation_blocked"
 EMPTY_TOOL_RESULT = "empty_tool_result"
+DISTILL = "distill"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
@@ -46,6 +47,7 @@ REQUIRED_PROMPTS: tuple[str, ...] = (
     APPROVAL_REJECTED,
     NAVIGATION_BLOCKED,
     EMPTY_TOOL_RESULT,
+    DISTILL,
 )
 
 _BLANK_RUN = re.compile(r"\n{3,}")

@@ -1,0 +1,289 @@
+"""The use-case HTTP surface: distil a run, review it, publish it.
+
+Uses the real FastAPI app with a scripted LLM, so the "exactly one model call"
+guarantee is exercised through the endpoint rather than only in unit tests.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from conftest import FakeMCPSession, ScriptedLLM
+from llm import LLMTurn, ToolCallRequest
+
+# Reuse the app fixture wiring from the main API tests.
+from test_api import FakeMCPBrowserSession, _fake_probe  # noqa: F401
+
+SNAPSHOT = """### Page
+- Page URL: https://example.com/signin
+### Snapshot
+```yaml
+- textbox "Username" [ref=e1]
+- textbox "Password" [ref=e2]
+- button "Sign in" [ref=e3]
+```"""
+
+# Step ids are `s<original step number>`, so they carry gaps where the
+# pre-filter dropped observation-only calls -- s2 was the snapshot. The model
+# only ever sees the surviving ids, so it cannot reference a gap.
+PLAN = {
+    "name": "Sign in and open a record",
+    "description": "Signs in once, then opens one record per row.",
+    "inputs": [{"name": "record_url", "type": "url"}],
+    "secrets": [{"name": "username"}, {"name": "password"}],
+    "setup_step_ids": ["s1", "s3", "s4"],
+    "row_step_ids": ["s5"],
+    "values": {"s3.Username": "{{secret.username}}", "s3.Password": "{{secret.password}}"},
+    "urls": {"s5": "{{input.record_url}}"},
+    "assertions": [
+        {"after_step_id": "s4", "kind": "url_contains", "value": "/signin", "negate": True}
+    ],
+    "session_check": {"kind": "url_contains", "value": "/signin", "negate": True},
+    "row_reset_url": "{{input.record_url}}",
+}
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    import main
+    import runner as runner_module
+
+    monkeypatch.setattr(main.settings, "database_path", str(tmp_path / "api.db"))
+    monkeypatch.setattr(main.settings, "artifacts_dir", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(main.settings, "llm_provider", "anthropic")
+    monkeypatch.setattr(main.settings, "anthropic_api_key", "test-key-not-used")
+    monkeypatch.setattr(main.settings, "agent_allowed_domains", ["example.com"])
+    monkeypatch.setattr(main, "probe", _fake_probe)
+    monkeypatch.setattr(runner_module, "MCPBrowserSession", FakeMCPBrowserSession)
+
+    with TestClient(main.app) as test_client:
+        yield test_client
+
+
+class PlanLLM:
+    """Answers a distillation request with a fixed plan; counts the calls."""
+
+    model = "fake"
+
+    def __init__(self, plan: dict | None = PLAN) -> None:
+        self.plan = plan
+        self.calls = 0
+
+    async def run_turn(self, *, system, messages, tools, on_text_delta=None, timeout=None):
+        self.calls += 1
+        if self.plan is None:
+            return LLMTurn(text="no idea")
+        return LLMTurn(
+            tool_calls=[ToolCallRequest(id="t1", name="build_usecase", input=self.plan)],
+            stop_reason="tool_use",
+        )
+
+
+async def seed_run(client: TestClient, *, status: str = "succeeded") -> str:
+    """Write a finished run with a recording straight into the store."""
+    from events import ToolCall, ToolResult
+
+    store = client.app.state.store
+    run_id = "run-seed"
+    await store.create_run(run_id, "sign in and open a record", None, {})
+
+    seq = 0
+
+    async def pair(tool: str, arguments: dict[str, Any], ok: bool, text: str, step: int) -> None:
+        nonlocal seq
+        seq += 1
+        await store.append_event(
+            ToolCall(run_id=run_id, seq=seq, step=step, call_id=f"c{step}", name=tool,
+                     arguments=arguments)
+        )
+        seq += 1
+        await store.append_event(
+            ToolResult(run_id=run_id, seq=seq, step=step, call_id=f"c{step}", name=tool,
+                       ok=ok, duration_ms=1, text=text)
+        )
+
+    await pair("browser_navigate", {"url": "https://example.com/signin"}, True, "ok", 1)
+    await pair("browser_snapshot", {}, True, SNAPSHOT, 2)
+    await pair(
+        "browser_fill_form",
+        {"fields": [
+            {"target": "ref=e1", "name": "Username", "value": "someone"},
+            {"target": "ref=e2", "name": "Password", "value": "«redacted»"},
+        ]},
+        True, "filled", 3,
+    )
+    await pair("browser_click", {"target": "ref=e3", "element": "Sign in button"}, True, "ok", 4)
+    await pair("browser_navigate", {"url": "https://example.com/record/1"}, True, "ok", 5)
+
+    await store.finish_run(run_id, status, steps=5, duration_ms=100, summary="done")
+    return run_id
+
+
+def use_plan_llm(client: TestClient, plan: dict | None = PLAN) -> PlanLLM:
+    llm = PlanLLM(plan)
+    client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
+    return llm
+
+
+# --- distilling ------------------------------------------------------------
+
+
+async def test_distilling_a_run_creates_a_draft_use_case(client: TestClient):
+    run_id = await seed_run(client)
+    llm = use_plan_llm(client)
+
+    response = client.post(f"/api/runs/{run_id}/distill")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["name"] == "Sign in and open a record"
+    assert body["status"] == "draft", "review is mandatory"
+    assert body["setup_steps"] == 4, "three recorded steps plus the woven-in assertion"
+    assert body["row_steps"] == 1
+    assert body["inputs"] == ["record_url"]
+    assert sorted(body["secrets"]) == ["password", "username"]
+    assert llm.calls == 1, "the entire cost of the feature"
+
+
+async def test_the_stored_definition_contains_no_ephemeral_refs(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    assert "ref=e" not in str(definition), "a ref would point at the wrong element next time"
+
+
+async def test_credentials_do_not_reach_the_stored_definition(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    assert "someone" not in str(definition)
+    assert "{{secret.username}}" in str(definition)
+
+
+async def test_a_failed_run_cannot_be_distilled(client: TestClient):
+    run_id = await seed_run(client, status="failed")
+    llm = use_plan_llm(client)
+
+    response = client.post(f"/api/runs/{run_id}/distill")
+
+    assert response.status_code == 409
+    assert "succeeded" in response.json()["detail"]
+    assert llm.calls == 0, "a failed run must not cost a token"
+
+
+async def test_distilling_an_unknown_run_is_a_404(client: TestClient):
+    assert client.post("/api/runs/nope/distill").status_code == 404
+
+
+async def test_a_model_that_returns_no_plan_is_reported_as_unprocessable(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client, plan=None)
+
+    response = client.post(f"/api/runs/{run_id}/distill")
+
+    assert response.status_code == 422
+    assert "no idea" in response.json()["detail"]
+
+
+# --- listing, reading, editing --------------------------------------------
+
+
+async def test_use_cases_are_listed_newest_first(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    client.post(f"/api/runs/{run_id}/distill")
+
+    rows = client.get("/api/usecases").json()["usecases"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "draft"
+    assert rows[0]["source_run_id"] == run_id
+
+
+async def test_an_edit_appends_a_version_rather_than_rewriting_one(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["name"] = "Renamed by a reviewer"
+    updated = client.put(f"/api/usecases/{usecase_id}", json=definition)
+
+    assert updated.status_code == 201
+    assert updated.json()["version"] == 2
+
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert body["definition"]["name"] == "Renamed by a reviewer"
+    assert [v["version"] for v in body["versions"]] == [2, 1]
+
+    original = client.get(f"/api/usecases/{usecase_id}", params={"version": 1}).json()
+    assert original["definition"]["name"] == "Sign in and open a record", "v1 is immutable"
+
+
+async def test_an_invalid_edit_is_rejected_with_the_reason(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["row_steps"][0]["url"] = "{{input.undeclared}}"
+
+    response = client.put(f"/api/usecases/{usecase_id}", json=definition)
+    assert response.status_code == 422
+    assert "not declared" in response.json()["detail"]
+
+
+async def test_editing_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.put("/api/usecases/nope", json={"name": "x"}).status_code == 404
+
+
+# --- publishing ------------------------------------------------------------
+
+
+async def test_publishing_moves_a_draft_to_ready(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    assert client.post(f"/api/usecases/{usecase_id}/publish").json()["status"] == "ready"
+    assert client.get(f"/api/usecases/{usecase_id}").json()["definition"]["status"] == "ready"
+
+
+async def test_a_use_case_with_scripts_cannot_be_published_without_the_opt_in(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["row_steps"].append(
+        {"id": "danger", "action": "script", "code": "await page.evaluate('1')"}
+    )
+    assert client.put(f"/api/usecases/{usecase_id}", json=definition).status_code == 201
+
+    response = client.post(f"/api/usecases/{usecase_id}/publish")
+    assert response.status_code == 422
+    assert "allow_scripts" in response.json()["detail"]
+
+    # A reviewer who reads the code and opts in can then publish.
+    definition["allow_scripts"] = True
+    client.put(f"/api/usecases/{usecase_id}", json=definition)
+    assert client.post(f"/api/usecases/{usecase_id}/publish").status_code == 200
+
+
+async def test_archiving_keeps_the_record(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    assert client.delete(f"/api/usecases/{usecase_id}").json()["status"] == "archived"
+    assert client.get(f"/api/usecases/{usecase_id}").status_code == 200, "history still resolves"
+
+
+async def test_publishing_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.post("/api/usecases/nope/publish").status_code == 404

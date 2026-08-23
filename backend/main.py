@@ -27,12 +27,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from agent import RunOptions
 from config import Settings, settings
+from distill import DistillationError, distill
 from events import TERMINAL_STATUSES, dump_event
 from llm import llm_health
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
 from runner import EventBus, RunManager, RunRequest
 from store import Store
+from usecase import UseCase
 
 log = logging.getLogger(__name__)
 
@@ -382,6 +384,146 @@ async def approve_action(
 # ---------------------------------------------------------------------------
 # Artifacts
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Use cases
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/runs/{run_id}/distill", status_code=201)
+async def distill_run(
+    run_id: str,
+    store: Store = Depends(get_store),
+    manager: RunManager = Depends(get_manager),
+) -> dict[str, Any]:
+    """Promote a successful run into a reusable use case.
+
+    This is the one LLM call in the whole replay feature. Everything the use
+    case is later executed with costs nothing.
+    """
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if run.status != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"only a succeeded run can be recorded as a use case; this one is {run.status!r}. "
+                "A failed run has no reliable sequence of working steps to learn from."
+            ),
+        )
+
+    events = await store.get_events(run_id)
+    try:
+        use_case = await distill(events, task=run.task, llm=manager.llm, source_run_id=run_id)
+    except DistillationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    definition = use_case.model_dump(mode="json", by_alias=True)
+    usecase_id, version = await store.save_usecase(definition)
+
+    log.info(
+        "distilled a run into a use case",
+        extra={"run_id": run_id, "usecase_id": usecase_id, "version": version},
+    )
+    return {
+        "usecase_id": usecase_id,
+        "version": version,
+        "name": use_case.name,
+        "status": use_case.status,
+        "warnings": use_case.warnings,
+        "setup_steps": len(use_case.setup_steps),
+        "row_steps": len(use_case.row_steps),
+        "inputs": [spec.name for spec in use_case.inputs],
+        "secrets": [spec.name for spec in use_case.secrets],
+        "blocked_scripts": use_case.blocked_scripts,
+    }
+
+
+@app.get("/api/usecases")
+async def list_usecases(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    rows = await store.list_usecases(status=status, limit=limit, offset=offset)
+    return {"usecases": rows, "limit": limit, "offset": offset}
+
+
+@app.get("/api/usecases/{usecase_id}")
+async def get_usecase(
+    usecase_id: str,
+    version: int | None = Query(default=None),
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    definition = await store.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+    return {
+        "definition": definition,
+        "versions": await store.list_usecase_versions(usecase_id),
+    }
+
+
+@app.put("/api/usecases/{usecase_id}", status_code=201)
+async def update_usecase(
+    usecase_id: str,
+    body: dict[str, Any],
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    """Save reviewer edits as a new version.
+
+    Never rewrites the version in place: a batch already running is reading
+    from a specific version and must not have it changed underneath it.
+    """
+    if await store.get_usecase(usecase_id) is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+
+    body = {**body, "id": usecase_id}
+    try:
+        use_case = UseCase.model_validate(body)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the editing UI verbatim
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _, version = await store.save_usecase(use_case.model_dump(mode="json", by_alias=True))
+    return {"usecase_id": usecase_id, "version": version, "status": use_case.status}
+
+
+@app.post("/api/usecases/{usecase_id}/publish")
+async def publish_usecase(
+    usecase_id: str,
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    """Move a reviewed draft to ``ready`` so it can be executed.
+
+    Re-validates at ``ready``, which is where the stricter rules bite -- most
+    notably that a use case carrying raw JavaScript cannot be published until
+    someone has read the code and turned ``allow_scripts`` on.
+    """
+    definition = await store.get_usecase(usecase_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+
+    try:
+        UseCase.model_validate({**definition, "status": "ready"})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    await store.set_usecase_status(usecase_id, "ready")
+    return {"usecase_id": usecase_id, "status": "ready"}
+
+
+@app.delete("/api/usecases/{usecase_id}")
+async def archive_usecase(
+    usecase_id: str,
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    """Archive rather than delete -- execution history references the id."""
+    if not await store.delete_usecase(usecase_id):
+        raise HTTPException(status_code=404, detail="use case not found")
+    return {"usecase_id": usecase_id, "status": "archived"}
 
 
 @app.get("/api/artifacts/{artifact_id}")

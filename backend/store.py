@@ -64,9 +64,32 @@ CREATE TABLE IF NOT EXISTS artifacts (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS usecases (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    current_version INTEGER NOT NULL DEFAULT 1,
+    source_run_id   TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Versions are immutable: an edit appends a row rather than rewriting one, so
+-- a batch already running cannot have its definition changed underneath it.
+CREATE TABLE IF NOT EXISTS usecase_versions (
+    usecase_id TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    definition TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    PRIMARY KEY (usecase_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_run_seq ON events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_runs_status    ON runs (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run  ON artifacts (run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_usecases_status ON usecases (status, updated_at DESC);
 """
 
 #: Schema revision this build expects. ``CREATE TABLE IF NOT EXISTS`` above
@@ -74,14 +97,19 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run  ON artifacts (run_id, seq);
 #: nothing when a table exists with an older shape -- so an ``ALTER`` or a
 #: backfill needs somewhere to hang. :data:`MIGRATIONS` is that place, and
 #: ``user_version`` records how far a given file has been brought forward.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: ``{target_version: (sql_statement, ...)}``, applied in ascending order to
 #: any database whose ``user_version`` is below the target. Statements must be
 #: idempotent where SQLite allows it, and must never drop user data.
 MIGRATIONS: dict[int, tuple[str, ...]] = {
-    # v1 is the schema created by SCHEMA above; nothing to migrate onto it.
+    # v1 is the original runs/events/artifacts schema.
     1: (),
+    # v2 adds usecases + usecase_versions. ``CREATE TABLE IF NOT EXISTS`` in
+    # SCHEMA already creates them on connect, so there is nothing to run --
+    # the entry exists to record that this database has been seen by a build
+    # that knows about those tables.
+    2: (),
 }
 
 ORPHAN_MESSAGE = "Backend restarted while this run was in flight."
@@ -391,6 +419,129 @@ class Store:
         ) as cursor:
             row = await cursor.fetchone()
         return int(row["max_seq"]) + 1
+
+
+    # -- use cases ----------------------------------------------------------
+    async def save_usecase(self, definition: dict[str, Any], *, created_by: str | None = None) -> tuple[str, int]:
+        """Insert a use case, or append a new version of an existing one.
+
+        Returns ``(usecase_id, version)``. Versions are append-only: an edit
+        never rewrites the row a running batch is reading from.
+        """
+        usecase_id = str(definition["id"])
+        name = str(definition.get("name") or "Untitled")
+        description = str(definition.get("description") or "")
+        status = str(definition.get("status") or "draft")
+        now = _now()
+
+        async with self.db.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM usecase_versions WHERE usecase_id=?",
+            (usecase_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        version = int(row["v"]) + 1
+
+        stored = {**definition, "version": version, "updated_at": now}
+        await self.db.execute(
+            "INSERT INTO usecase_versions (usecase_id, version, definition, created_at, created_by)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (usecase_id, version, json.dumps(stored), now, created_by),
+        )
+        await self.db.execute(
+            "INSERT INTO usecases (id, name, description, status, current_version, source_run_id,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description,"
+            " status=excluded.status, current_version=excluded.current_version,"
+            " updated_at=excluded.updated_at",
+            (
+                usecase_id,
+                name,
+                description,
+                status,
+                version,
+                definition.get("source_run_id"),
+                now,
+                now,
+            ),
+        )
+        await self.db.commit()
+        return usecase_id, version
+
+    async def get_usecase(self, usecase_id: str, version: int | None = None) -> dict[str, Any] | None:
+        """One stored definition. ``version=None`` means the current one."""
+        if version is None:
+            async with self.db.execute(
+                "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+            version = int(row["v"])
+
+        async with self.db.execute(
+            "SELECT definition FROM usecase_versions WHERE usecase_id=? AND version=?",
+            (usecase_id, version),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _loads(row["definition"]) if row else None
+
+    async def list_usecases(
+        self, *, status: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Summary rows for the list view -- not the full definitions."""
+        sql = (
+            "SELECT id, name, description, status, current_version, source_run_id,"
+            " created_at, updated_at FROM usecases"
+        )
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status=?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        async with self.db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_usecase_versions(self, usecase_id: str) -> list[dict[str, Any]]:
+        async with self.db.execute(
+            "SELECT version, created_at, created_by FROM usecase_versions"
+            " WHERE usecase_id=? ORDER BY version DESC",
+            (usecase_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def set_usecase_status(self, usecase_id: str, status: str) -> bool:
+        """Move a use case between draft / ready / archived.
+
+        Also rewrites the status inside the current stored definition, so a
+        definition read back on its own still reports the truth.
+        """
+        definition = await self.get_usecase(usecase_id)
+        if definition is None:
+            return False
+
+        definition["status"] = status
+        async with self.db.execute(
+            "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        version = int(row["v"])
+
+        await self.db.execute(
+            "UPDATE usecase_versions SET definition=? WHERE usecase_id=? AND version=?",
+            (json.dumps(definition), usecase_id, version),
+        )
+        await self.db.execute(
+            "UPDATE usecases SET status=?, updated_at=? WHERE id=?", (status, _now(), usecase_id)
+        )
+        await self.db.commit()
+        return True
+
+    async def delete_usecase(self, usecase_id: str) -> bool:
+        """Archive rather than delete: a batch's history references the id."""
+        return await self.set_usecase_status(usecase_id, "archived")
 
     # -- artifacts ----------------------------------------------------------
     async def save_artifact(
