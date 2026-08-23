@@ -230,6 +230,16 @@ class UseCaseDoctor:
 
     async def diagnose(self, context: FailureContext) -> RepairProposal:
         options = candidates(context.snapshot)
+        if not options:
+            # Without the page there is nothing to point at, so every fix the
+            # model could name would be a guess. Say so instead of paying for
+            # a refusal.
+            raise RepairError(
+                "The page was not recorded for this failure, so there is nothing to match "
+                "against and any repair would be guesswork. This affects runs from before "
+                "the page was captured at failure time -- run it once more and the repair "
+                "will have the page to work from."
+            )
         listing = (
             "\n".join(
                 f'{index}. {node.role} "{node.name or node.text}"'
@@ -270,9 +280,16 @@ class UseCaseDoctor:
         tokens = int(turn.usage.get("input_tokens", 0)) + int(turn.usage.get("output_tokens", 0))
         call = next((c for c in turn.tool_calls if c.name == PROPOSE_TOOL["name"]), None)
         if call is None:
-            raise RepairError(
-                "The model did not propose a repair. It said: "
-                + (turn.text or "(nothing)")[:400]
+            # Answering in prose rather than calling the tool is usually the
+            # model explaining why it cannot help. That is information, not an
+            # error -- report it as an unrepairable failure so the person reads
+            # the reasoning instead of a stack of API noise.
+            return RepairProposal(
+                diagnosis=(turn.text or "").strip()[:1200] or "The model gave no answer.",
+                fixes=[],
+                confidence="low",
+                unfixable_reason="the model did not propose a concrete edit",
+                tokens=tokens,
             )
 
         payload = call.input

@@ -200,12 +200,8 @@ async def test_a_model_that_declines_is_not_an_error():
     assert "sign-in" in proposal.unfixable_reason
 
 
-async def test_a_model_that_answers_in_prose_is_reported():
-    llm = ProposingLLM(None)
-    with pytest.raises(RepairError, match="no idea"):
-        await UseCaseDoctor(llm).diagnose(
-            gather_context(use_case(), execution(), failure_events())
-        )
+# (a model that answers in prose is covered below, under "when there is no
+#  page to look at" -- it is reported rather than raised.)
 
 
 # --- applying ---------------------------------------------------------------
@@ -366,3 +362,39 @@ def test_a_repair_that_breaks_the_schema_is_rejected():
     # The step became an assert, so it no longer reads the input; still valid
     # as a draft.
     validate_patched(patched)
+
+
+# --- when there is no page to look at --------------------------------------
+
+
+async def test_no_captured_page_refuses_before_spending_a_token():
+    """Every fix would be a guess, so do not pay for a refusal."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+    context = gather_context(use_case(), execution(), [])
+
+    with pytest.raises(RepairError, match="not recorded"):
+        await UseCaseDoctor(llm).diagnose(context)
+    assert llm.calls == 0
+
+
+async def test_a_snapshot_that_was_only_a_link_counts_as_no_page():
+    """The spill bug produced exactly this: a result with nothing parseable."""
+    events = failure_events("### Snapshot\n- [Snapshot](.playwright-mcp/page-1.yml)\n")
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    with pytest.raises(RepairError, match="not recorded"):
+        await UseCaseDoctor(llm).diagnose(gather_context(use_case(), execution(), events))
+    assert llm.calls == 0
+
+
+async def test_prose_instead_of_a_tool_call_is_reported_not_raised():
+    """A model explaining itself is information, not an API failure."""
+    llm = ProposingLLM(None)
+    proposal = await UseCaseDoctor(llm).diagnose(
+        gather_context(use_case(), execution(), failure_events())
+    )
+
+    assert proposal.actionable is False
+    assert "no idea" in proposal.diagnosis
+    assert proposal.confidence == "low"
+    assert proposal.tokens == 1200

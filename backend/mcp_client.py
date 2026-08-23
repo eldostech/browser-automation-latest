@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import os
 import tempfile
 from contextlib import AsyncExitStack
@@ -40,6 +41,12 @@ from mcp.client.streamable_http import streamablehttp_client
 from config import Settings
 
 log = logging.getLogger(__name__)
+
+#: Playwright MCP spills a large snapshot to a file and returns a link to it.
+_SNAPSHOT_LINK_RE = re.compile(r"^[ 	]*-\s*\[Snapshot\]\((?P<path>[^)]+)\)[ 	]*$", re.MULTILINE)
+
+#: Ceiling on a spilled snapshot we will read back in.
+MAX_SNAPSHOT_FILE_BYTES = 4_000_000
 
 
 class MCPConnectionError(RuntimeError):
@@ -333,15 +340,80 @@ class MCPBrowserSession:
         duration_ms = int((loop.time() - started) * 1000)
         return self._normalise(name, result, duration_ms)
 
-    @staticmethod
-    def _normalise(name: str, result: Any, duration_ms: int) -> ToolOutcome:
+    # -- snapshot spill files -----------------------------------------------
+    def _inline_snapshot_links(self, text: str) -> str:
+        """Splice a spilled snapshot back into the tool result.
+
+        Playwright MCP writes a large accessibility snapshot to a file and
+        returns only a link to it::
+
+            ### Snapshot
+            - [Snapshot](.playwright-mcp/page-2026-08-23T17-58-40-745Z.yml)
+
+        Everything downstream expects the tree inline: the snapshot parser
+        reads no nodes from a link, so every ``role`` locator silently fails to
+        resolve and the model is shown a page with nothing on it. Reading the
+        file here fixes it once, for the agent loop and the replay executor
+        alike, rather than in each of them.
+        """
+        if "[Snapshot](" not in text:
+            return text
+
+        def replace(match: re.Match[str]) -> str:
+            content = self._read_spilled_snapshot(match.group("path"))
+            return content.rstrip() if content else match.group(0)
+
+        return _SNAPSHOT_LINK_RE.sub(replace, text)
+
+    def _read_spilled_snapshot(self, raw: str) -> str | None:
+        """Read a snapshot file the server wrote, or ``None`` if it is not safe to.
+
+        The path comes from tool output, so it is treated as untrusted: only a
+        YAML file, only inside the server's own output directory or the working
+        directory it was spawned in, and only up to a sane size.
+        """
+        candidate = Path(raw.strip().replace("\\", "/"))
+        if candidate.suffix.lower() not in (".yml", ".yaml"):
+            return None
+
+        bases: list[Path] = []
+        if self.config.output_dir:
+            bases.append(Path(self.config.output_dir))
+        bases.append(Path.cwd())
+
+        for base in bases:
+            try:
+                root = base.resolve()
+                path = (candidate if candidate.is_absolute() else root / candidate).resolve()
+                # Containment: never read outside the directory we expect.
+                path.relative_to(root)
+            except (ValueError, OSError):
+                continue
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_size > MAX_SNAPSHOT_FILE_BYTES:
+                    log.warning(
+                        "snapshot file is too large to inline",
+                        extra={"path": str(path), "bytes": path.stat().st_size},
+                    )
+                    return None
+                return path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                log.warning("could not read snapshot file", extra={"error": str(exc)})
+                return None
+
+        log.warning("snapshot file referenced but not found", extra={"path": raw})
+        return None
+
+    def _normalise(self, name: str, result: Any, duration_ms: int) -> ToolOutcome:
         texts: list[str] = []
         images: list[tuple[str, bytes]] = []
 
         for block in getattr(result, "content", []) or []:
             block_type = getattr(block, "type", None)
             if block_type == "text":
-                texts.append(getattr(block, "text", "") or "")
+                texts.append(self._inline_snapshot_links(getattr(block, "text", "") or ""))
             elif block_type == "image":
                 raw = getattr(block, "data", "") or ""
                 try:
@@ -352,7 +424,7 @@ class MCPBrowserSession:
                 resource = getattr(block, "resource", None)
                 text = getattr(resource, "text", None)
                 if text:
-                    texts.append(text)
+                    texts.append(self._inline_snapshot_links(text))
 
         structured = getattr(result, "structuredContent", None)
         return ToolOutcome(
