@@ -559,3 +559,75 @@ def test_an_input_used_only_by_row_reset_is_kept():
     }
     use_case = build_usecase(plan, recording)
     assert [spec.name for spec in use_case.inputs] == ["start_url"]
+
+
+# --- assertions that can never hold ----------------------------------------
+
+
+def _ixl_recording():
+    return pre_filter(
+        build_events(
+            ("browser_navigate", {"url": "https://www.ixl.com/signin"}, True, "ok"),
+            ("browser_click", {"target": "#go"}, True, "ok"),
+        )
+    )
+
+
+def test_an_assertion_the_allowlist_forbids_is_dropped_with_a_reason():
+    """Regression: `NOT url_contains "ixl.com"` while confined to www.ixl.com."""
+    plan = {
+        "name": "x",
+        "setup_step_ids": ["s1", "s2"],
+        "row_step_ids": [],
+        "assertions": [
+            {"after_step_id": "s2", "kind": "url_contains", "value": "ixl.com", "negate": True}
+        ],
+    }
+    use_case = build_usecase(plan, _ixl_recording())
+
+    assert not any(s.action == "assert" for s in use_case.setup_steps)
+    assert any("dropped assertion" in w and "never pass" in w for w in use_case.warnings)
+
+
+def test_the_correct_pattern_survives():
+    """Negating the *path* is right and must not be touched."""
+    plan = {
+        "name": "x",
+        "setup_step_ids": ["s1", "s2"],
+        "row_step_ids": [],
+        "assertions": [
+            {"after_step_id": "s2", "kind": "url_contains", "value": "/signin", "negate": True}
+        ],
+    }
+    use_case = build_usecase(plan, _ixl_recording())
+
+    assertions = [s for s in use_case.setup_steps if s.action == "assert"]
+    assert len(assertions) == 1
+    assert assertions[0].assertion.value == "/signin"
+
+
+def test_an_impossible_session_check_is_dropped_and_called_out():
+    plan = {
+        "name": "x",
+        "setup_step_ids": ["s1"],
+        "row_step_ids": ["s2"],
+        "session_check": {"kind": "url_contains", "value": "ixl.com", "negate": True},
+    }
+    use_case = build_usecase(plan, _ixl_recording())
+
+    assert use_case.session_check is None
+    assert any("dropped the session check" in w for w in use_case.warnings)
+
+
+def test_a_dropped_assertion_still_leaves_the_no_assertions_warning():
+    """Losing the only check must not look like a use case that has one."""
+    plan = {
+        "name": "x",
+        "setup_step_ids": ["s1", "s2"],
+        "row_step_ids": [],
+        "assertions": [
+            {"after_step_id": "s2", "kind": "url_contains", "value": "ixl.com", "negate": True}
+        ],
+    }
+    use_case = build_usecase(plan, _ixl_recording())
+    assert any("no assertions were proposed" in w for w in use_case.warnings)

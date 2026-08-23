@@ -192,6 +192,58 @@ class Assertion(BaseModel):
             raise ValueError("assertion 'element_count' requires a count")
         return self
 
+    def unsatisfiable_reason(self, allowed_domains: list[str]) -> str | None:
+        """Why this assertion can never hold, or ``None`` if it might.
+
+        The domain allowlist is enforced on every navigation, so it bounds
+        where the browser can possibly be -- which makes some URL assertions
+        provably false before anything runs. Catching those is worth doing
+        deterministically: an assertion that cannot pass turns every row of a
+        batch into a failure, and the failure message blames the page rather
+        than the assertion.
+
+        Deliberately conservative. It only reports a contradiction it can
+        actually prove, because wrongly discarding a real check would remove
+        the only thing standing between a batch and silent success.
+        """
+        if self.kind != "url_contains" or not self.value:
+            return None
+
+        domains = [
+            d.strip().lower().removeprefix("*.")
+            for d in allowed_domains
+            if d and d.strip() and d.strip() != "*"
+        ]
+        # No allowlist, or a wildcard: the browser could be anywhere.
+        if not domains or len(domains) != len([d for d in allowed_domains if d and d.strip()]):
+            return None
+
+        value = self.value.strip().lower()
+
+        if self.negate:
+            # "the URL must NOT contain X", where X is part of every domain the
+            # run is allowed to reach. The allowlist forbids being anywhere else.
+            if all(value in domain for domain in domains):
+                return (
+                    f"asserts the URL does NOT contain {self.value!r}, but this use case is "
+                    f"restricted to {', '.join(allowed_domains)} -- so every page it can "
+                    "reach contains that text and the check can never pass"
+                )
+            return None
+
+        # "the URL must contain X", where X names a host that is not reachable.
+        # Only applied when the value looks like a hostname, so a path check
+        # like "/signin" is never touched.
+        looks_like_host = "." in value and "/" not in value and " " not in value
+        if looks_like_host and not any(
+            value in domain or domain in value for domain in domains
+        ):
+            return (
+                f"asserts the URL contains {self.value!r}, which is not among the domains "
+                f"this use case may visit ({', '.join(allowed_domains)})"
+            )
+        return None
+
     def describe(self) -> str:
         body = {
             "url_contains": f"URL contains {self.value!r}",
@@ -489,6 +541,40 @@ class UseCase(BaseModel):
             raise ValueError(
                 "these templates reference names that are not declared: " + "; ".join(missing)
             )
+        return self
+
+    def impossible_assertions(self) -> list[tuple[str, str]]:
+        """``(where, why)`` for every assertion that can never hold.
+
+        Covers the session check too: one that can never pass makes the batch
+        runner think the session dropped after every single row, and re-run
+        sign-in forever.
+        """
+        found: list[tuple[str, str]] = []
+        for step in self.all_steps:
+            if step.assertion is None:
+                continue
+            reason = step.assertion.unsatisfiable_reason(self.allowed_domains)
+            if reason:
+                found.append((step.id, reason))
+        if self.session_check is not None:
+            reason = self.session_check.unsatisfiable_reason(self.allowed_domains)
+            if reason:
+                found.append(("session_check", reason))
+        return found
+
+    @model_validator(mode="after")
+    def _published_assertions_can_pass(self) -> "UseCase":
+        """A published use case may not carry an assertion that can never hold.
+
+        Checked at ``ready`` so a draft can still be inspected and repaired.
+        """
+        if self.status != "ready":
+            return self
+        broken = self.impossible_assertions()
+        if broken:
+            detail = "; ".join(f"{where} {why}" for where, why in broken)
+            raise ValueError(f"cannot publish: {detail}")
         return self
 
     @model_validator(mode="after")

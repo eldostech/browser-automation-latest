@@ -86,6 +86,19 @@ Put an assertion after the last setup step proving sign-in worked, and at least
 one in the per-row steps proving the row's work landed. Keep them specific
 enough to catch a failure and loose enough to survive a wording change.
 
+**Assert on the path, never on the domain.** The whole task happens on one
+site, so `url_contains` with the site's own domain is either always true or —
+if you negate it — never true. Negating the domain is the common mistake and it
+turns every row into a failure:
+
+- Wrong: `url_contains "ixl.com"` negated. The run cannot leave that domain, so
+  this can never pass.
+- Right: `url_contains "/signin"` negated. Signing in moves you off that path,
+  which is exactly what you want to prove.
+
+`text_present` is usually the better proof that a row's work landed: assert on
+something the page only shows once the action succeeded.
+
 ### 5. Session check and row reset
 
 - `session_check` — a cheap assertion proving the shared session is still

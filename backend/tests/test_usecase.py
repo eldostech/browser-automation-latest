@@ -434,3 +434,94 @@ def test_publishing_with_an_input_nothing_reads_is_refused():
 def test_a_draft_may_hold_an_unused_input_so_it_can_be_reviewed():
     use_case = simple(inputs=[InputSpec(name="unused_thing")])
     assert [i.name for i in use_case.inputs] == ["unused_thing"]
+
+
+# --- assertions the allowlist makes impossible -----------------------------
+#
+# Regression: a distilled use case asserted `NOT url_contains "ixl.com"` while
+# restricted to www.ixl.com. Every row failed, and the message blamed the page.
+
+
+@pytest.mark.parametrize(
+    ("value", "negate", "domains", "impossible"),
+    [
+        # The bug, exactly.
+        ("ixl.com", True, ["www.ixl.com"], True),
+        ("www.ixl.com", True, ["www.ixl.com"], True),
+        # Negating a path is the correct pattern and must survive.
+        ("/signin", True, ["www.ixl.com"], False),
+        ("/dashboard", False, ["www.ixl.com"], False),
+        # Asserting the domain positively is pointless but not impossible.
+        ("ixl.com", False, ["www.ixl.com"], False),
+        # A host that is not reachable at all.
+        ("google.com", False, ["www.ixl.com"], True),
+        # Reachable via a wildcard entry.
+        ("shop.example.com", False, ["*.example.com"], False),
+        # Several domains: negation only impossible if it holds for all of them.
+        ("example.com", True, ["www.example.com", "cdn.example.com"], True),
+        ("example.com", True, ["www.example.com", "other.org"], False),
+        # No confinement means nothing is provable.
+        ("ixl.com", True, ["*"], False),
+        ("ixl.com", True, [], False),
+    ],
+)
+def test_unsatisfiable_url_assertions_are_detected(value, negate, domains, impossible):
+    check = Assertion(kind="url_contains", value=value, negate=negate)
+    assert (check.unsatisfiable_reason(domains) is not None) is impossible
+
+
+def test_only_url_assertions_are_judged():
+    """Nothing is knowable in advance about page text or titles."""
+    for kind in ("text_present", "title_contains"):
+        check = Assertion(kind=kind, value="anything", negate=True)
+        assert check.unsatisfiable_reason(["www.ixl.com"]) is None
+
+
+def test_publishing_an_impossible_assertion_is_refused():
+    with pytest.raises(ValidationError, match="can never pass"):
+        simple(
+            status="ready",
+            allowed_domains=["www.ixl.com"],
+            row_steps=[
+                Step(
+                    id="s1",
+                    action="assert",
+                    assertion=Assertion(kind="url_contains", value="ixl.com", negate=True),
+                )
+            ],
+        )
+
+
+def test_an_impossible_session_check_is_refused_too():
+    """One that never passes makes the batch re-run sign-in after every row."""
+    with pytest.raises(ValidationError, match="can never pass"):
+        simple(
+            status="ready",
+            allowed_domains=["www.ixl.com"],
+            session_check=Assertion(kind="url_contains", value="ixl.com", negate=True),
+        )
+
+
+def test_a_draft_may_hold_one_so_it_can_be_seen_and_repaired():
+    use_case = simple(
+        allowed_domains=["www.ixl.com"],
+        row_steps=[
+            Step(
+                id="s1",
+                action="assert",
+                assertion=Assertion(kind="url_contains", value="ixl.com", negate=True),
+            )
+        ],
+    )
+    assert [where for where, _ in use_case.impossible_assertions()] == ["s1"]
+
+
+def test_a_sound_use_case_reports_no_impossible_assertions():
+    use_case = simple(
+        allowed_domains=["www.ixl.com"],
+        session_check=Assertion(kind="url_contains", value="/signin", negate=True),
+        row_steps=[
+            Step(id="s1", action="assert", assertion=Assertion(kind="text_present", value="Done"))
+        ],
+    )
+    assert use_case.impossible_assertions() == []

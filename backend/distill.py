@@ -774,6 +774,39 @@ def build_usecase(
 
     session_check = _assertion_from(plan["session_check"]) if plan.get("session_check") else None
 
+    # An assertion the allowlist makes impossible would fail every row while
+    # blaming the page, so drop it here rather than storing a use case that
+    # cannot succeed. Dropping loses nothing: it could never have passed.
+    #
+    # This runs *before* the "no assertions" check below, so a use case that
+    # loses its only check is reported as having none -- which is the truth.
+    def usable(steps: list[Step]) -> list[Step]:
+        kept: list[Step] = []
+        for step in steps:
+            reason = (
+                step.assertion.unsatisfiable_reason(pre.domains)
+                if step.assertion is not None
+                else None
+            )
+            if reason:
+                warnings.append(f"dropped assertion {step.id}: it {reason}")
+                continue
+            kept.append(step)
+        return kept
+
+    setup_steps = usable(setup_steps)
+    row_steps = usable(row_steps)
+    teardown_steps = usable(teardown_steps)
+
+    if session_check is not None:
+        reason = session_check.unsatisfiable_reason(pre.domains)
+        if reason:
+            warnings.append(
+                f"dropped the session check: it {reason}. Without one, a session that drops "
+                "part-way through a batch will not be noticed."
+            )
+            session_check = None
+
     if not any(step.action == "assert" for step in (*setup_steps, *row_steps)):
         warnings.append(
             "no assertions were proposed. A replay has no judgement, so a batch will report "

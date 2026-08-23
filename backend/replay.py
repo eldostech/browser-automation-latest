@@ -568,6 +568,19 @@ class UseCaseExecutor:
         if check is None:
             return StepOutcome(step.id, True, 0, "no assertion")
 
+        # If the allowlist makes this check impossible, say so instead of
+        # waiting out the timeout and then blaming the page. Distillation drops
+        # these, but a hand-edited or older definition can still carry one.
+        impossible = check.unsatisfiable_reason(self.usecase.allowed_domains)
+        if impossible:
+            return StepOutcome(
+                step.id,
+                False,
+                0,
+                f"this assertion can never pass: it {impossible}. Fix the assertion rather "
+                "than the page.",
+            )
+
         deadline = time.monotonic() + max(check.timeout_ms, 0) / 1000.0
         detail = ""
         while True:
