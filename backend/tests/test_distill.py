@@ -276,17 +276,20 @@ def recording():
     )
 
 
+# Recorded step ids are sequential over the SURVIVING steps (s1, s2, s3...),
+# not the agent's step numbers. The agent's numbers repeat whenever one turn
+# issued several tool calls, which silently collapsed those steps into one.
 PLAN = {
     "name": "IXL practice",
     "description": "Sign in and open a skill.",
     "inputs": [{"name": "practice_url", "type": "url"}],
     "secrets": [{"name": "username"}, {"name": "password"}],
-    "setup_step_ids": ["s1", "s3", "s4"],
-    "row_step_ids": ["s5"],
-    "values": {"s3.Username": "{{secret.username}}", "s3.Password": "{{secret.password}}"},
-    "urls": {"s5": "{{input.practice_url}}"},
+    "setup_step_ids": ["s1", "s2", "s3"],
+    "row_step_ids": ["s4"],
+    "values": {"s2.Username": "{{secret.username}}", "s2.Password": "{{secret.password}}"},
+    "urls": {"s4": "{{input.practice_url}}"},
     "assertions": [
-        {"after_step_id": "s4", "kind": "url_contains", "value": "/signin", "negate": True}
+        {"after_step_id": "s3", "kind": "url_contains", "value": "/signin", "negate": True}
     ],
     "session_check": {"kind": "url_contains", "value": "/signin", "negate": True},
     "row_reset_url": "{{input.practice_url}}",
@@ -295,8 +298,8 @@ PLAN = {
 
 def test_the_plan_splits_setup_from_per_row_work(recording):
     use_case = build_usecase(PLAN, recording, source_run_id="run-1")
-    assert [s.id for s in use_case.setup_steps] == ["s1", "s3", "s4", "s4_check1"]
-    assert [s.id for s in use_case.row_steps] == ["s5"]
+    assert [s.id for s in use_case.setup_steps] == ["s1", "s2", "s3", "s3_check1"]
+    assert [s.id for s in use_case.row_steps] == ["s4"]
     assert use_case.row_reset.url == "{{input.practice_url}}"
     assert use_case.session_check.negate is True
 
@@ -316,7 +319,7 @@ def test_per_row_values_become_input_templates(recording):
 def test_assertions_are_woven_in_after_the_step_they_verify(recording):
     use_case = build_usecase(PLAN, recording)
     ids = [s.id for s in use_case.setup_steps]
-    assert ids.index("s4_check1") == ids.index("s4") + 1
+    assert ids.index("s3_check1") == ids.index("s3") + 1
 
 
 def test_locators_survive_into_the_use_case_unchanged(recording):
@@ -338,14 +341,14 @@ def test_allowed_domains_default_to_what_the_recording_visited(recording):
 def test_steps_the_plan_ignored_are_reported(recording):
     plan = {**PLAN, "row_step_ids": []}
     use_case = build_usecase(plan, recording)
-    assert any("dropped by the plan" in w and "s5" in w for w in use_case.warnings)
+    assert any("dropped by the plan" in w and "s4" in w for w in use_case.warnings)
 
 
 def test_an_unknown_step_id_is_warned_about_rather_than_crashing(recording):
-    plan = {**PLAN, "row_step_ids": ["s5", "s999"]}
+    plan = {**PLAN, "row_step_ids": ["s4", "s999"]}
     use_case = build_usecase(plan, recording)
     assert any("s999" in w for w in use_case.warnings)
-    assert [s.id for s in use_case.row_steps] == ["s5"]
+    assert [s.id for s in use_case.row_steps] == ["s4"]
 
 
 def test_a_plan_with_no_assertions_is_warned_about(recording):
@@ -631,3 +634,101 @@ def test_a_dropped_assertion_still_leaves_the_no_assertions_warning():
     }
     use_case = build_usecase(plan, _ixl_recording())
     assert any("no assertions were proposed" in w for w in use_case.warnings)
+
+
+# --- several tool calls in one agent turn ----------------------------------
+#
+# Regression: a contact form filled with four values in a single turn produced
+# four recorded steps all numbered "s9". `by_id` is a dict, so three were
+# silently discarded, the model could reference the id only once, and the four
+# inputs it correctly declared had nothing to bind to -- so they were dropped
+# as unused and the form asked for nothing at all.
+
+
+def one_turn_form() -> list:
+    """Four fills and a click, all issued in the same agent step."""
+    events: list = []
+    seq = 0
+
+    def pair(step: int, tool: str, arguments: dict, text: str = "ok") -> None:
+        nonlocal seq
+        call_id = f"c{len(events)}"
+        seq += 1
+        events.append(
+            ToolCall(run_id="r", seq=seq, step=step, call_id=call_id, name=tool,
+                     arguments=arguments)
+        )
+        seq += 1
+        events.append(
+            ToolResult(run_id="r", seq=seq, step=step, call_id=call_id, name=tool,
+                       ok=True, duration_ms=1, text=text)
+        )
+
+    pair(1, "browser_navigate", {"url": "https://example.com/contact"})
+    # One turn, four tool calls -- all step 9.
+    pair(9, "browser_type", {"target": "#name", "text": "Nitin Asati"})
+    pair(9, "browser_type", {"target": "#email", "text": "unicorn@gmail.com"})
+    pair(9, "browser_type", {"target": "#company", "text": "Unicorn Private Limited"})
+    pair(9, "browser_type", {"target": "#reason", "text": "needs automating"})
+    pair(11, "browser_click", {"target": "#submit", "element": "Request a demo"})
+    return events
+
+
+def test_every_tool_call_in_one_turn_becomes_its_own_step():
+    result = pre_filter(one_turn_form())
+
+    assert len(result.steps) == 6, "four fills must not collapse into one"
+    assert [s.id for s in result.steps] == ["s1", "s2", "s3", "s4", "s5", "s6"]
+    assert [s.value for s in result.steps if s.action == "fill"] == [
+        "Nitin Asati",
+        "unicorn@gmail.com",
+        "Unicorn Private Limited",
+        "needs automating",
+    ]
+
+
+def test_recorded_step_ids_are_unique():
+    ids = [s.id for s in pre_filter(one_turn_form()).steps]
+    assert len(ids) == len(set(ids))
+
+
+def test_every_typed_value_is_offered_as_a_parameter_candidate():
+    literals = pre_filter(one_turn_form()).literals
+    for value in ("Nitin Asati", "unicorn@gmail.com", "Unicorn Private Limited"):
+        assert value in literals
+
+
+def test_each_field_can_be_wired_to_its_own_input():
+    """The end the bug broke: four fields, four inputs, all bound."""
+    recording = pre_filter(one_turn_form())
+    plan = {
+        "name": "Submit the contact form",
+        "inputs": [
+            {"name": "full_name", "type": "string"},
+            {"name": "work_email", "type": "string"},
+            {"name": "company_name", "type": "string"},
+            {"name": "reason", "type": "string"},
+        ],
+        "row_step_ids": ["s1", "s2", "s3", "s4", "s5", "s6"],
+        "values": {
+            "s2": "{{input.full_name}}",
+            "s3": "{{input.work_email}}",
+            "s4": "{{input.company_name}}",
+            "s5": "{{input.reason}}",
+        },
+    }
+    use_case = build_usecase(plan, recording)
+
+    assert sorted(spec.name for spec in use_case.inputs) == [
+        "company_name",
+        "full_name",
+        "reason",
+        "work_email",
+    ], "no input is dropped as unused"
+    assert [s.value for s in use_case.row_steps if s.action == "fill"] == [
+        "{{input.full_name}}",
+        "{{input.work_email}}",
+        "{{input.company_name}}",
+        "{{input.reason}}",
+    ]
+    assert not any("no step reads" in w for w in use_case.warnings)

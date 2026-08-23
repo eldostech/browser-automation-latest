@@ -51,6 +51,12 @@ decide:
 - **an input** — data that changes per row (a search term, an answer, a target
   URL, a customer name). Declare it in `inputs` and replace the literal with
   `{{input.name}}`.
+
+  **A value typed into a form field is almost always an input.** A name, an
+  email address, a company, a message — the whole point of running the use
+  case again is to submit different ones. Wire *every* such field: a form with
+  four fields needs four inputs and four entries in `values`, one per step id.
+  Leaving one hard-coded means every record gets the same value, silently.
 - **a secret** — a credential (password, API key, PIN, security answer).
   Declare it in `secrets` and replace the literal with `{{secret.name}}`.
   A username used to sign in is a secret, not an input, because sign-in happens

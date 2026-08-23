@@ -26,20 +26,19 @@ SNAPSHOT = """### Page
 - button "Sign in" [ref=e3]
 ```"""
 
-# Step ids are `s<original step number>`, so they carry gaps where the
-# pre-filter dropped observation-only calls -- s2 was the snapshot. The model
-# only ever sees the surviving ids, so it cannot reference a gap.
+# Step ids are sequential over the SURVIVING steps, so the dropped snapshot
+# leaves no gap: navigate=s1, fill_form=s2, click=s3, navigate=s4.
 PLAN = {
     "name": "Sign in and open a record",
     "description": "Signs in once, then opens one record per row.",
     "inputs": [{"name": "record_url", "type": "url"}],
     "secrets": [{"name": "username"}, {"name": "password"}],
-    "setup_step_ids": ["s1", "s3", "s4"],
-    "row_step_ids": ["s5"],
-    "values": {"s3.Username": "{{secret.username}}", "s3.Password": "{{secret.password}}"},
-    "urls": {"s5": "{{input.record_url}}"},
+    "setup_step_ids": ["s1", "s2", "s3"],
+    "row_step_ids": ["s4"],
+    "values": {"s2.Username": "{{secret.username}}", "s2.Password": "{{secret.password}}"},
+    "urls": {"s4": "{{input.record_url}}"},
     "assertions": [
-        {"after_step_id": "s4", "kind": "url_contains", "value": "/signin", "negate": True}
+        {"after_step_id": "s3", "kind": "url_contains", "value": "/signin", "negate": True}
     ],
     "session_check": {"kind": "url_contains", "value": "/signin", "negate": True},
     "row_reset_url": "{{input.record_url}}",

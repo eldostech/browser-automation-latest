@@ -118,6 +118,9 @@ class RecordedStep:
     """One surviving tool call, with its ref already resolved to role + name."""
 
     call_id: str
+    #: The agent's step number. NOT unique -- one turn can issue several tool
+    #: calls, and all of them share it. Kept for logs and for reading a
+    #: recording against the original run.
     step: int
     seq: int
     tool: str
@@ -133,6 +136,10 @@ class RecordedStep:
     #: Set when a ref could not be resolved against any snapshot.
     unresolved_ref: str | None = None
     result_text: str = ""
+    #: Unique within one recording, assigned after the surviving steps are
+    #: known. This is what the model references and what a use case's steps
+    #: are named after, so it must not collide.
+    id: str = ""
 
     @staticmethod
     def _dump(locator: Locator) -> dict[str, Any]:
@@ -142,7 +149,7 @@ class RecordedStep:
 
     def to_prompt_dict(self) -> dict[str, Any]:
         """The compact shape handed to the model. Deliberately small."""
-        payload: dict[str, Any] = {"id": f"s{self.step}", "action": self.action}
+        payload: dict[str, Any] = {"id": self.id, "action": self.action}
         if self.description:
             payload["describes"] = self.description
         if self.locators:
@@ -405,6 +412,13 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
         for candidate in [*step.all_values(), url]:
             if candidate and candidate not in literals:
                 literals.append(candidate)
+
+    # Name the surviving steps. Sequential over the recording rather than the
+    # agent's step number, which repeats whenever one turn issued several tool
+    # calls -- four fills in one turn all shared "s9", so three of them were
+    # silently lost and the values they typed could never be parameterised.
+    for index, step in enumerate(kept, start=1):
+        step.id = f"s{index}"
 
     # Order every ladder by durability rather than by the order the model
     # happened to arrive at each locator.
@@ -687,8 +701,18 @@ def build_usecase(
     plan to a use case, which is what guarantees every locator in the result
     came from a call that actually succeeded -- the model cannot express one.
     """
-    by_id = {f"s{step.step}": step for step in pre.steps}
+    by_id = {step.id: step for step in pre.steps}
     warnings = list(pre.warnings)
+
+    # A collision here silently discards recorded steps -- it is how four form
+    # fills in one turn became one. Never expected; loud if it happens.
+    if len(by_id) != len(pre.steps):
+        duplicates = sorted({s.id for s in pre.steps if sum(1 for o in pre.steps if o.id == s.id) > 1})
+        log.error("recorded step ids collided", extra={"duplicates": duplicates})
+        warnings.append(
+            "internal: recorded step ids collided (" + ", ".join(duplicates) + "), so some "
+            "recorded steps were lost. Please report this."
+        )
 
     def collect(key: str) -> list[tuple[str, RecordedStep]]:
         chosen: list[tuple[str, RecordedStep]] = []
