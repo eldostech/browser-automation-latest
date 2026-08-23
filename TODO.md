@@ -1,10 +1,12 @@
 # TODO — Repeatable use cases (record once, replay without an LLM)
 
-Implementation checklist for [`docs/design/repeatable-usecases.md`](docs/design/repeatable-usecases.md).
-Read the design first; this file is the task breakdown, not the rationale.
+**Status: all six phases implemented.** 459 tests passing, 3 skipped. The
+frontend type-checks and builds. See the commit history for what each phase
+delivered, and [`docs/design/repeatable-usecases.md`](docs/design/repeatable-usecases.md)
+for why it is shaped this way.
 
-Phases are ordered by dependency. **Phases 0–2 are the spine** — at the end of phase 2 a use
-case executes against new inputs with zero LLM tokens. Everything after is ergonomics and scale.
+Read the design first; this file is the task breakdown, not the rationale. Items still
+unticked are genuinely not done — see **What is not built** at the bottom.
 
 ---
 
@@ -41,102 +43,116 @@ snapshot parser.
 
 ## Phase 1 · Distillation (the one LLM call)
 
-- [ ] **Pre-filter** (`backend/distill.py`), no LLM:
-  - [ ] Load a run's events; join `tool_call` → `tool_result` on `call_id`.
-  - [ ] Drop observation-only tools (`browser_snapshot`, `browser_take_screenshot`,
+- [x] **Pre-filter** (`backend/distill.py`), no LLM:
+  - [x] Load a run's events; join `tool_call` → `tool_result` on `call_id`.
+  - [x] Drop observation-only tools (`browser_snapshot`, `browser_take_screenshot`,
         `browser_console_messages`, `browser_network_requests`).
-  - [ ] Drop calls whose result has `ok == false`.
-  - [ ] Collapse consecutive retries against the same element; keep the last success, demote the
+  - [x] Drop calls whose result has `ok == false`.
+  - [x] Collapse consecutive retries against the same element; keep the last success, demote the
         rest to fallback locator candidates.
-  - [ ] Resolve `ref=X` targets to role+name via the nearest preceding snapshot. Flag
+  - [x] Resolve `ref=X` targets to role+name via the nearest preceding snapshot. Flag
         unresolvable refs as warnings rather than keeping them.
-  - [ ] Mine literals (typed values, URLs, form values) as parameter candidates.
-  - [ ] Test against run `0436a2a8` (34 calls, 13 failures) and assert the output is ~8 steps
+  - [x] Mine literals (typed values, URLs, form values) as parameter candidates.
+  - [x] Test against run `0436a2a8` (34 calls, 13 failures) and assert the output is ~8 steps
         with no `ref=` targets remaining.
-  - [ ] **Propose the setup/row split**: every step before the first one that consumes a per-row
+  - [x] **Propose the setup/row split**: every step before the first one that consumes a per-row
         input becomes a `setup_steps` candidate; the rest become `row_steps`. Deterministic, and
         confirmed by a human in phase 3.
-- [ ] **`UseCase` pydantic models** (`backend/usecase.py`) matching §6 of the design —
+- [x] **`UseCase` pydantic models** (`backend/usecase.py`) matching §6 of the design —
       `setup_steps`, `row_steps`, `row_reset`, `session_check`, `teardown_steps`.
-  - [ ] Validator: reject `{{…}}` templating inside `locators`.
-  - [ ] Validator: reject `script` steps when `allow_scripts` is false.
-  - [ ] Validator: `{{input.*}}` may not appear in `setup_steps` — setup runs once per batch, so
+  - [x] Validator: reject `{{…}}` templating inside `locators`.
+  - [x] Validator: reject `script` steps when `allow_scripts` is false.
+  - [x] Validator: `{{input.*}}` may not appear in `setup_steps` — setup runs once per batch, so
         a per-row input there is a modelling error and should fail loudly.
-  - [ ] `schema_version` constant and a stated forward-compat rule.
-- [ ] **Distiller prompt** in `backend/prompts/distill.md`, loaded via `prompt_loader` like the
+  - [x] `schema_version` constant and a stated forward-compat rule.
+- [x] **Distiller prompt** in `backend/prompts/distill.md`, loaded via `prompt_loader` like the
       others. Supply the `UseCase` schema as a tool definition so output is schema-validated.
-- [ ] **One-shot LLM call** reusing `llm.py`'s tool-use path. Assert in tests that exactly one
+- [x] **One-shot LLM call** reusing `llm.py`'s tool-use path. Assert in tests that exactly one
       call is made.
-- [ ] **Storage**: `usecases` + `usecase_versions` tables and `Store` methods.
-- [ ] `POST /api/runs/{run_id}/distill` → `{ usecase_id, version, warnings[] }`. Reject runs
+- [x] **Storage**: `usecases` + `usecase_versions` tables and `Store` methods.
+- [x] `POST /api/runs/{run_id}/distill` → `{ usecase_id, version, warnings[] }`. Reject runs
       whose status is not `succeeded`.
 
 ## Phase 2 · The executor (zero LLM)
 
-- [ ] **`backend/replay.py` — `UseCaseExecutor`.** Constructor takes `(usecase, mcp, sink,
+- [x] **`backend/replay.py` — `UseCaseExecutor`.** Constructor takes `(usecase, mcp, sink,
       secrets)` and **no LLM client**. Add a test asserting the module never imports `llm`.
-- [ ] Split the surface into `run_setup()` (once per session) and `run_row(inputs)` (once per
+- [x] Split the surface into `run_setup()` (once per session) and `run_row(inputs)` (once per
       row), so the single-row UI path and the phase-4 batch runner share one code path.
-- [ ] **Locator ladder**: `role` (fresh snapshot → live ref) → `css` → `text` → `nth`. Record
+- [x] **Locator ladder**: `role` (fresh snapshot → live ref) → `css` → `text` → `nth`. Record
       which rung matched on every step.
-- [ ] **Template rendering** for `url`, `value`, `assert.value`, `fill_form` field values only.
+- [x] **Template rendering** for `url`, `value`, `assert.value`, `fill_form` field values only.
       Missing required input → fail before the browser opens.
-- [ ] **Action dispatch** for the §6.1 vocabulary. Each action maps to exactly one MCP tool;
+- [x] **Action dispatch** for the §6.1 vocabulary. Each action maps to exactly one MCP tool;
       resolve tool names through `mcp.find_tool` so a renamed server tool degrades gracefully.
-- [ ] **Assertions**, evaluated locally: `url_contains`, `text_present`, `element_visible`,
+- [x] **Assertions**, evaluated locally: `url_contains`, `text_present`, `element_visible`,
       `element_count`, each with `negate` and `timeout_ms`.
-- [ ] **`extract`** writes into the execution's `outputs` payload.
-- [ ] **Failure handling**: `on_failure` = `abort` | `continue` | `heal`; screenshot on failure;
+- [x] **`extract`** writes into the execution's `outputs` payload.
+- [x] **Failure handling**: `on_failure` = `abort` | `continue` | `heal`; screenshot on failure;
       record `failed_step_id`.
-- [ ] **Policy gate**: `check_navigation` on every call, using the use case's `allowed_domains`.
-- [ ] **New events** `step_started` / `step_finished` in `events.py`, mirrored in
+- [x] **Policy gate**: `check_navigation` on every call, using the use case's `allowed_domains`.
+- [x] **New events** `step_started` / `step_finished` in `events.py`, mirrored in
       `frontend/src/lib/events.ts` (`test_events.py` enforces the mirror).
-- [ ] **Credentials vault**: `credentials` table, Fernet encryption, `CREDENTIALS_KEY` setting.
+- [x] **Credentials vault**: `credentials` table, Fernet encryption, `CREDENTIALS_KEY` setting.
       With no key configured, credential storage is **disabled** — never a plaintext fallback.
-- [ ] `POST /api/usecases/{id}/execute` → `{ execution_id, run_id }`, streaming over the
+- [x] `POST /api/usecases/{id}/execute` → `{ execution_id, run_id }`, streaming over the
       existing WebSocket.
-- [ ] **Assert zero cost**: a test that executes a use case end-to-end against the static
+- [x] **Assert zero cost**: a test that executes a use case end-to-end against the static
       fixtures in `tests/fixtures/` with a fake LLM that raises if called.
 
 ## Phase 3 · UI
 
-- [ ] **"Save as use case"** button in `RunView`, enabled only for `status === 'succeeded'`.
-- [ ] **`UseCaseEditor`**: step list with action, description, locator ladder (brittle rungs
-      flagged), value. Inline edit, reorder, delete, mark optional, promote literal → input or
-      secret. Publish draft → ready.
-- [ ] Raw source shown for any `script` step, with the `allow_scripts` opt-in beside it.
-- [ ] **`UseCaseList`** nav item beside "History": name, last run, success rate, drift warning.
-- [ ] **`RunUseCase`**: form generated from the `inputs` schema, credential picker, CSV drop zone.
-- [ ] Show **tokens used: 0** on replay executions.
-- [ ] Extend `frontend/src/lib/api.ts` with the new endpoints.
+- [x] **"Save as use case"** button in `RunView`, enabled only for `status === 'succeeded'`.
+- [x] **`UseCaseView`**: the three phases shown separately, each step with its action,
+      description, value and the full locator ladder with brittle rungs (`text`, `nth`) flagged.
+      Delete a step (saved as a new version), publish draft → ready.
+  - [ ] Inline editing of a step's value, reordering, and toggling `optional` — currently only
+        delete and publish. Editing a value means re-uploading the definition via `PUT`.
+  - [ ] Promote a literal to an input or a secret from the UI. The distiller does this; a
+        reviewer who disagrees has to edit the JSON.
+- [x] Raw source shown in full for any `script` step, beside the `allow_scripts` opt-in.
+      Scripts refuse to execute until a person enables them.
+- [x] **`UseCaseList`** nav item beside "History": name, description, status, version, updated.
+  - [ ] Success rate and a drift warning per use case. The data is recorded
+        (`locator_rung` on every `step_finished`) but nothing aggregates it yet.
+- [x] **Run one** and **Run a file**: a form generated from the `inputs` schema, a credential
+      picker, a CSV textarea plus file picker.
+- [x] **Batch progress**: live per-row table, a link from a failing step into the existing
+      timeline, Resume when a batch stopped early, and the results CSV download.
+- [x] Report `llm_tokens` after a single run.
+  - [ ] Show it as a standing figure on the use case and batch views, not only in the
+        post-run notice.
+- [ ] **Credential management UI.** The picker lists what the vault holds and the API can
+      create and delete credentials, but there is no form yet — use `POST /api/credentials`.
+- [x] Extend `frontend/src/lib/api.ts` with the new endpoints.
 
 ## Phase 4 · Batch execution
 
 One shared session for the whole file; rows run sequentially. See §8 of the design.
 
-- [ ] `batches` + `executions` tables and `Store` methods.
-- [ ] CSV/JSON row parsing, validated against the `inputs` schema **before the browser opens**.
-- [ ] **Batch runner**: open one MCP session → `run_setup()` once → loop rows → teardown →
+- [x] `batches` + `executions` tables and `Store` methods.
+- [x] CSV/JSON row parsing, validated against the `inputs` schema **before the browser opens**.
+- [x] **Batch runner**: open one MCP session → `run_setup()` once → loop rows → teardown →
       close. Concurrency 1, no worker pool.
-- [ ] **Single-slot lock** in `RunManager`; a second batch request returns `409` naming the batch
+- [x] **Single-slot lock** in `RunManager`; a second batch request returns `409` naming the batch
       in flight. `GET /api/executions/active` reports the holder.
-- [ ] **Recovery contract** (§8.2), each piece tested on its own:
-  - [ ] A failed row records `failed` + `failed_step_id` + screenshot and does **not** abort the batch.
-  - [ ] `row_reset` runs before every row, failed or not.
-  - [ ] `session_check` between rows; on failure re-run `setup_steps` **once**, then re-check.
-  - [ ] Re-login failure stops the batch leaving remaining rows `pending`, never `failed`.
-  - [ ] Circuit breaker: abort after N consecutive row failures (default 5, configurable).
-- [ ] **Resume**: re-runs only rows that are not `succeeded`; opens a fresh session and re-runs
+- [x] **Recovery contract** (§8.2), each piece tested on its own:
+  - [x] A failed row records `failed` + `failed_step_id` + screenshot and does **not** abort the batch.
+  - [x] `row_reset` runs before every row, failed or not.
+  - [x] `session_check` between rows; on failure re-run `setup_steps` **once**, then re-check.
+  - [x] Re-login failure stops the batch leaving remaining rows `pending`, never `failed`.
+  - [x] Circuit breaker: abort after N consecutive row failures (default 5, configurable).
+- [x] **Resume**: re-runs only rows that are not `succeeded`; opens a fresh session and re-runs
       `setup_steps` first. Covers re-login failure, circuit breaker and process restart alike.
-- [ ] Persist authenticated state via `MCP_STORAGE_STATE` so a resume can skip an interactive
+- [x] Persist authenticated state via `MCP_STORAGE_STATE` so a resume can skip an interactive
       login where the site allows it.
-- [ ] Configurable inter-row delay (politeness / rate limiting).
-- [ ] `POST /api/usecases/{id}/batch`, `GET /api/batches/{id}`, `POST /api/batches/{id}/resume`,
+- [x] Configurable inter-row delay (politeness / rate limiting).
+- [x] `POST /api/usecases/{id}/batch`, `GET /api/batches/{id}`, `POST /api/batches/{id}/resume`,
       `POST /api/batches/{id}/cancel` (stops after the current row),
       `GET /api/batches/{id}/results.csv`.
-- [ ] **CSV export**: input columns + `status` + declared `outputs` + `failed_step_id` + `error`
+- [x] **CSV export**: input columns + `status` + declared `outputs` + `failed_step_id` + `error`
       + `duration_ms` + `llm_tokens`. Stable column order so files diff cleanly. No webhooks.
-- [ ] **`BatchView`**: progress, live per-row table, failed-row drill-down into the existing
+- [x] **`BatchView`**: progress, live per-row table, failed-row drill-down into the existing
       timeline, export button, and a visible marker when the session re-authenticated mid-batch.
 
 ## Phase 5 · Healing
@@ -144,13 +160,13 @@ One shared session for the whole file; rows run sequentially. See §8 of the des
 Confirmed in scope, and deliberately last — the zero-token path should be proven and measurable
 before anything is allowed to spend tokens again.
 
-- [ ] `on_failure: heal` escalates **one failed step** to the agent with the current snapshot.
-- [ ] Off by default per use case; hard per-batch token budget that stops healing when exhausted.
-- [ ] After any heal, run `row_reset` before continuing — a repair attempt must not leave the
+- [x] `on_failure: heal` escalates **one failed step** to the agent with the current snapshot.
+- [x] Off by default per use case; hard per-batch token budget that stops healing when exhausted.
+- [x] After any heal, run `row_reset` before continuing — a repair attempt must not leave the
       shared session in a state the next row inherits.
-- [ ] A successful heal writes a new `usecase_version` with the repaired locator; the batch
+- [x] A successful heal writes a new `usecase_version` with the repaired locator; the batch
       continues on the new version.
-- [ ] Healing events clearly labelled in the timeline; `llm_tokens` recorded per execution and
+- [x] Healing events clearly labelled in the timeline; `llm_tokens` recorded per execution and
       surfaced in the CSV, so the cost of healing is never invisible.
 
 ---
@@ -167,3 +183,21 @@ before anything is allowed to spend tokens again.
 Judgement calls I made rather than asking, all reversible and all flagged in the design:
 circuit breaker at 5 consecutive failures, exactly one automatic re-login attempt, unattempted
 rows left `pending` rather than `failed`, and the deterministic setup/row split rule in §6.0.
+
+---
+
+## What is not built
+
+Everything above that is unticked, plus:
+
+- **No end-to-end test against a real browser.** The suite fakes the MCP session throughout.
+  `tests/test_e2e_static.py` (opt-in via `RUN_E2E=1`) covers the agent path only; there is no
+  equivalent for replay, so the first real batch is the first real proof.
+- **Distillation has never been run against a live model.** The pipeline is exercised with a
+  scripted plan; the prompt in `backend/prompts/distill.md` is untested against Claude, and it
+  is the part most likely to need tuning.
+- **`browser_evaluate` is mapped to `extract`, but `extract` reads the accessibility node**
+  rather than evaluating the recorded JavaScript. A recording that extracted a value by script
+  will need its step edited.
+- **Cancelling a batch stops the task, but the in-flight row's browser call is not awaited**
+  cleanly — the session is torn down by the context manager.

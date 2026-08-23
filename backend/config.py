@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     #: Per-step wall clock ceiling inside a replay.
     replay_step_timeout: float = 30.0
 
+    #: Self-healing. OFF by default, and deliberately so: it is the best
+    #: defence against a site redesign and also the easiest way to turn a free
+    #: batch back into an expensive one. Only steps whose `on_failure` is
+    #: "heal" are ever offered a repair, and the caps below bound a whole batch.
+    replay_healing_enabled: bool = False
+    replay_heal_max_attempts: int = 3
+    replay_heal_max_tokens: int = 20_000
+
     # --- Server ------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8000

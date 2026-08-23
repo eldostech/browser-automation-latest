@@ -147,7 +147,11 @@ async def lifespan(app: FastAPI):
     app.state.bus = EventBus()
     app.state.manager = RunManager(store, settings, bus=app.state.bus)
     app.state.vault = Vault(settings.credentials_key or None)
-    app.state.replays = ReplayManager(store, settings, bus=app.state.bus)
+    # The healer is the only route from a replay to a model, and it is handed
+    # over lazily and only when healing is switched on.
+    app.state.replays = ReplayManager(
+        store, settings, bus=app.state.bus, llm_factory=lambda: app.state.manager.llm
+    )
     if not app.state.vault.available:
         log.warning(
             "credential storage is disabled: CREDENTIALS_KEY is not set. "

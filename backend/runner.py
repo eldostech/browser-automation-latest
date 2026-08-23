@@ -508,12 +508,39 @@ class ReplayManager:
     same session.
     """
 
-    def __init__(self, store: Store, settings: Settings, bus: EventBus) -> None:
+    def __init__(
+        self,
+        store: Store,
+        settings: Settings,
+        bus: EventBus,
+        llm_factory: Any = None,
+    ) -> None:
         self.store = store
         self.settings = settings
         self.bus = bus
+        #: Supplies a model *only* for healing, and only when healing is
+        #: enabled. Left None, there is no route from a replay to an LLM.
+        self.llm_factory = llm_factory
         self._slot: dict[str, Any] | None = None
         self._task: asyncio.Task | None = None
+
+    def make_healer(self) -> Any:
+        """A healer, or None when healing is off.
+
+        Returning None is the common case and is what keeps the executor's
+        zero-token guarantee true by construction.
+        """
+        if not self.settings.replay_healing_enabled or self.llm_factory is None:
+            return None
+        from healing import HealingBudget, StepHealer
+
+        return StepHealer(
+            self.llm_factory(),
+            HealingBudget(
+                max_attempts=self.settings.replay_heal_max_attempts,
+                max_tokens=self.settings.replay_heal_max_tokens,
+            ),
+        )
 
     # -- the single slot ----------------------------------------------------
     @property
@@ -682,6 +709,7 @@ class ReplayManager:
                     secrets=request.secrets,
                     redactor=redactor,
                     step_timeout=self.settings.replay_step_timeout,
+                    healer=self.make_healer(),
                 )
                 setup = await executor.run_setup()
                 if not setup.ok:
@@ -804,6 +832,7 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
                 secrets=request.secrets,
                 redactor=redactor,
                 step_timeout=manager.settings.replay_step_timeout,
+                healer=manager.make_healer(),
             )
 
             runner = BatchRunner(
@@ -832,6 +861,9 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
 
             runner.on_row = record
             progress = await runner.run()
+
+            if executor.healed:
+                await _persist_repairs(manager, usecase.id, executor.healed)
 
     except asyncio.CancelledError:
         progress.stopped_reason = "cancelled"
@@ -894,3 +926,22 @@ async def _finalise_batch(
 
 def batch_summary(progress: BatchProgress) -> str:
     return batch_summarise(progress)
+
+
+async def _persist_repairs(manager: "ReplayManager", usecase_id: str, repairs: list) -> None:
+    """Write healed locators back as a new use case version.
+
+    The whole point of healing is that the repair is paid for once. Leaving it
+    only in memory would mean paying again on the next batch.
+    """
+    from healing import apply_repairs
+
+    definition = await manager.store.get_usecase(usecase_id)
+    if definition is None:
+        return
+    patched = apply_repairs(definition, repairs)
+    _, version = await manager.store.save_usecase(patched, created_by="healing")
+    log.info(
+        "wrote healed locators back",
+        extra={"usecase_id": usecase_id, "version": version, "repairs": len(repairs)},
+    )

@@ -84,6 +84,21 @@ class EventSink(Protocol):
     ) -> tuple[str, str] | None: ...
 
 
+class Healer(Protocol):
+    """Repairs one broken step by looking at the page as it is now.
+
+    Implemented in ``healing.py``, which is the module that imports an LLM
+    client -- this one never does. A healer is injected only where healing is
+    deliberately enabled, so with none passed there is no path to a model at
+    all. That is what keeps "zero tokens" structural rather than configured.
+    """
+
+    async def repair(self, step: Step, snapshot: Any) -> Any: ...
+
+    @property
+    def tokens_used(self) -> int: ...
+
+
 class StepFailed(RuntimeError):
     """A step did not succeed and its ``on_failure`` says to stop."""
 
@@ -159,6 +174,7 @@ class UseCaseExecutor:
         redactor: Redactor | None = None,
         screenshot_on_failure: bool = True,
         step_timeout: float = 30.0,
+        healer: "Healer | None" = None,
     ) -> None:
         self.usecase = usecase
         self.mcp = mcp
@@ -168,12 +184,16 @@ class UseCaseExecutor:
         self.redactor = redactor or Redactor(self.secrets.values())
         self.screenshot_on_failure = screenshot_on_failure
         self.step_timeout = step_timeout
+        #: Optional and off by default. See :class:`Healer`.
+        self.healer = healer
 
         self.step_number = 0
         self._last_snapshot: Snapshot | None = None
         self._last_page_url: str | None = None
         #: Rungs deeper than the first, per step id. Surfaced as drift.
         self.locator_drift: dict[str, int] = {}
+        #: Repairs accepted this session, for the version bump afterwards.
+        self.healed: list[Any] = []
 
     # -- public API ---------------------------------------------------------
     async def run_setup(self) -> RowResult:
@@ -300,6 +320,14 @@ class UseCaseExecutor:
                 step_id=step.id, ok=False, duration_ms=0, message=f"{type(exc).__name__}: {exc}"
             )
 
+        # One repair attempt, only for a step that asked for it and only when a
+        # healer was deliberately injected. Everything else about this method
+        # is unchanged whether healing exists or not.
+        if not outcome.ok and step.on_failure == "heal" and self.healer is not None:
+            repaired = await self._heal(step, values, outputs if outputs is not None else {})
+            if repaired is not None:
+                outcome = repaired
+
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
 
         await self.sink.emit(
@@ -328,6 +356,61 @@ class UseCaseExecutor:
             return outcome
 
         raise StepFailed(step.id, f"step {step.id!r} ({step.summary()}) failed: {outcome.message}")
+
+    async def _heal(
+        self, step: Step, values: dict[str, Any], outputs: dict[str, Any]
+    ) -> StepOutcome | None:
+        """Ask the healer for a new locator, then retry the step once.
+
+        The repaired locator is *prepended* to the ladder rather than replacing
+        it, so a repair that turns out to be wrong degrades to what the
+        recording already knew instead of losing it.
+        """
+        assert self.healer is not None
+        await self._refresh_snapshot()
+        repair = await self.healer.repair(step, self._last_snapshot)
+        if repair is None:
+            return None
+
+        await self._emit_error(
+            "healed",
+            f"step {step.id!r} was repaired: now looks for {repair.locator.describe()} "
+            f"({repair.confidence} confidence). {repair.reason}",
+            recoverable=True,
+        )
+
+        step.locators = [repair.locator, *[l for l in step.locators if l != repair.locator]]
+        self.healed.append(repair)
+
+        try:
+            outcome = await self._perform(step, values, outputs)
+        except Exception as exc:  # noqa: BLE001 - a failed repair is a failed row
+            log.warning("retry after healing failed", extra={"step_id": step.id, "error": str(exc)})
+            return None
+
+        # The repair may have left a dialog open or the page part-way through
+        # something, so put the browser back before the next row inherits it.
+        if self.usecase.row_reset is not None:
+            try:
+                await self._do_navigate(self.usecase.row_reset, values)
+            except Exception:  # noqa: BLE001 - best effort
+                log.debug("row_reset after healing failed", extra={"step_id": step.id})
+
+        return outcome if outcome.ok else None
+
+    async def _emit_error(
+        self, kind: str, message: str, *, recoverable: bool = False
+    ) -> None:
+        await self.sink.emit(
+            ErrorEvent(
+                run_id=self.run_id,
+                seq=self.sink.reserve_seq(),
+                step=self.step_number,
+                kind=kind,
+                message=self.redactor.text(message),
+                recoverable=recoverable,
+            )
+        )
 
     async def _perform(
         self, step: Step, values: dict[str, Any], outputs: dict[str, Any]

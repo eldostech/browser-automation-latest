@@ -1,0 +1,14 @@
+The step that failed:
+
+- what it does: $step
+- action: $action
+- element it used to find: $wanted
+
+Current page: $page_url
+
+Controls on the page now:
+
+$candidates
+
+Which index is the element this step should act on? Answer -1 if none of them
+is right.
