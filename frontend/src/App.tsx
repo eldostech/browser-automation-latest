@@ -3,8 +3,15 @@ import { api } from './lib/api';
 import { RunHistory } from './components/RunHistory';
 import { RunView } from './components/RunView';
 import { TaskComposer } from './components/TaskComposer';
+import { UseCaseList } from './components/UseCaseList';
+import { UseCaseView } from './components/UseCaseView';
 
-type View = { name: 'compose' } | { name: 'history' } | { name: 'run'; runId: string };
+type View =
+  | { name: 'compose' }
+  | { name: 'history' }
+  | { name: 'run'; runId: string }
+  | { name: 'usecases' }
+  | { name: 'usecase'; usecaseId: string };
 
 /** The run id lives in the URL hash so a live run can be shared or reloaded. */
 function viewFromHash(): View {
@@ -13,12 +20,19 @@ function viewFromHash(): View {
     const runId = hash.slice('runs/'.length);
     if (runId) return { name: 'run', runId };
   }
+  if (hash.startsWith('usecases/')) {
+    const usecaseId = hash.slice('usecases/'.length);
+    if (usecaseId) return { name: 'usecase', usecaseId };
+  }
+  if (hash === 'usecases') return { name: 'usecases' };
   if (hash === 'history') return { name: 'history' };
   return { name: 'compose' };
 }
 
 function hashFor(view: View): string {
   if (view.name === 'run') return `#/runs/${view.runId}`;
+  if (view.name === 'usecase') return `#/usecases/${view.usecaseId}`;
+  if (view.name === 'usecases') return '#/usecases';
   if (view.name === 'history') return '#/history';
   return '#/';
 }
@@ -69,6 +83,14 @@ export default function App() {
           >
             History
           </button>
+          <button
+            type="button"
+            className={view.name === 'usecases' || view.name === 'usecase' ? 'active' : ''}
+            onClick={() => navigate({ name: 'usecases' })}
+            title="Recorded steps that replay without an LLM"
+          >
+            Use cases
+          </button>
         </nav>
         <span className="spacer" />
         <span className="meta">
@@ -80,7 +102,7 @@ export default function App() {
         </span>
       </header>
 
-      <main className={view.name === 'run' ? 'page' : 'page narrow'}>
+      <main className={view.name === 'run' || view.name === 'usecase' ? 'page' : 'page narrow'}>
         {view.name === 'compose' && (
           <>
             {health?.status === 'degraded' && (
@@ -98,7 +120,23 @@ export default function App() {
         )}
 
         {view.name === 'run' && (
-          <RunView runId={view.runId} onBack={() => navigate({ name: 'history' })} />
+          <RunView
+            runId={view.runId}
+            onBack={() => navigate({ name: 'history' })}
+            onRecorded={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
+          />
+        )}
+
+        {view.name === 'usecases' && (
+          <UseCaseList onOpen={(usecaseId) => navigate({ name: 'usecase', usecaseId })} />
+        )}
+
+        {view.name === 'usecase' && (
+          <UseCaseView
+            usecaseId={view.usecaseId}
+            onBack={() => navigate({ name: 'usecases' })}
+            onOpenRun={(runId) => navigate({ name: 'run', runId })}
+          />
         )}
       </main>
     </div>

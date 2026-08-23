@@ -633,3 +633,160 @@ table.runs .task-cell button:hover {
   border-color: var(--accent-dim);
   color: #b8d0f7;
 }
+
+/* ---------------------------------------------------------------------------
+   Use cases: recorded steps that replay without an LLM
+   --------------------------------------------------------------------------- */
+
+.banner.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* One phase of a use case. The locator ladder is shown rather than hidden:
+   which rung a step relies on predicts whether it still works next month. */
+.usecase-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usecase-steps > li {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.step-head .action {
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--accent-dim);
+  color: var(--accent);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.step-head .summary {
+  flex: 1;
+  min-width: 200px;
+}
+
+.step-head .tag {
+  font-size: 11px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.step-detail {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.step-detail .label {
+  color: var(--text-faint);
+  min-width: 76px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.step-detail code {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* Ladder rungs. The first is tried first; a brittle one is flagged because
+   falling through to it is the early warning that a site has drifted. */
+code.locator {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-right: 6px;
+  display: inline-block;
+}
+
+code.locator.brittle {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.step-script {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.step-script summary {
+  cursor: pointer;
+  color: var(--danger);
+}
+
+.step-script pre {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-x: auto;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 6px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.kv .label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  margin-bottom: 4px;
+}
+
+.progress {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+}
+
+button.link.danger {
+  color: var(--danger);
+  margin-left: auto;
+}

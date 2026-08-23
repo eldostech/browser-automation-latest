@@ -7,7 +7,19 @@
  * query string.
  */
 
-import type { AgentEvent, RunDetail, RunSummary, ServerConfig } from './events';
+import type {
+  AgentEvent,
+  BatchDetail,
+  BatchSummary,
+  CredentialSummary,
+  DistillResult,
+  ExecutionRecord,
+  RunDetail,
+  RunSummary,
+  ServerConfig,
+  UseCase,
+  UseCaseSummary,
+} from './events';
 
 /** Empty by default: Vite (dev) and nginx (prod) proxy /api to the backend. */
 export const API_BASE: string = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
@@ -87,7 +99,107 @@ export const api = {
     }),
 
   health: () => request<Record<string, unknown>>('/healthz'),
+
+  // --- use cases ------------------------------------------------------------
+
+  /** Promote a succeeded run into a reusable use case. The one LLM call. */
+  distillRun: (runId: string) =>
+    request<DistillResult>(`/api/runs/${runId}/distill`, { method: 'POST' }),
+
+  listUseCases: (status?: string) => {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    return request<{ usecases: UseCaseSummary[] }>(`/api/usecases?${params}`);
+  },
+
+  getUseCase: (id: string, version?: number) => {
+    const params = new URLSearchParams();
+    if (version) params.set('version', String(version));
+    return request<{ definition: UseCase; versions: { version: number; created_at: string }[] }>(
+      `/api/usecases/${id}?${params}`,
+    );
+  },
+
+  /** Saves reviewer edits as a NEW version; existing versions are immutable. */
+  updateUseCase: (id: string, definition: UseCase) =>
+    request<{ usecase_id: string; version: number; status: string }>(`/api/usecases/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(definition),
+    }),
+
+  publishUseCase: (id: string) =>
+    request<{ usecase_id: string; status: string }>(`/api/usecases/${id}/publish`, {
+      method: 'POST',
+    }),
+
+  archiveUseCase: (id: string) =>
+    request<{ usecase_id: string; status: string }>(`/api/usecases/${id}`, { method: 'DELETE' }),
+
+  // --- executing (zero LLM calls) -------------------------------------------
+
+  executeUseCase: (
+    id: string,
+    payload: { inputs: Record<string, unknown>; credential_id?: string | null },
+  ) =>
+    request<{
+      execution_id: string;
+      run_id: string;
+      status: string;
+      outputs: Record<string, unknown>;
+      error: string | null;
+      llm_calls: number;
+      llm_tokens: number;
+    }>(`/api/usecases/${id}/execute`, { method: 'POST', body: JSON.stringify(payload) }),
+
+  listExecutions: (usecaseId: string) =>
+    request<{ executions: ExecutionRecord[] }>(`/api/usecases/${usecaseId}/executions`),
+
+  activeExecution: () =>
+    request<{ active: Record<string, unknown> | null }>('/api/executions/active'),
+
+  // --- batches ---------------------------------------------------------------
+
+  startBatch: (id: string, payload: { csv: string; credential_id?: string | null }) =>
+    request<{ batch_id: string; total: number; columns: string[]; warnings: string[] }>(
+      `/api/usecases/${id}/batch`,
+      { method: 'POST', body: JSON.stringify(payload) },
+    ),
+
+  getBatch: (batchId: string) => request<BatchDetail>(`/api/batches/${batchId}`),
+
+  listBatches: (usecaseId: string) =>
+    request<{ batches: BatchSummary[] }>(`/api/usecases/${usecaseId}/batches`),
+
+  resumeBatch: (batchId: string, credentialId?: string | null) =>
+    request<{ batch_id: string; rows: number }>(`/api/batches/${batchId}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({ credential_id: credentialId ?? null }),
+    }),
+
+  cancelBatch: (batchId: string) =>
+    request<{ batch_id: string; cancelled: boolean }>(`/api/batches/${batchId}/cancel`, {
+      method: 'POST',
+    }),
+
+  // --- credentials (write-only) ---------------------------------------------
+
+  listCredentials: () =>
+    request<{ credentials: CredentialSummary[]; vault_available: boolean }>('/api/credentials'),
+
+  createCredential: (name: string, values: Record<string, string>) =>
+    request<{ id: string; name: string; slots: string[] }>('/api/credentials', {
+      method: 'POST',
+      body: JSON.stringify({ name, values }),
+    }),
+
+  deleteCredential: (id: string) =>
+    request<{ id: string; deleted: boolean }>(`/api/credentials/${id}`, { method: 'DELETE' }),
 };
+
+/** Download URL for a finished batch's results. */
+export function batchResultsUrl(batchId: string): string {
+  return `${API_BASE}/api/batches/${batchId}/results.csv`;
+}
 
 /** Absolute URL for an artifact returned by the backend as a relative path. */
 export function artifactUrl(url: string): string {

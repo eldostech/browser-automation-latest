@@ -12,6 +12,8 @@ import { Timeline } from './Timeline';
 interface Props {
   runId: string;
   onBack: () => void;
+  /** Opens the review screen for a use case distilled from this run. */
+  onRecorded?: (usecaseId: string) => void;
 }
 
 /**
@@ -19,10 +21,11 @@ interface Props {
  * replays the persisted history from seq 0 and then closes, so there is one
  * rendering path instead of two.
  */
-export function RunView({ runId, onBack }: Props) {
+export function RunView({ runId, onBack, onRecorded }: Props) {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pinnedShot, setPinnedShot] = useState<number | null>(null);
+  const [recording, setRecording] = useState(false);
 
   const stream = useRunStream(runId);
 
@@ -76,6 +79,24 @@ export function RunView({ runId, onBack }: Props) {
     [runId, stream.pendingApproval],
   );
 
+  /**
+   * Turn this run into a reusable use case. This is the only LLM call the
+   * replay feature ever makes: everything the use case is later run with
+   * costs nothing.
+   */
+  const record = useCallback(async () => {
+    setRecording(true);
+    setActionError(null);
+    try {
+      const result = await api.distillRun(runId);
+      onRecorded?.(result.usecase_id);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRecording(false);
+    }
+  }, [runId, onRecorded]);
+
   const status = stream.status;
   const running = !isTerminal(status);
 
@@ -97,6 +118,17 @@ export function RunView({ runId, onBack }: Props) {
           </div>
           <p>{detail?.task ?? 'Loading task...'}</p>
         </div>
+        {status === 'succeeded' && (
+          <button
+            type="button"
+            className="primary"
+            onClick={record}
+            disabled={recording}
+            title="Record these steps so they can be replayed with no LLM calls"
+          >
+            {recording ? 'Recording...' : 'Save as use case'}
+          </button>
+        )}
         {running && (
           <button type="button" className="danger" onClick={cancel}>
             Cancel run

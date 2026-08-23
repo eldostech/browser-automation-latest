@@ -210,3 +210,167 @@ export interface ServerConfig {
   provider: string;
   transport: string;
 }
+
+// ---------------------------------------------------------------------------
+// Use cases: a recorded run, replayable without an LLM
+// ---------------------------------------------------------------------------
+
+export type UseCaseStatus = 'draft' | 'ready' | 'archived';
+
+/** One rung of the locator ladder, most durable first. */
+export interface Locator {
+  strategy: 'role' | 'css' | 'text' | 'nth';
+  role?: string | null;
+  name?: string | null;
+  selector?: string | null;
+  text?: string | null;
+  nth?: number;
+}
+
+export interface Assertion {
+  kind: 'url_contains' | 'text_present' | 'element_visible' | 'element_count' | 'title_contains';
+  value?: string | null;
+  count?: number | null;
+  locator?: Locator | null;
+  negate?: boolean;
+  timeout_ms?: number;
+}
+
+export interface FormFieldSpec {
+  name: string;
+  value: string;
+  type: string;
+  locators: Locator[];
+}
+
+export interface UseCaseStep {
+  id: string;
+  action: string;
+  description: string;
+  locators: Locator[];
+  url?: string | null;
+  value?: string | null;
+  fields: FormFieldSpec[];
+  output?: string | null;
+  code?: string | null;
+  assert?: Assertion | null;
+  wait_for?: Record<string, unknown> | null;
+  optional: boolean;
+  on_failure: 'abort' | 'continue' | 'heal';
+  timeout_ms: number;
+  rejected_locators: Locator[];
+}
+
+export interface InputSpec {
+  name: string;
+  type: 'string' | 'url' | 'number' | 'boolean' | 'file';
+  required: boolean;
+  default?: unknown;
+  description: string;
+  example: string;
+}
+
+export interface SecretSpec {
+  name: string;
+  required: boolean;
+  description: string;
+}
+
+export interface UseCase {
+  schema_version: number;
+  id: string;
+  name: string;
+  description: string;
+  status: UseCaseStatus;
+  version: number;
+  source_run_id: string | null;
+  allowed_domains: string[];
+  /** Raw-JavaScript steps refuse to run until a person turns this on. */
+  allow_scripts: boolean;
+  inputs: InputSpec[];
+  secrets: SecretSpec[];
+  /** Runs once per batch — the sign-in. */
+  setup_steps: UseCaseStep[];
+  session_check: Assertion | null;
+  row_reset: UseCaseStep | null;
+  /** Runs once per input row. */
+  row_steps: UseCaseStep[];
+  teardown_steps: UseCaseStep[];
+  outputs: string[];
+  warnings: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UseCaseSummary {
+  id: string;
+  name: string;
+  description: string;
+  status: UseCaseStatus;
+  current_version: number;
+  source_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DistillResult {
+  usecase_id: string;
+  version: number;
+  name: string;
+  status: UseCaseStatus;
+  warnings: string[];
+  setup_steps: number;
+  row_steps: number;
+  inputs: string[];
+  secrets: string[];
+  blocked_scripts: string[];
+}
+
+export interface ExecutionRecord {
+  id: string;
+  batch_id: string | null;
+  usecase_id: string;
+  version: number;
+  run_id: string | null;
+  row_index: number | null;
+  inputs: Record<string, unknown>;
+  outputs: Record<string, unknown> | null;
+  status: 'pending' | 'running' | 'succeeded' | 'failed';
+  failed_step_id: string | null;
+  error: string | null;
+  /** Always 0 for a replay. That is the point of the feature. */
+  llm_calls: number;
+  llm_tokens: number;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export interface BatchSummary {
+  id: string;
+  usecase_id: string;
+  version: number;
+  status: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  credential_id: string | null;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface BatchDetail {
+  batch: BatchSummary;
+  executions: ExecutionRecord[];
+  running: boolean;
+  /** Rows never attempted — a stopped batch leaves these, and resume runs them. */
+  pending: number;
+}
+
+export interface CredentialSummary {
+  id: string;
+  name: string;
+  slots: string[];
+  created_at: string;
+  last_used_at: string | null;
+}
