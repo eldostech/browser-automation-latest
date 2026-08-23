@@ -582,6 +582,26 @@ ACTIONS_WE_CAN_REPLAY: frozenset[str] = frozenset(
 )
 
 
+def _frozen_literals(steps: Iterable[Step], literals: list[str]) -> list[str]:
+    """Recorded values baked into script code, and therefore fixed for every row.
+
+    A `script` step is opaque: nothing can substitute into JavaScript, so any
+    literal inside it is frozen at whatever the recording happened to do. When
+    those literals were *answers* rather than settings, the task is not
+    replayable at all -- and that is much better said out loud than discovered
+    on row 400.
+    """
+    code = "\n".join(step.code or "" for step in steps if step.action == "script")
+    if not code:
+        return []
+    found: list[str] = []
+    for literal in literals:
+        # Short values match too eagerly inside code; a bare "2" is noise.
+        if len(literal) >= 2 and literal in code and literal not in found:
+            found.append(literal)
+    return found
+
+
 def _assertion_from(spec: dict[str, Any]) -> Assertion:
     return Assertion(
         kind=spec["kind"],
@@ -760,12 +780,44 @@ def build_usecase(
             "success even when a row silently did nothing. Add at least one before publishing."
         )
 
-    scripts = [s.id for s in (*setup_steps, *row_steps, *teardown_steps) if s.action == "script"]
+    all_steps = (*setup_steps, *row_steps, *teardown_steps)
+
+    scripts = [s.id for s in all_steps if s.action == "script"]
     if scripts:
         warnings.append(
             "contains raw-JavaScript step(s) "
             + ", ".join(scripts)
             + ". Read the code, then set allow_scripts if they are genuinely needed."
+        )
+
+    # An input nothing reads is worse than useless: it demands a value per row
+    # and then ignores it. This happens when the model parameterises a literal
+    # that lives inside `script` code, which nothing can substitute into.
+    declared = [InputSpec(**spec) for spec in (plan.get("inputs") or [])]
+    referenced = {name for step in all_steps for kind, name in step.references() if kind == "input"}
+    if row_reset is not None:
+        referenced |= {name for kind, name in row_reset.references() if kind == "input"}
+
+    used = [spec for spec in declared if spec.name in referenced]
+    unused = [spec.name for spec in declared if spec.name not in referenced]
+    if unused:
+        warnings.append(
+            "dropped input(s) that no step reads: "
+            + ", ".join(unused)
+            + ". They were removed rather than asked for on every row. If these values really "
+            "do change per record, the step that uses them has to read them -- which a "
+            "raw-JavaScript step cannot do, because nothing substitutes into code."
+        )
+
+    # Literals frozen inside script code, so a reviewer can see what will be
+    # identical on every single row.
+    frozen = _frozen_literals(all_steps, pre.literals)
+    if frozen:
+        warnings.append(
+            "these recorded values are hard-coded inside script step(s) and will be "
+            "IDENTICAL on every row: "
+            + ", ".join(repr(v) for v in frozen[:8])
+            + ". If they should vary per record, this task cannot be replayed as recorded."
         )
 
     usecase = UseCase(
@@ -775,7 +827,7 @@ def build_usecase(
         source_run_id=source_run_id,
         allowed_domains=list(pre.domains),
         allow_scripts=False,
-        inputs=[InputSpec(**spec) for spec in (plan.get("inputs") or [])],
+        inputs=used,
         secrets=[SecretSpec(**spec) for spec in (plan.get("secrets") or [])],
         setup_steps=setup_steps,
         session_check=session_check,

@@ -485,3 +485,77 @@ def test_a_step_the_schema_rejects_is_dropped_with_a_warning_not_a_crash():
     assert [s.action for s in use_case.row_steps] == ["navigate"], "the good step survives"
     assert any("could not be turned into a replayable step" in w for w in use_case.warnings)
     assert any("browser_click" in w for w in use_case.warnings)
+
+
+# --- inputs that nothing reads ---------------------------------------------
+
+
+def test_an_input_no_step_reads_is_dropped_with_a_warning():
+    """Regression: the model parameterised literals living inside script code.
+
+    `values` substitutes into a step's typed value; nothing substitutes into
+    JavaScript. The result demanded seven area measurements per row and then
+    ignored all of them.
+    """
+    recording = pre_filter(
+        build_events(
+            ("browser_navigate", {"url": "https://example.com/p"}, True, "ok"),
+            ("browser_run_code_unsafe", {"code": "await inputs.nth(0).fill('20')"}, True, "ok"),
+        )
+    )
+    plan = {
+        "name": "x",
+        "inputs": [
+            {"name": "problem_url", "type": "url"},
+            {"name": "rect1_area", "type": "string"},
+        ],
+        "row_step_ids": ["s1", "s2"],
+        "urls": {"s1": "{{input.problem_url}}"},
+        # rect1_area is declared but wired to nothing.
+    }
+    use_case = build_usecase(plan, recording)
+
+    assert [spec.name for spec in use_case.inputs] == ["problem_url"]
+    assert any("rect1_area" in w and "no step reads" in w for w in use_case.warnings)
+
+
+def test_values_frozen_inside_a_script_are_called_out():
+    recording = pre_filter(
+        build_events(
+            ("browser_type", {"target": "#a", "text": "48.06"}, True, "ok"),
+            ("browser_run_code_unsafe", {"code": "await x.fill('48.06')"}, True, "ok"),
+        )
+    )
+    use_case = build_usecase({"name": "x", "row_step_ids": ["s1", "s2"]}, recording)
+
+    assert any("IDENTICAL on every row" in w and "48.06" in w for w in use_case.warnings)
+
+
+def test_an_input_that_is_used_survives():
+    recording = pre_filter(
+        build_events(("browser_navigate", {"url": "https://example.com/p"}, True, "ok"))
+    )
+    plan = {
+        "name": "x",
+        "inputs": [{"name": "page_url", "type": "url"}],
+        "row_step_ids": ["s1"],
+        "urls": {"s1": "{{input.page_url}}"},
+    }
+    use_case = build_usecase(plan, recording)
+
+    assert [spec.name for spec in use_case.inputs] == ["page_url"]
+    assert not any("no step reads" in w for w in use_case.warnings)
+
+
+def test_an_input_used_only_by_row_reset_is_kept():
+    recording = pre_filter(
+        build_events(("browser_click", {"target": "#a"}, True, "ok"))
+    )
+    plan = {
+        "name": "x",
+        "inputs": [{"name": "start_url", "type": "url"}],
+        "row_step_ids": ["s1"],
+        "row_reset_url": "{{input.start_url}}",
+    }
+    use_case = build_usecase(plan, recording)
+    assert [spec.name for spec in use_case.inputs] == ["start_url"]

@@ -63,6 +63,20 @@ It is **always** a secret: declare one and reference it.
 Use `snake_case` names that say what the value is (`practice_url`, `answer`,
 `password`), never `input1` or `value`.
 
+**Only declare an input you can actually wire to a step.** You substitute
+values through `values` (a step's typed value) and `urls` (a navigate step's
+URL). Nothing substitutes into a `script` step's code — JavaScript is opaque to
+the runner. So a literal that lives *only* inside a script cannot become an
+input, however much it looks like one. Declaring it anyway produces a use case
+that demands a value on every row and then ignores it.
+
+**A value the recording had to work out is not an input.** If the number was
+computed by reading the page — a total, an answer, a result — then asking the
+person running the batch to supply it means asking them to do the task
+themselves. Leave it alone and say so in the description. A task whose per-row
+work is *reasoning about what is on screen* cannot be replayed without a model,
+and it is far better to record that honestly than to dress it up as inputs.
+
 ### 4. Add assertions
 
 A deterministic replay has no judgement, so without assertions a batch fails

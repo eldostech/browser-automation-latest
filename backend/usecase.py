@@ -492,6 +492,30 @@ class UseCase(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _published_inputs_are_all_used(self) -> "UseCase":
+        """A published use case may not demand an input nothing reads.
+
+        An unused input is worse than useless: whoever runs it has to supply a
+        value for every row, and nothing does anything with it. It happens when
+        a literal gets parameterised inside `script` code, which nothing can
+        substitute into. Checked at ``ready`` so a draft can still be inspected.
+        """
+        if self.status != "ready":
+            return self
+        referenced = {
+            name for step in self.all_steps for kind, name in step.references() if kind == "input"
+        }
+        unused = [spec.name for spec in self.inputs if spec.name not in referenced]
+        if unused:
+            raise ValueError(
+                "cannot publish: these inputs are declared but no step reads them ("
+                + ", ".join(unused)
+                + "). Either wire them into a step or remove them -- asking for a value on "
+                "every row and then ignoring it is never right."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _declared_outputs_match_extract_steps(self) -> "UseCase":
         produced = {s.output for s in self.all_steps if s.action == "extract" and s.output}
         declared = set(self.outputs)

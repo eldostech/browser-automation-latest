@@ -423,3 +423,14 @@ def test_the_actions_that_do_need_a_target_still_require_one(action):
     kwargs = {"output": "x"} if action == "extract" else {}
     with pytest.raises(ValidationError, match="requires at least one locator"):
         Step(id="s1", action=action, **kwargs)
+
+
+def test_publishing_with_an_input_nothing_reads_is_refused():
+    """Asking for a value on every row and ignoring it is never right."""
+    with pytest.raises(ValidationError, match="no step reads them"):
+        simple(status="ready", inputs=[InputSpec(name="unused_thing")])
+
+
+def test_a_draft_may_hold_an_unused_input_so_it_can_be_reviewed():
+    use_case = simple(inputs=[InputSpec(name="unused_thing")])
+    assert [i.name for i in use_case.inputs] == ["unused_thing"]
