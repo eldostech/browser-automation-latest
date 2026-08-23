@@ -751,6 +751,75 @@ class Store:
             "created_at": row["created_at"],
         }
 
+
+    # -- batches ------------------------------------------------------------
+    async def create_batch(
+        self,
+        batch_id: str,
+        usecase_id: str,
+        version: int,
+        *,
+        total: int,
+        credential_id: str | None = None,
+    ) -> None:
+        await self.db.execute(
+            "INSERT INTO batches (id, usecase_id, version, status, total, credential_id,"
+            " created_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (batch_id, usecase_id, version, total, credential_id, _now()),
+        )
+        await self.db.commit()
+
+    async def update_batch(
+        self,
+        batch_id: str,
+        *,
+        status: str | None = None,
+        succeeded: int | None = None,
+        failed: int | None = None,
+        error: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        assignments: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("status", status),
+            ("succeeded", succeeded),
+            ("failed", failed),
+            ("error", error),
+        ):
+            if value is not None:
+                assignments.append(f"{column}=?")
+                params.append(value)
+        if finished:
+            assignments.append("finished_at=?")
+            params.append(_now())
+        if not assignments:
+            return
+        params.append(batch_id)
+        await self.db.execute(
+            f"UPDATE batches SET {', '.join(assignments)} WHERE id=?", params
+        )
+        await self.db.commit()
+
+    async def get_batch(self, batch_id: str) -> dict[str, Any] | None:
+        async with self.db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_batches(
+        self, *, usecase_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM batches"
+        params: list[Any] = []
+        if usecase_id:
+            sql += " WHERE usecase_id=?"
+            params.append(usecase_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self.db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     # -- artifacts ----------------------------------------------------------
     async def save_artifact(
         self,

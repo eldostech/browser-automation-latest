@@ -22,10 +22,11 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
 from agent import RunOptions
+from batch import BatchInputError, parse_csv, results_csv, rows_from_json, validate_rows
 from config import Settings, settings
 from credentials import (
     NO_KEY_MESSAGE,
@@ -40,6 +41,7 @@ from llm import llm_health
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
 from runner import (
+    BatchRequest,
     EventBus,
     ExecutionBusy,
     ExecutionRequest,
@@ -715,6 +717,229 @@ async def list_usecase_executions(
     store: Store = Depends(get_store),
 ) -> dict[str, Any]:
     return {"executions": await store.list_executions(usecase_id=usecase_id, limit=limit)}
+
+
+# ---------------------------------------------------------------------------
+# Batches: one use case over many rows, one shared session
+# ---------------------------------------------------------------------------
+
+
+class BatchRequestBody(BaseModel):
+    """Rows arrive either as raw CSV text or as a JSON array of objects."""
+
+    csv: str | None = None
+    rows: list[dict[str, Any]] | None = None
+    credential_id: str | None = None
+    secrets: dict[str, str] | None = None
+    version: int | None = None
+    headless: bool | None = None
+    browser: str | None = None
+
+
+async def _load_usecase_for_execution(
+    usecase_id: str, version: int | None, store: Store
+) -> tuple[UseCase, int]:
+    definition = await store.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="use case not found")
+    try:
+        use_case = UseCase.model_validate(definition)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
+    if use_case.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"this use case is {use_case.status!r}. Review it and publish it before "
+                "running it against a file."
+            ),
+        )
+    return use_case, int(definition.get("version") or 1)
+
+
+@app.post("/api/usecases/{usecase_id}/batch", status_code=202)
+async def start_batch(
+    usecase_id: str,
+    body: BatchRequestBody,
+    store: Store = Depends(get_store),
+    vault: Vault = Depends(get_vault),
+    replays: ReplayManager = Depends(get_replays),
+) -> dict[str, Any]:
+    """Run a use case over a file of input rows. **No LLM call is made.**
+
+    Every row is validated against the input schema before a browser opens, so
+    a bad column fails in a millisecond rather than on record 700.
+    """
+    use_case, version = await _load_usecase_for_execution(usecase_id, body.version, store)
+
+    try:
+        parsed = parse_csv(body.csv) if body.csv is not None else rows_from_json(body.rows)
+    except BatchInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    problems = validate_rows(use_case, parsed)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "the input file does not match this use case", "problems": problems},
+        )
+
+    secrets = await _resolve_secrets(
+        ExecuteRequest(credential_id=body.credential_id, secrets=body.secrets), store, vault
+    )
+    missing = use_case.missing_secrets(secrets)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"missing required credential slot(s): {', '.join(missing)}",
+        )
+
+    try:
+        batch_id = await replays.start_batch(
+            BatchRequest(
+                usecase=use_case,
+                version=version,
+                rows=parsed.rows,
+                secrets=secrets,
+                credential_id=body.credential_id,
+                headless=body.headless,
+                browser=body.browser,
+            )
+        )
+    except ExecutionBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "batch_id": batch_id,
+        "total": len(parsed),
+        "columns": parsed.columns,
+        "warnings": parsed.warnings,
+    }
+
+
+@app.get("/api/batches/{batch_id}")
+async def get_batch(
+    batch_id: str,
+    store: Store = Depends(get_store),
+    replays: ReplayManager = Depends(get_replays),
+) -> dict[str, Any]:
+    batch = await store.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+
+    executions = await store.list_executions(batch_id=batch_id)
+    active = replays.active
+    return {
+        "batch": batch,
+        "executions": executions,
+        "running": bool(active and active.get("batch_id") == batch_id),
+        "pending": sum(1 for row in executions if row["status"] == "pending"),
+    }
+
+
+@app.post("/api/batches/{batch_id}/resume", status_code=202)
+async def resume_batch(
+    batch_id: str,
+    body: BatchRequestBody,
+    store: Store = Depends(get_store),
+    vault: Vault = Depends(get_vault),
+    replays: ReplayManager = Depends(get_replays),
+) -> dict[str, Any]:
+    """Re-run only the rows that are not ``succeeded``.
+
+    Covers all three ways a batch ends early -- re-login failure, the circuit
+    breaker, and a process restart -- identically.
+    """
+    batch = await store.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+
+    outstanding = await replays.pending_row_indices(batch_id)
+    if not outstanding:
+        raise HTTPException(status_code=409, detail="every row in this batch already succeeded")
+
+    use_case, version = await _load_usecase_for_execution(
+        batch["usecase_id"], batch["version"], store
+    )
+
+    executions = await store.list_executions(batch_id=batch_id)
+    by_index = {int(row["row_index"]): row["inputs"] for row in executions if row["row_index"] is not None}
+    highest = max(by_index) if by_index else -1
+    rows = [by_index.get(index, {}) for index in range(highest + 1)]
+
+    secrets = await _resolve_secrets(
+        ExecuteRequest(
+            credential_id=body.credential_id or batch.get("credential_id"),
+            secrets=body.secrets,
+        ),
+        store,
+        vault,
+    )
+    missing = use_case.missing_secrets(secrets)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"missing required credential slot(s): {', '.join(missing)}",
+        )
+
+    try:
+        new_id = await replays.start_batch(
+            BatchRequest(
+                usecase=use_case,
+                version=version,
+                rows=rows,
+                secrets=secrets,
+                credential_id=body.credential_id or batch.get("credential_id"),
+                only_rows=outstanding,
+                headless=body.headless,
+                browser=body.browser,
+            )
+        )
+    except ExecutionBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {"batch_id": new_id, "resumed_from": batch_id, "rows": len(outstanding)}
+
+
+@app.post("/api/batches/{batch_id}/cancel")
+async def cancel_batch(
+    batch_id: str, replays: ReplayManager = Depends(get_replays)
+) -> dict[str, Any]:
+    """Stop after the row in flight finishes."""
+    active = replays.active
+    if not active or active.get("batch_id") != batch_id:
+        raise HTTPException(status_code=409, detail="that batch is not running")
+    return {"batch_id": batch_id, "cancelled": await replays.cancel_active()}
+
+
+@app.get("/api/batches/{batch_id}/results.csv")
+async def batch_results_csv(
+    batch_id: str, store: Store = Depends(get_store)
+) -> PlainTextResponse:
+    """One row out per row in, in a stable column order so files diff cleanly."""
+    batch = await store.get_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+
+    definition = await store.get_usecase(batch["usecase_id"], batch["version"])
+    if definition is None:
+        raise HTTPException(status_code=404, detail="the use case this batch ran is gone")
+
+    body = results_csv(
+        UseCase.model_validate(definition), await store.list_executions(batch_id=batch_id)
+    )
+    return PlainTextResponse(
+        body,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="batch-{batch_id[:8]}.csv"'},
+    )
+
+
+@app.get("/api/usecases/{usecase_id}/batches")
+async def list_usecase_batches(
+    usecase_id: str, store: Store = Depends(get_store)
+) -> dict[str, Any]:
+    return {"batches": await store.list_batches(usecase_id=usecase_id)}
 
 
 @app.get("/api/artifacts/{artifact_id}")

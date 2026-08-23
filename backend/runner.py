@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agent import AgentOutcome, AgentSpec, BrowserAgent, RunOptions
+from batch import BatchProgress, BatchRunner, new_batch_id
+from batch import summarise as batch_summarise
 from config import Settings
 from events import (
     AgentEvent,
@@ -538,6 +540,57 @@ class ReplayManager:
         self._task.cancel()
         return True
 
+    # -- batches ------------------------------------------------------------
+    async def start_batch(self, request: BatchRequest) -> str:
+        """Claim the slot and drive a batch in the background.
+
+        Returns immediately with the batch id: a thousand rows is not an HTTP
+        request, so progress is polled from ``GET /api/batches/{id}``.
+        """
+        usecase = request.usecase
+        indices = (
+            list(request.only_rows)
+            if request.only_rows is not None
+            else list(range(len(request.rows)))
+        )
+        batch_id = new_batch_id()
+
+        self._claim(
+            f"{usecase.name} ({len(indices)} rows)",
+            batch_id=batch_id,
+            usecase_id=usecase.id,
+            rows=len(indices),
+        )
+        await self.store.create_batch(
+            batch_id,
+            usecase.id,
+            request.version,
+            total=len(indices),
+            credential_id=request.credential_id,
+        )
+
+        async def drive() -> None:
+            try:
+                await _run_batch(self, batch_id, request)
+            finally:
+                self._release()
+
+        self._task = asyncio.create_task(drive(), name=f"batch-{batch_id}")
+        return batch_id
+
+    async def pending_row_indices(self, batch_id: str) -> list[int]:
+        """Row indices that are not ``succeeded``.
+
+        This is what makes resume cover all three early exits identically:
+        re-login failure, the circuit breaker, and a process restart.
+        """
+        executions = await self.store.list_executions(batch_id=batch_id)
+        return [
+            int(row["row_index"])
+            for row in executions
+            if row["status"] != "succeeded" and row["row_index"] is not None
+        ]
+
     # -- single-row execution ----------------------------------------------
     async def execute_once(self, request: ExecutionRequest) -> dict[str, Any]:
         """Run setup plus one row, and return the outcome.
@@ -671,3 +724,173 @@ def _iso_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(slots=True)
+class BatchRequest:
+    usecase: UseCase
+    version: int
+    rows: list[dict[str, Any]]
+    secrets: dict[str, str] = field(default_factory=dict)
+    credential_id: str | None = None
+    headless: bool | None = None
+    browser: str | None = None
+    #: Row indices to run. ``None`` means all of them; a resume passes the
+    #: indices that are not yet ``succeeded``.
+    only_rows: list[int] | None = None
+
+
+async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequest) -> None:
+    """Drive one batch to completion on a single shared browser session."""
+    store = manager.store
+    usecase = request.usecase
+    indices = (
+        list(request.only_rows)
+        if request.only_rows is not None
+        else list(range(len(request.rows)))
+    )
+    rows = [request.rows[i] for i in indices]
+
+    run_id = uuid.uuid4().hex
+    redactor = Redactor(request.secrets.values())
+    sink = RunEventSink(run_id, store, manager.bus, redactor=redactor)
+    mcp_config = MCPConfig.from_settings(
+        manager.settings, headless=request.headless, browser=request.browser
+    )
+
+    await store.create_run(
+        run_id,
+        f"Batch: {usecase.name} ({len(rows)} rows)",
+        None,
+        {"usecase_id": usecase.id, "version": request.version, "batch_id": batch_id,
+         "replay": True, "rows": len(rows)},
+    )
+    await store.mark_started(run_id)
+    await store.update_batch(batch_id, status="running")
+    await sink.emit(
+        RunStarted(
+            run_id=run_id,
+            seq=sink.reserve_seq(),
+            task=f"Batch: {usecase.name}",
+            options={"usecase_id": usecase.id, "batch_id": batch_id, "rows": len(rows),
+                     "replay": True, "llm_calls": 0},
+        )
+    )
+
+    # One execution row per input row, created up-front so a batch that stops
+    # early leaves the unattempted rows visibly `pending` rather than absent.
+    execution_ids: dict[int, str] = {}
+    for position, row_index in enumerate(indices):
+        execution_id = uuid.uuid4().hex
+        execution_ids[position] = execution_id
+        await store.create_execution(
+            execution_id,
+            usecase.id,
+            request.version,
+            run_id=run_id,
+            batch_id=batch_id,
+            row_index=row_index,
+            inputs=rows[position],
+        )
+
+    progress = BatchProgress(total=len(rows), pending=len(rows))
+    try:
+        async with MCPBrowserSession(mcp_config) as mcp:
+            executor = UseCaseExecutor(
+                usecase,
+                mcp,
+                sink,
+                run_id=run_id,
+                secrets=request.secrets,
+                redactor=redactor,
+                step_timeout=manager.settings.replay_step_timeout,
+            )
+
+            runner = BatchRunner(
+                executor,
+                rows,
+                failure_streak_limit=manager.settings.replay_failure_streak_limit,
+                row_delay=manager.settings.replay_row_delay_seconds,
+                sleep=asyncio.sleep,
+            )
+
+            async def record(position: int, row: dict[str, Any], result: RowResult) -> None:
+                """Persist each row as it finishes, so progress survives a crash."""
+                await store.finish_execution(
+                    execution_ids[position],
+                    "succeeded" if result.ok else "failed",
+                    outputs=result.outputs,
+                    failed_step_id=result.failed_step_id,
+                    error=result.error,
+                    duration_ms=result.duration_ms,
+                )
+                await store.update_batch(
+                    batch_id,
+                    succeeded=runner.progress.succeeded,
+                    failed=runner.progress.failed,
+                )
+
+            runner.on_row = record
+            progress = await runner.run()
+
+    except asyncio.CancelledError:
+        progress.stopped_reason = "cancelled"
+        raise
+    except MCPConnectionError as exc:
+        progress.stopped_reason = str(exc)
+        await emit_replay_error(sink, run_id, "mcp_unavailable", str(exc))
+    except Exception as exc:  # noqa: BLE001 - a crash must still close the batch
+        log.exception("batch crashed", extra={"batch_id": batch_id})
+        progress.stopped_reason = f"{type(exc).__name__}: {exc}"
+        await emit_replay_error(sink, run_id, "internal_error", progress.stopped_reason)
+    finally:
+        await asyncio.shield(
+            _finalise_batch(manager, batch_id, run_id, sink, progress)
+        )
+
+
+async def _finalise_batch(
+    manager: "ReplayManager",
+    batch_id: str,
+    run_id: str,
+    sink: RunEventSink,
+    progress: BatchProgress,
+) -> None:
+    status = "succeeded" if progress.failed == 0 and not progress.stopped_reason else "failed"
+    await manager.store.update_batch(
+        batch_id,
+        status=status,
+        succeeded=progress.succeeded,
+        failed=progress.failed,
+        error=progress.stopped_reason,
+        finished=True,
+    )
+    await manager.store.finish_run(
+        run_id,
+        "succeeded" if status == "succeeded" else "failed",
+        steps=progress.attempted,
+        duration_ms=0,
+        summary=batch_summary(progress),
+        result={**progress.to_dict(), "llm_calls": 0, "llm_tokens": 0},
+        error=progress.stopped_reason,
+    )
+    await sink.emit(
+        RunFinished(
+            run_id=run_id,
+            seq=sink.reserve_seq(),
+            status="succeeded" if status == "succeeded" else "failed",
+            steps=progress.attempted,
+            duration_ms=0,
+            summary=batch_summary(progress),
+            result={**progress.to_dict(), "llm_calls": 0, "llm_tokens": 0},
+            error=progress.stopped_reason,
+        )
+    )
+    log.info(
+        "batch finished",
+        extra={"batch_id": batch_id, "status": status, **progress.to_dict()},
+    )
+
+
+def batch_summary(progress: BatchProgress) -> str:
+    return batch_summarise(progress)
