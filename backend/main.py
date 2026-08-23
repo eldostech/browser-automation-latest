@@ -23,7 +23,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from agent import RunOptions
 from batch import BatchInputError, parse_csv, results_csv, rows_from_json, validate_rows
@@ -446,6 +446,13 @@ async def distill_run(
         use_case = await distill(events, task=run.task, llm=manager.llm, source_run_id=run_id)
     except DistillationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValidationError as exc:
+        # A recording the schema cannot express is the user's problem to see,
+        # not a server fault. Name the step rather than returning a 500.
+        raise HTTPException(
+            status_code=422,
+            detail=f"this run could not be turned into a use case: {exc}",
+        ) from exc
 
     definition = use_case.model_dump(mode="json", by_alias=True)
     usecase_id, version = await store.save_usecase(definition)

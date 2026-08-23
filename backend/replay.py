@@ -54,6 +54,7 @@ from policy import check_navigation
 from redaction import Redactor
 from snapshot import Snapshot, parse as parse_snapshot
 from usecase import (
+    OPTIONAL_LOCATOR_ACTIONS,
     Assertion,
     Locator,
     MissingValue,
@@ -454,12 +455,20 @@ class UseCaseExecutor:
         if tool is None:
             return StepOutcome(step.id, False, 0, f"no MCP tool for action {step.action!r}")
 
-        resolved = await self._resolve(step.locators, step.id)
-        if resolved is None:
-            return StepOutcome(step.id, False, 0, self._not_found_message(step))
-        target, rung, described = resolved
+        arguments: dict[str, Any] = {}
+        rung: int | None = None
+        described: str | None = None
 
-        arguments: dict[str, Any] = {"target": target}
+        # `press` sends a key to whatever has focus and `upload` answers an open
+        # file chooser; neither needs a target, and neither is recorded with
+        # one. Every other element action does.
+        if step.locators or step.action not in OPTIONAL_LOCATOR_ACTIONS:
+            resolved = await self._resolve(step.locators, step.id)
+            if resolved is None:
+                return StepOutcome(step.id, False, 0, self._not_found_message(step))
+            target, rung, described = resolved
+            arguments["target"] = target
+
         if step.description:
             arguments["element"] = step.description
         if step.action in {"fill", "select", "press"} and step.value is not None:

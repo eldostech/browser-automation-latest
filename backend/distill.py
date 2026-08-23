@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from pydantic import ValidationError
+
 from events import AgentEvent
 from prompt_loader import DISTILL, load
 from snapshot import Snapshot, extract_ref, is_ref, parse as parse_snapshot
@@ -698,7 +700,25 @@ def build_usecase(
     def build(pairs: list[tuple[str, RecordedStep]]) -> list[Step]:
         built: list[Step] = []
         for step_id, recorded in pairs:
-            step = _build_step(recorded, plan, step_id=step_id)
+            try:
+                step = _build_step(recorded, plan, step_id=step_id)
+            except ValidationError as exc:
+                # One step the schema will not accept must not cost the whole
+                # recording. Drop it, say so loudly, and let the reviewer decide
+                # whether what is left is still worth publishing.
+                reasons = "; ".join(
+                    str(error.get("msg", "")).removeprefix("Value error, ")
+                    for error in exc.errors()
+                )
+                warnings.append(
+                    f"{step_id}: recorded {recorded.tool!r} could not be turned into a "
+                    f"replayable step and was left out ({reasons})"
+                )
+                log.warning(
+                    "dropped an unbuildable step",
+                    extra={"step_id": step_id, "tool": recorded.tool, "reasons": reasons},
+                )
+                continue
             if step is None:
                 warnings.append(
                     f"{step_id}: recorded action {recorded.action!r} (tool {recorded.tool!r}) "

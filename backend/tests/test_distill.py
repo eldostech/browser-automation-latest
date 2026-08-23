@@ -452,3 +452,36 @@ async def test_a_model_that_answers_in_prose_is_an_error_not_a_broken_use_case()
     events = build_events(("browser_navigate", {"url": "https://example.com"}, True, "ok"))
     with pytest.raises(DistillationError, match="not sure what you want"):
         await distill(events, task="t", llm=llm)
+
+
+# --- a recorded keypress, which used to crash distillation -----------------
+
+
+def test_a_target_less_keypress_becomes_a_step():
+    """Regression: `browser_press_key` carries only a key, never a target.
+
+    Requiring a locator for it made run 0fdb18ca -- which pressed Enter to
+    submit a dialog -- impossible to distil at all, returning a 500.
+    """
+    recording = pre_filter(build_events(("browser_press_key", {"key": "Enter"}, True, "pressed")))
+    use_case = build_usecase({"name": "x", "row_step_ids": ["s1"]}, recording)
+
+    assert [s.action for s in use_case.row_steps] == ["press"]
+    assert use_case.row_steps[0].value == "Enter"
+    assert use_case.row_steps[0].locators == []
+
+
+def test_a_step_the_schema_rejects_is_dropped_with_a_warning_not_a_crash():
+    """One unbuildable step must not cost the whole recording."""
+    recording = pre_filter(
+        build_events(
+            ("browser_navigate", {"url": "https://example.com"}, True, "ok"),
+            # A click with no target at all cannot be replayed.
+            ("browser_click", {}, True, "clicked"),
+        )
+    )
+    use_case = build_usecase({"name": "x", "row_step_ids": ["s1", "s2"]}, recording)
+
+    assert [s.action for s in use_case.row_steps] == ["navigate"], "the good step survives"
+    assert any("could not be turned into a replayable step" in w for w in use_case.warnings)
+    assert any("browser_click" in w for w in use_case.warnings)

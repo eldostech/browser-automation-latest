@@ -386,3 +386,40 @@ def test_wait_for_round_trips():
 def test_unknown_fields_are_rejected_rather_than_silently_dropped():
     with pytest.raises(ValidationError):
         UseCase(name="x", row_steps=[], nonsense=True)
+
+
+# --- actions that legitimately have no target ------------------------------
+#
+# `browser_press_key` sends a key to whatever has focus and `browser_file_upload`
+# answers an open file chooser. Neither is ever recorded with a target, and
+# requiring one made a recording containing an Enter keypress impossible to
+# distil at all.
+
+
+def test_press_needs_no_locator():
+    step = Step(id="s1", action="press", value="Enter")
+    assert step.locators == []
+    assert step.summary() == "press"
+
+
+def test_press_still_requires_a_key():
+    with pytest.raises(ValidationError, match="requires a key"):
+        Step(id="s1", action="press")
+
+
+def test_press_may_still_carry_a_locator_when_one_was_recorded():
+    step = Step(id="s1", action="press", value="Enter", locators=[role("Search", "textbox")])
+    assert step.locators[0].name == "Search"
+
+
+def test_upload_needs_no_locator_but_needs_a_path():
+    assert Step(id="s1", action="upload", value="/tmp/a.pdf").locators == []
+    with pytest.raises(ValidationError, match="requires a file path"):
+        Step(id="s1", action="upload")
+
+
+@pytest.mark.parametrize("action", ["click", "fill", "select", "hover", "extract"])
+def test_the_actions_that_do_need_a_target_still_require_one(action):
+    kwargs = {"output": "x"} if action == "extract" else {}
+    with pytest.raises(ValidationError, match="requires at least one locator"):
+        Step(id="s1", action=action, **kwargs)

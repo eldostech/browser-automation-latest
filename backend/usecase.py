@@ -45,10 +45,19 @@ Action = Literal[
     "hover", "upload", "wait", "assert", "extract", "script",
 ]
 
-#: Actions whose target is an element and therefore need a locator.
+#: Actions that cannot be performed without knowing which element to act on.
+#:
+#: ``press`` and ``upload`` are deliberately absent. ``browser_press_key`` takes
+#: only a key and sends it to whatever has focus, and ``browser_file_upload``
+#: takes only paths and answers whichever file chooser is open -- neither is
+#: ever recorded with a target. Requiring one made a recording containing an
+#: Enter keypress impossible to distil at all.
 ELEMENT_ACTIONS: frozenset[str] = frozenset(
-    {"click", "fill", "select", "press", "hover", "upload", "extract"}
+    {"click", "fill", "select", "hover", "extract"}
 )
+
+#: Actions that may carry a locator but work fine without one.
+OPTIONAL_LOCATOR_ACTIONS: frozenset[str] = frozenset({"press", "upload"})
 
 Status = Literal["draft", "ready", "archived"]
 FailureMode = Literal["abort", "continue", "heal"]
@@ -288,6 +297,10 @@ class Step(BaseModel):
             raise ValueError(f"step {self.id!r}: 'fill_form' requires at least one field")
         if self.action == "wait" and self.wait_for is None:
             raise ValueError(f"step {self.id!r}: 'wait' requires wait_for")
+        if self.action == "press" and not self.value:
+            raise ValueError(f"step {self.id!r}: 'press' requires a key")
+        if self.action == "upload" and not self.value:
+            raise ValueError(f"step {self.id!r}: 'upload' requires a file path")
         return self
 
     @model_validator(mode="after")
