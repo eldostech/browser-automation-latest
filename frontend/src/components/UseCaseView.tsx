@@ -31,6 +31,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [credentialId, setCredentialId] = useState<string>('');
   const [csv, setCsv] = useState('');
+  // Watching the browser work is the fastest way to understand why a step
+  // fails, so this is offered on both run paths rather than buried in config.
+  const [watch, setWatch] = useState(false);
   const [batch, setBatch] = useState<BatchDetail | null>(null);
 
   const load = useCallback(async () => {
@@ -118,6 +121,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const result = await api.executeUseCase(usecaseId, {
         inputs,
         credential_id: credentialId || null,
+        headless: !watch,
       });
       setNotice(
         result.status === 'succeeded'
@@ -132,6 +136,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const started = await api.startBatch(usecaseId, {
         csv,
         credential_id: credentialId || null,
+        headless: !watch,
       });
       setBatch(await api.getBatch(started.batch_id));
       setNotice(`Started ${started.total} rows on one shared browser session.`);
@@ -143,6 +148,32 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const resumed = await api.resumeBatch(batch.batch.id, credentialId || null);
       setBatch(await api.getBatch(resumed.batch_id));
       setNotice(`Re-running ${resumed.rows} row(s) that had not succeeded.`);
+    });
+
+  const archive = () =>
+    act(async () => {
+      await api.archiveUseCase(usecaseId);
+      onBack();
+    });
+
+  const destroy = () =>
+    act(async () => {
+      if (
+        !window.confirm(
+          [
+            'Delete this use case permanently?',
+            '',
+            'Its steps, every saved version and its execution records go for good.',
+            'The runs and screenshots they produced are kept.',
+            '',
+            'Archive instead if you only want it out of the way.',
+          ].join('\n'),
+        )
+      ) {
+        return;
+      }
+      await api.deleteUseCase(usecaseId);
+      onBack();
     });
 
   if (!useCase) {
@@ -184,6 +215,14 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             Publish
           </button>
         )}
+        {useCase.status !== 'archived' && (
+          <button type="button" onClick={archive} disabled={busy} title="Reversible — hides it from the list">
+            Archive
+          </button>
+        )}
+        <button type="button" className="danger" onClick={destroy} disabled={busy}>
+          Delete
+        </button>
       </div>
 
       {error && <div className="banner error">{error}</div>}
@@ -333,6 +372,24 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
                 This use case still needs: {missingSlots.join(', ')}. Add them below.
               </p>
             )}
+          </div>
+
+          <div className="card">
+            <h3>Browser</h3>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={watch}
+                onChange={(e) => setWatch(e.target.checked)}
+              />
+              <span>
+                Show the browser while it runs
+                <span className="hint" style={{ margin: '2px 0 0' }}>
+                  Opens a visible window instead of running headless. The quickest way to see
+                  why a step fails — though a long batch will hold a window open throughout.
+                </span>
+              </span>
+            </label>
           </div>
 
           {(missingSlots.length > 0 || credentials.length === 0 || !vaultAvailable) && (

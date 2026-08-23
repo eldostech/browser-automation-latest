@@ -287,3 +287,46 @@ async def test_archiving_keeps_the_record(client: TestClient):
 
 async def test_publishing_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.post("/api/usecases/nope/publish").status_code == 404
+
+
+# --- archiving vs deleting -------------------------------------------------
+
+
+async def test_archiving_is_reversible_and_keeps_the_record(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    assert client.delete(f"/api/usecases/{usecase_id}").json()["status"] == "archived"
+    assert client.get(f"/api/usecases/{usecase_id}").status_code == 200
+
+
+async def test_purging_removes_the_use_case_for_good(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    response = client.delete(f"/api/usecases/{usecase_id}", params={"purge": "true"})
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+    assert response.json()["removed"]["usecases"] == 1
+    assert client.get(f"/api/usecases/{usecase_id}").status_code == 404
+    assert client.get("/api/usecases").json()["usecases"] == []
+
+
+async def test_purging_keeps_the_run_that_produced_it(client: TestClient):
+    """The timeline records what happened to a browser; deleting a recipe
+    must not erase the history of things it actually did."""
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    client.delete(f"/api/usecases/{usecase_id}", params={"purge": "true"})
+
+    assert client.get(f"/api/runs/{run_id}").status_code == 200
+    assert client.get(f"/api/runs/{run_id}/events").json()["events"]
+
+
+async def test_purging_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.delete("/api/usecases/nope", params={"purge": "true"}).status_code == 404

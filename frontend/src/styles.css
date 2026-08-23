@@ -804,3 +804,21 @@ button.link.danger {
   white-space: pre;
   color: var(--text-dim);
 }
+
+/* A checkbox with an explanation under its label. */
+.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.checkbox input[type='checkbox'] {
+  width: auto;
+  margin: 2px 0 0;
+  flex: none;
+}
+
+.checkbox > span {
+  display: flex;
+  flex-direction: column;
+}

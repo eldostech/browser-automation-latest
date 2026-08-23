@@ -588,8 +588,33 @@ class Store:
         return True
 
     async def delete_usecase(self, usecase_id: str) -> bool:
-        """Archive rather than delete: a batch's history references the id."""
+        """Archive: hide it from the active list but keep every reference intact."""
         return await self.set_usecase_status(usecase_id, "archived")
+
+    async def purge_usecase(self, usecase_id: str) -> dict[str, int] | None:
+        """Delete a use case, its versions, and its execution records for good.
+
+        The runs and events those executions produced are deliberately left
+        alone: they are the timeline of things that actually happened to a
+        browser, and they stay meaningful — and auditable — after the recipe
+        that caused them is gone.
+
+        Returns the row counts removed, or ``None`` if there was no such use
+        case.
+        """
+        if await self.get_usecase(usecase_id) is None:
+            return None
+
+        removed: dict[str, int] = {}
+        for table in ("executions", "batches", "usecase_versions", "usecases"):
+            column = "id" if table == "usecases" else "usecase_id"
+            cursor = await self.db.execute(
+                f"DELETE FROM {table} WHERE {column}=?", (usecase_id,)
+            )
+            removed[table] = cursor.rowcount
+        await self.db.commit()
+        log.info("purged a use case", extra={"usecase_id": usecase_id, **removed})
+        return removed
 
 
     # -- credentials --------------------------------------------------------

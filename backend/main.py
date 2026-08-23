@@ -218,6 +218,14 @@ def get_settings_dep(request: Request) -> Settings:
     return request.app.state.settings
 
 
+def get_vault(request: Request) -> Vault:
+    return request.app.state.vault
+
+
+def get_replays(request: Request) -> ReplayManager:
+    return request.app.state.replays
+
+
 # ---------------------------------------------------------------------------
 # Health & config
 # ---------------------------------------------------------------------------
@@ -552,9 +560,30 @@ async def publish_usecase(
 @app.delete("/api/usecases/{usecase_id}")
 async def archive_usecase(
     usecase_id: str,
+    purge: bool = Query(default=False),
     store: Store = Depends(get_store),
+    replays: ReplayManager = Depends(get_replays),
 ) -> dict[str, Any]:
-    """Archive rather than delete -- execution history references the id."""
+    """Archive a use case, or delete it outright with ``?purge=true``.
+
+    Archiving is the default because it is reversible and keeps every
+    reference intact. Purging removes the use case, its versions and its
+    execution records permanently; the runs and events they produced are kept,
+    since those record what actually happened to a browser.
+    """
+    active = replays.active
+    if active and active.get("usecase_id") == usecase_id:
+        raise HTTPException(
+            status_code=409,
+            detail="that use case is running right now; wait for it to finish or cancel it first",
+        )
+
+    if purge:
+        removed = await store.purge_usecase(usecase_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="use case not found")
+        return {"usecase_id": usecase_id, "deleted": True, "removed": removed}
+
     if not await store.delete_usecase(usecase_id):
         raise HTTPException(status_code=404, detail="use case not found")
     return {"usecase_id": usecase_id, "status": "archived"}
@@ -570,14 +599,6 @@ class CredentialRequest(BaseModel):
     #: ``{slot: value}`` matching the use case's declared secrets. Write-only:
     #: no endpoint returns these, and nothing in the dashboard needs them back.
     values: dict[str, str] = Field(min_length=1)
-
-
-def get_vault(request: Request) -> Vault:
-    return request.app.state.vault
-
-
-def get_replays(request: Request) -> ReplayManager:
-    return request.app.state.replays
 
 
 @app.post("/api/credentials", status_code=201)

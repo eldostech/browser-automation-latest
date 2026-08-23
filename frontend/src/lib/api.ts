@@ -132,14 +132,27 @@ export const api = {
       method: 'POST',
     }),
 
+  /** Reversible: hides it from the active list, keeps every reference. */
   archiveUseCase: (id: string) =>
     request<{ usecase_id: string; status: string }>(`/api/usecases/${id}`, { method: 'DELETE' }),
+
+  /** Permanent: removes the use case, its versions and its execution records. */
+  deleteUseCase: (id: string) =>
+    request<{ usecase_id: string; deleted: boolean; removed: Record<string, number> }>(
+      `/api/usecases/${id}?purge=true`,
+      { method: 'DELETE' },
+    ),
 
   // --- executing (zero LLM calls) -------------------------------------------
 
   executeUseCase: (
     id: string,
-    payload: { inputs: Record<string, unknown>; credential_id?: string | null },
+    payload: {
+      inputs: Record<string, unknown>;
+      credential_id?: string | null;
+      /** false opens a visible browser so you can watch the replay. */
+      headless?: boolean;
+    },
   ) =>
     request<{
       execution_id: string;
@@ -159,7 +172,10 @@ export const api = {
 
   // --- batches ---------------------------------------------------------------
 
-  startBatch: (id: string, payload: { csv: string; credential_id?: string | null }) =>
+  startBatch: (
+    id: string,
+    payload: { csv: string; credential_id?: string | null; headless?: boolean },
+  ) =>
     request<{ batch_id: string; total: number; columns: string[]; warnings: string[] }>(
       `/api/usecases/${id}/batch`,
       { method: 'POST', body: JSON.stringify(payload) },

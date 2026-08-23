@@ -289,3 +289,61 @@ async def test_executions_are_listed_for_a_use_case(client: TestClient):
     assert len(executions) == 1
     assert executions[0]["llm_tokens"] == 0
     assert executions[0]["inputs"] == {"record_url": "https://example.com/r"}
+
+
+# --- watching the browser --------------------------------------------------
+
+
+async def test_headless_false_reaches_the_browser_config(client: TestClient):
+    """The toggle must actually open a visible window, not just look like it."""
+    seen: list[Any] = []
+
+    class RecordingSession(FakeReplaySession):
+        def __init__(self, config: Any) -> None:
+            seen.append(config)
+            super().__init__(config)
+
+    import runner as runner_module
+
+    runner_module.MCPBrowserSession = RecordingSession
+    try:
+        usecase_id = await seed(client)
+        client.post(
+            f"/api/usecases/{usecase_id}/execute",
+            json={
+                "inputs": {"record_url": "https://example.com/r"},
+                "secrets": {"username": "u", "password": "p"},
+                "headless": False,
+            },
+        )
+        assert seen and seen[0].headless is False
+        # And the flag the MCP server actually receives.
+        assert "--headless" not in seen[0].command_line()
+    finally:
+        runner_module.MCPBrowserSession = FakeReplaySession
+
+
+async def test_headless_defaults_to_the_server_setting(client: TestClient):
+    seen: list[Any] = []
+
+    class RecordingSession(FakeReplaySession):
+        def __init__(self, config: Any) -> None:
+            seen.append(config)
+            super().__init__(config)
+
+    import runner as runner_module
+
+    runner_module.MCPBrowserSession = RecordingSession
+    try:
+        usecase_id = await seed(client)
+        client.post(
+            f"/api/usecases/{usecase_id}/execute",
+            json={
+                "inputs": {"record_url": "https://example.com/r"},
+                "secrets": {"username": "u", "password": "p"},
+            },
+        )
+        assert seen and seen[0].headless is True
+        assert "--headless" in seen[0].command_line()
+    finally:
+        runner_module.MCPBrowserSession = FakeReplaySession
