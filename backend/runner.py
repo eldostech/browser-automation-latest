@@ -18,7 +18,7 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from agent import AgentOutcome, AgentSpec, BrowserAgent, RunOptions
@@ -34,6 +34,7 @@ from events import (
 from llm import LLMClient, build_llm
 from logging_setup import bind_run_id
 from mcp_client import MCPBrowserSession, MCPConfig, MCPConnectionError
+from redaction import NULL_REDACTOR, Redactor
 from store import Store
 
 log = logging.getLogger(__name__)
@@ -85,13 +86,26 @@ class EventBus:
 
 
 class RunEventSink:
-    """Implements ``agent.EventSink``: allocate seq, persist, broadcast."""
+    """Implements ``agent.EventSink``: allocate seq, redact, persist, broadcast.
 
-    def __init__(self, run_id: str, store: Store, bus: EventBus, api_base: str = "") -> None:
+    Redaction happens here rather than in ``Store`` because this is the single
+    point every event passes through on its way to *both* destinations. Doing
+    it in the store would leave the WebSocket broadcasting the unredacted copy.
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        store: Store,
+        bus: EventBus,
+        api_base: str = "",
+        redactor: Redactor | None = None,
+    ) -> None:
         self.run_id = run_id
         self.store = store
         self.bus = bus
         self.api_base = api_base.rstrip("/")
+        self.redactor = redactor or NULL_REDACTOR
         self._seq = 0
 
     def reserve_seq(self) -> int:
@@ -103,6 +117,7 @@ class RunEventSink:
         return self._seq
 
     async def emit(self, event: AgentEvent) -> None:
+        event = self.redactor.event(event)
         try:
             await self.store.append_event(event)
         except Exception as exc:  # noqa: BLE001 - never let logging kill a run
@@ -177,6 +192,9 @@ class RunRequest:
     options: RunOptions = None  # type: ignore[assignment]
     headless: bool | None = None
     browser: str | None = None
+    #: Values to keep out of the event log, the database and the logs. Anything
+    #: here is replaced with a placeholder on its way to any of the three.
+    secrets: list[str] = field(default_factory=list)
 
 
 class RunManager:
@@ -299,7 +317,10 @@ class RunManager:
         bind_run_id(run_id)
         started = time.monotonic()
 
-        sink = _TrackingSink(RunEventSink(run_id, self.store, self.bus), self, run_id)
+        redactor = Redactor(request.secrets)
+        sink = _TrackingSink(
+            RunEventSink(run_id, self.store, self.bus, redactor=redactor), self, run_id
+        )
         gate = RunApprovalGate(run_id, self)
         outcome: AgentOutcome | None = None
         cancelled = False

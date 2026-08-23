@@ -65,6 +65,12 @@ class CreateRunRequest(BaseModel):
     headless: bool | None = None
     browser: str | None = None
 
+    #: Values to keep out of the event log, the database and the logs. Anything
+    #: listed here is replaced with a placeholder wherever it appears -- in the
+    #: task text, in a tool argument, in a tool result echoing it back, or in
+    #: the model's own prose. Write-only: never returned by any endpoint.
+    secrets: list[str] | None = None
+
     @field_validator("start_url")
     @classmethod
     def _validate_url(cls, value: str | None) -> str | None:
@@ -278,6 +284,7 @@ async def create_run(
             options=options,
             headless=body.headless,
             browser=body.browser,
+            secrets=list(body.secrets or []),
         )
     )
     return CreateRunResponse(run_id=run_id, status="pending")

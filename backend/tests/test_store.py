@@ -107,3 +107,32 @@ async def test_interrupted_runs_are_reaped_on_restart(store):
     assert len(events) == 1
     assert isinstance(events[0], RunFinished)
     assert events[0].status == "failed"
+
+
+# --- schema versioning -----------------------------------------------------
+
+
+async def test_a_fresh_database_is_stamped_at_the_current_version(store):
+    """SCHEMA already builds the final shape, so nothing should need migrating."""
+    from store import SCHEMA_VERSION
+
+    assert await store.schema_version() == SCHEMA_VERSION
+
+
+async def test_migrate_is_idempotent(store):
+    from store import SCHEMA_VERSION
+
+    assert await store.migrate() == SCHEMA_VERSION
+    assert await store.migrate() == SCHEMA_VERSION
+
+
+async def test_an_unversioned_database_is_brought_forward(store):
+    """A database written before user_version existed must still migrate."""
+    from store import SCHEMA_VERSION
+
+    await store.db.execute("PRAGMA user_version = 0")
+    await store.db.commit()
+    assert await store.schema_version() == 0
+
+    assert await store.migrate() == SCHEMA_VERSION
+    assert await store.schema_version() == SCHEMA_VERSION

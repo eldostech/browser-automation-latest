@@ -89,9 +89,16 @@ def test_default_model_is_an_inference_profile_not_a_bare_model_id():
     assert model.endswith("-v1:0"), model
 
 
-def test_no_api_key_is_required_for_bedrock():
-    """The whole point: Bedrock authenticates with AWS credentials."""
-    assert Settings().anthropic_api_key == ""
+def test_no_api_key_is_required_for_bedrock(monkeypatch):
+    """The whole point: Bedrock authenticates with AWS credentials.
+
+    Isolated from both credential sources -- ``_env_file=None`` ignores the
+    operator's ``.env`` and ``delenv`` clears the process environment. Without
+    that this asserts on whoever's laptop is running the suite rather than on
+    the code, and fails for anyone who has a real key configured.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert Settings(_env_file=None).anthropic_api_key == ""
     llm = build_llm(settings())
     assert isinstance(llm, BedrockLLM)
 

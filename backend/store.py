@@ -69,6 +69,21 @@ CREATE INDEX IF NOT EXISTS idx_runs_status    ON runs (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run  ON artifacts (run_id, seq);
 """
 
+#: Schema revision this build expects. ``CREATE TABLE IF NOT EXISTS`` above
+#: handles *adding* tables to an existing database, but it silently does
+#: nothing when a table exists with an older shape -- so an ``ALTER`` or a
+#: backfill needs somewhere to hang. :data:`MIGRATIONS` is that place, and
+#: ``user_version`` records how far a given file has been brought forward.
+SCHEMA_VERSION = 1
+
+#: ``{target_version: (sql_statement, ...)}``, applied in ascending order to
+#: any database whose ``user_version`` is below the target. Statements must be
+#: idempotent where SQLite allows it, and must never drop user data.
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    # v1 is the schema created by SCHEMA above; nothing to migrate onto it.
+    1: (),
+}
+
 ORPHAN_MESSAGE = "Backend restarted while this run was in flight."
 
 
@@ -148,7 +163,37 @@ class Store:
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
         await self._db.commit()
+        await self.migrate()
         log.info("store connected", extra={"db_path": str(self.db_path)})
+
+    async def schema_version(self) -> int:
+        async with self.db.execute("PRAGMA user_version") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def migrate(self) -> int:
+        """Bring the database up to :data:`SCHEMA_VERSION`. Returns the version reached.
+
+        A fresh file is stamped at the current version without running anything
+        -- ``SCHEMA`` already created it in its final shape. An existing file
+        runs only the migrations above its recorded version.
+        """
+        current = await self.schema_version()
+        if current >= SCHEMA_VERSION:
+            return current
+
+        for target in sorted(MIGRATIONS):
+            if target <= current:
+                continue
+            for statement in MIGRATIONS[target]:
+                await self.db.execute(statement)
+            # PRAGMA does not accept a bound parameter.
+            await self.db.execute(f"PRAGMA user_version = {int(target)}")
+            await self.db.commit()
+            log.info("applied schema migration", extra={"from": current, "to": target})
+            current = target
+
+        return current
 
     async def close(self) -> None:
         if self._db is not None:

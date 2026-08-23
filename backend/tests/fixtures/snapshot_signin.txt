@@ -1,0 +1,142 @@
+### Page
+- Page URL: https://www.ixl.com/math/grade-5/multiply-decimals-using-area-models
+- Page Title: IXL | Multiply decimals using area models | 5th grade math
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - link "SKIP TO CONTENT" [ref=e2] [cursor=pointer]:
+    - /url: "#maincontent"
+  - generic [ref=e6]:
+    - generic [ref=e7]:
+      - banner "IXL Learning" [ref=e9] [cursor=pointer]
+      - generic [ref=e10]:
+        - button [ref=e12] [cursor=pointer]:
+          - img "Search for skill" [ref=e13]
+        - link "Join now" [ref=e14] [cursor=pointer]:
+          - /url: /membership
+        - button "Open navigation menu" [expanded] [active] [ref=e15] [cursor=pointer]
+    - menu [ref=e546]:
+      - generic [ref=e547]:
+        - navigation [ref=e548]:
+          - list [ref=e549]:
+            - listitem [ref=e550]:
+              - button "Learning" [ref=e551]
+              - navigation [ref=e555]:
+                - heading "Learning" [level=2] [ref=e556]
+                - list [ref=e557]:
+                  - listitem:
+                    - navigation [ref=e558]:
+                      - heading "Math" [level=2] [ref=e559]
+                      - list [ref=e560]:
+                        - listitem
+                        - listitem [ref=e561]
+                        - listitem [ref=e562]
+                        - listitem [ref=e563]
+                        - listitem [ref=e564]
+                  - listitem [ref=e565]:
+                    - navigation [ref=e566]:
+                      - heading "Language arts" [level=2] [ref=e567]
+                      - list [ref=e568]:
+                        - listitem
+                        - listitem [ref=e569]
+                        - listitem [ref=e570]
+                  - listitem [ref=e571]
+                  - listitem [ref=e572]
+                  - listitem [ref=e573]
+                  - listitem [ref=e574]
+                  - listitem [ref=e575]:
+                    - navigation [ref=e576]:
+                      - heading "Skill plans" [level=2] [ref=e577]
+                      - list [ref=e578]:
+                        - listitem
+                        - listitem [ref=e579]
+                        - listitem [ref=e580]
+                        - listitem [ref=e581]
+                  - listitem [ref=e582]
+            - listitem [ref=e583]:
+              - link "Assessment" [ref=e584]:
+                - /url: /diagnostic
+            - listitem [ref=e586]:
+              - link "Analytics" [ref=e587]:
+                - /url: /analytics
+            - listitem [ref=e589]:
+              - link "Inspiration" [ref=e590]:
+                - /url: /resources/welcome
+        - navigation [ref=e592]:
+          - link "Sign in" [ref=e593] [cursor=pointer]:
+            - /url: /signin
+  - main [ref=e16]:
+    - article [ref=e18]:
+      - navigation [ref=e19]:
+        - generic [ref=e20]:
+          - link "Fifth grade" [ref=e21] [cursor=pointer]:
+            - /url: /math/grade-5
+          - generic [ref=e22]:
+            - text: DD.5
+            - heading "Multiply decimals using area models" [level=1] [ref=e23]
+          - generic [ref=e24]: RH8
+          - navigation [ref=e25] [cursor=pointer]:
+            - generic [ref=e26]: Share skill
+            - generic:
+              - button "copy link"
+            - button "share to facebook"
+            - button "share to twitter"
+      - generic [ref=e27]:
+        - generic [ref=e28]:
+          - generic [ref=e29]:
+            - generic [ref=e31]:
+              - generic [ref=e33]:
+                - button "Learn with an example" [ref=e37] [cursor=pointer]
+                - generic [ref=e39]: or
+                - button "Watch a video" [ref=e44] [cursor=pointer]
+              - region "question" [ref=e63]:
+                - generic [ref=e65]:
+                  - generic [ref=e66]:
+                    - text: Use the model to find
+                    - generic [ref=e67]:
+                      - generic [ref=e68]: "0.9"
+                      - img "times" [ref=e70]: ×
+                    - generic [ref=e72]:
+                      - generic [ref=e73]: "3.8"
+                      - text: .
+                  - generic [ref=e75]: First, fill in the area of each rectangle.
+                  - group "area model with 1 rows of 2 rectangles" [ref=e82]:
+                    - generic [ref=e83]:
+                      - generic [ref=e84]:
+                        - group "column label" [ref=e86]:
+                          - generic [ref=e87]: "3"
+                        - group "column label" [ref=e90]:
+                          - generic [ref=e93]:
+                            - generic [ref=e94]: "0"
+                            - generic [ref=e95]: .
+                            - generic [ref=e96]: "8"
+                      - group "row 1" [ref=e97]:
+                        - group "row label" [ref=e98]:
+                          - generic [ref=e101]:
+                            - generic [ref=e102]: "0"
+                            - generic [ref=e103]: .
+                            - generic [ref=e104]: "9"
+                        - figure "Row 1 , rectangle . Width 3 . Height 0.9 . Find the total area. ." [ref=e105]:
+                          - textbox "answer" [ref=e107]
+                        - figure "Row 1 , rectangle 2 . Width 0.8 . Height 0.9 . Find the total area. ." [ref=e108]:
+                          - textbox "answer" [ref=e110]
+                    - generic [ref=e111]: Row
+                    - generic [ref=e112]: ", rectangle"
+                    - generic [ref=e113]: . Width
+                    - generic [ref=e114]: . Height
+                    - generic [ref=e115]: . Find the total area.
+                    - generic [ref=e116]: . Area
+                    - generic [ref=e117]: column
+                    - generic [ref=e118]: ", missing side length"
+                    - generic [ref=e119]: .
+                    - generic [ref=e120]: "1"
+                    - generic [ref=e121]: "2"
+                    - generic [ref=e122]: "3"
+                  - generic [ref=e123]: Then, find the total area.
+                  - generic [ref=e126]:
+                    - generic [ref=e127]:
+                      - generic [ref=e128]: "0.9"
+                      - img "times" [ref=e130]: ×
+                    - generic [ref=e131]:
+                      - generic [ref=e132]: "3.8"
+```
