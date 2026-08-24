@@ -99,6 +99,14 @@ PROPOSE_TOOL: dict[str, Any] = {
                                 "You may not describe an element any other way."
                             ),
                         },
+                        "field_name": {
+                            "type": "string",
+                            "description": (
+                                "replace_locator on a step that fills a FORM: which field to "
+                                "change. Required there -- each field has its own locator, and "
+                                "the step itself has none."
+                            ),
+                        },
                         "assertion_kind": {
                             "enum": ["url_contains", "text_present", "title_contains"],
                             "description": "fix_assertion / fix_session_check.",
@@ -349,15 +357,38 @@ def apply_fixes(
                 continue
             node = options[index]
             healed = Locator(strategy="role", role=node.role, name=node.name or None)
-            existing = [
-                loc
-                for loc in (step.get("locators") or [])
-                if (loc.get("role"), loc.get("name")) != (healed.role, healed.name)
-            ]
-            # Prepended, not replacing: a wrong repair degrades to what the
-            # recording already knew rather than losing it.
-            step["locators"] = [healed.model_dump(exclude_none=True), *existing]
-            applied.append(f"{step_id} now looks for {healed.describe()}. {reason}")
+
+            def ladder_for(holder: dict[str, Any]) -> list[dict[str, Any]]:
+                existing = [
+                    loc
+                    for loc in (holder.get("locators") or [])
+                    if (loc.get("role"), loc.get("name")) != (healed.role, healed.name)
+                ]
+                # Prepended, not replacing: a wrong repair degrades to what the
+                # recording already knew rather than losing it.
+                return [healed.model_dump(exclude_none=True), *existing]
+
+            # A fill_form step holds no locator of its own -- each field has
+            # its own ladder, and that is what the executor reads. Writing the
+            # step-level list would look applied and do nothing.
+            if step.get("action") == "fill_form":
+                wanted = str(fix.get("field_name") or "")
+                fields = step.get("fields") or []
+                target = next((f for f in fields if f.get("name") == wanted), None)
+                if target is None:
+                    names = ", ".join(repr(f.get("name")) for f in fields) or "(none)"
+                    applied.append(
+                        f"SKIPPED {step_id}: it fills a form, so the fix must name which field "
+                        f"to change. field_name was {wanted!r}; the fields are {names}"
+                    )
+                    continue
+                target["locators"] = ladder_for(target)
+                applied.append(
+                    f"{step_id} field {wanted!r} now looks for {healed.describe()}. {reason}"
+                )
+            else:
+                step["locators"] = ladder_for(step)
+                applied.append(f"{step_id} now looks for {healed.describe()}. {reason}")
 
         elif kind == "fix_assertion":
             check = Assertion(
@@ -389,6 +420,25 @@ def apply_fixes(
             applied.append(f"SKIPPED {step_id}: unknown fix {kind!r}")
 
     return patched, applied
+
+
+def is_unchanged(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Did a repair actually change the use case?
+
+    Metadata that moves on every save is ignored, so this answers the question
+    a person is really asking -- did any step change? Saving a version that
+    differs only by a timestamp is how a repair comes to report success while
+    nothing about the use case is different.
+    """
+    def strip(definition: dict[str, Any]) -> str:
+        trimmed = {
+            key: value
+            for key, value in definition.items()
+            if key not in {"version", "updated_at", "created_at", "status", "warnings"}
+        }
+        return json.dumps(trimmed, sort_keys=True, default=str)
+
+    return strip(before) == strip(after)
 
 
 def validate_patched(patched: dict[str, Any]) -> UseCase:

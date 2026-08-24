@@ -472,3 +472,41 @@ async def test_repairing_with_no_failure_to_look_at_is_a_404(client: TestClient)
 
 async def test_repairing_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.post("/api/usecases/nope/repair", json={}).status_code == 404
+
+
+async def test_a_repair_that_changes_nothing_is_not_reported_as_repaired(client: TestClient):
+    """Regression: pressing Fix twice saved two identical versions and said
+    'repaired' both times, which looks exactly like a change that did not
+    persist."""
+    store = client.app.state.store
+    usecase_id, _ = await store.save_usecase({**BROKEN, "id": "uc-noop"})
+
+    failure = client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"},
+              "secrets": {"username": "u", "password": "p"}},
+    ).json()
+
+    # A fix pointing at a step that does not exist: nothing can be applied.
+    client.app.state.manager._llm = RepairLLM(  # noqa: SLF001
+        {
+            "diagnosis": "Something moved.",
+            "confidence": "medium",
+            "fixes": [
+                {"kind": "replace_locator", "step_id": "not-a-step", "element_index": 0}
+            ],
+        }
+    )
+
+    body = client.post(
+        f"/api/usecases/{usecase_id}/repair", json={"execution_id": failure["execution_id"]}
+    ).json()
+
+    assert body["repaired"] is False
+    assert "nothing was saved" in body["unfixable_reason"]
+    assert any("SKIPPED" in line for line in body["applied"])
+
+    # And crucially, no version was created.
+    detail = client.get(f"/api/usecases/{usecase_id}").json()
+    assert detail["definition"]["version"] == 1
+    assert len(detail["versions"]) == 1

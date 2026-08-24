@@ -55,7 +55,15 @@ class _StubSettings:
 
 
 def settings(**overrides) -> Settings:
+    """Settings isolated from the operator's .env.
+
+    `_env_file=None` matters: without it, every field this helper does not
+    name is still read from .env, so these tests assert on whoever's machine
+    is running them. That has bitten three times now -- the API key, the
+    default model, and the repair model.
+    """
     base = {
+        "_env_file": None,
         "llm_provider": "bedrock",
         "llm_model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "bedrock_api": "invoke",

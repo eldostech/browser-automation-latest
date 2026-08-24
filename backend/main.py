@@ -46,6 +46,7 @@ from repair import (
     apply_fixes,
     candidates,
     gather_context,
+    is_unchanged,
     validate_patched,
 )
 from runner import (
@@ -1050,6 +1051,32 @@ async def repair_usecase(
         }
 
     patched, applied = apply_fixes(definition, proposal, candidates(context.snapshot))
+
+    # A repair that changes nothing must not be reported as one, and must not
+    # leave a version behind. Otherwise pressing the button appears to work
+    # while the use case stays exactly as broken as it was.
+    if is_unchanged(definition, patched):
+        skipped = [line for line in applied if line.startswith("SKIPPED")]
+        log.info(
+            "repair proposed nothing that could be applied",
+            extra={"usecase_id": usecase_id, "fixes": len(proposal.fixes), "skipped": len(skipped)},
+        )
+        return {
+            "usecase_id": usecase_id,
+            "repaired": False,
+            "diagnosis": proposal.diagnosis,
+            "confidence": proposal.confidence,
+            "applied": applied,
+            "unfixable_reason": (
+                "none of the proposed edits could be applied, so nothing was saved: "
+                + "; ".join(skipped)
+                if skipped
+                else "the proposed edits would leave the use case exactly as it is, so "
+                "nothing was saved. It may already carry this repair."
+            ),
+            "llm_tokens": proposal.tokens,
+        }
+
     try:
         validate_patched(patched)
     except ValidationError as exc:

@@ -22,7 +22,7 @@ from repair import (
     gather_context,
     validate_patched,
 )
-from usecase import Assertion, InputSpec, Locator, Step, UseCase
+from usecase import Assertion, FormField, InputSpec, Locator, Step, UseCase
 
 PAGE = """### Page
 - Page URL: https://example.com/contact
@@ -398,3 +398,123 @@ async def test_prose_instead_of_a_tool_call_is_reported_not_raised():
     assert "no idea" in proposal.diagnosis
     assert proposal.confidence == "low"
     assert proposal.tokens == 1200
+
+
+# --- a repair that changes nothing is not a repair -------------------------
+#
+# Regression: pressing "Fix it with AI" twice produced two new versions, the
+# second byte-identical to the first, and reported success both times. From
+# the outside that is indistinguishable from "the change did not persist".
+
+
+def test_is_unchanged_ignores_metadata_that_moves_on_every_save():
+    from repair import is_unchanged
+
+    before = definition()
+    after = {**before, "version": 9, "updated_at": "later", "warnings": ["new"]}
+    assert is_unchanged(before, after) is True
+
+
+def test_is_unchanged_sees_a_real_edit():
+    from repair import is_unchanged
+
+    before = definition()
+    after, _ = apply_fixes(
+        before,
+        RepairProposal(diagnosis="x", fixes=[{"kind": "drop_step", "step_id": "s10"}]),
+        offered(),
+    )
+    assert is_unchanged(before, after) is False
+
+
+def test_a_proposal_whose_fixes_all_skip_leaves_the_definition_alone():
+    from repair import is_unchanged
+
+    before = definition()
+    after, applied = apply_fixes(
+        before,
+        RepairProposal(
+            diagnosis="x",
+            fixes=[{"kind": "replace_locator", "step_id": "does-not-exist", "element_index": 0}],
+        ),
+        offered(),
+    )
+    assert all("SKIPPED" in line for line in applied)
+    assert is_unchanged(before, after) is True
+
+
+# --- a form's fields each carry their own locator --------------------------
+
+
+def form_definition() -> dict:
+    return UseCase(
+        id="uc-form",
+        name="Contact form",
+        allowed_domains=["example.com"],
+        row_steps=[
+            Step(
+                id="s4",
+                action="fill_form",
+                fields=[
+                    FormField(name="Full Name", value="Ada",
+                              locators=[Locator(strategy="css", selector="input#name")]),
+                    FormField(name="Work Email", value="a@b.c",
+                              locators=[Locator(strategy="css", selector="input#email")]),
+                ],
+            )
+        ],
+    ).model_dump(mode="json", by_alias=True)
+
+
+def test_replacing_a_form_field_locator_edits_the_field_not_the_step():
+    """The executor reads per-field locators; a step-level one is ignored."""
+    patched, applied = apply_fixes(
+        form_definition(),
+        RepairProposal(
+            diagnosis="renamed",
+            fixes=[
+                {"kind": "replace_locator", "step_id": "s4", "field_name": "Full Name",
+                 "element_index": 0}
+            ],
+        ),
+        offered(),
+    )
+    step = patched["row_steps"][0]
+
+    assert step["fields"][0]["locators"][0]["name"] == "Your name", "the field was changed"
+    assert step["fields"][0]["locators"][1]["selector"] == "input#name", "original kept"
+    assert step["fields"][1]["locators"][0]["selector"] == "input#email", "other field untouched"
+    assert step["locators"] == [], "the ignored step-level list is left empty"
+    assert "Full Name" in applied[0]
+    validate_patched(patched)
+
+
+def test_a_form_fix_without_a_field_name_is_refused_with_the_field_list():
+    """Silently writing a locator the executor ignores is the worst outcome."""
+    before = form_definition()
+    patched, applied = apply_fixes(
+        before,
+        RepairProposal(
+            diagnosis="x",
+            fixes=[{"kind": "replace_locator", "step_id": "s4", "element_index": 0}],
+        ),
+        offered(),
+    )
+    from repair import is_unchanged
+
+    assert "SKIPPED" in applied[0]
+    assert "'Full Name'" in applied[0] and "'Work Email'" in applied[0]
+    assert is_unchanged(before, patched) is True
+
+
+def test_an_unknown_field_name_is_refused():
+    _, applied = apply_fixes(
+        form_definition(),
+        RepairProposal(
+            diagnosis="x",
+            fixes=[{"kind": "replace_locator", "step_id": "s4", "field_name": "Nope",
+                    "element_index": 0}],
+        ),
+        offered(),
+    )
+    assert "SKIPPED" in applied[0] and "'Nope'" in applied[0]

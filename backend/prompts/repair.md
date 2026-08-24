@@ -6,7 +6,9 @@ failure, the steps, and the page as it actually was when it broke, then call
 ## What you can change
 
 - **replace_locator** — the step could not find its element. Pick the element
-  it should have found, by index from the candidate list.
+  it should have found, by index from the candidate list. If the step fills a
+  **form**, you must also give `field_name`: each field carries its own
+  locator and the step itself has none, so a fix without it changes nothing.
 - **fix_assertion** — the check was wrong. Give it a kind and value that would
   actually prove the step worked.
 - **change_value** — the text typed no longer applies.
@@ -27,6 +29,11 @@ step recorded on a button should not land on a heading.
 
 **Prefer the smallest fix.** One replaced locator beats three edits. Do not
 tidy things that did not fail.
+
+**Do not propose an edit that is already in place.** The steps you are shown
+are the current ones. If a step already says what you were going to change it
+to, the use case has been repaired before and this failure has a different
+cause — say so with `unfixable_reason` rather than proposing it again.
 
 **Assert on the path, never on the domain.** `url_contains` with the site's own
 domain is always true, and negated it is never true — negating the domain makes
