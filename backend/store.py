@@ -587,6 +587,40 @@ class Store:
         await self.db.commit()
         return True
 
+    async def rename_usecase(
+        self, usecase_id: str, name: str, description: str | None = None
+    ) -> bool:
+        """Change the label, in place, without creating a version.
+
+        Versions exist so a running batch cannot have its *recipe* changed
+        underneath it. A name is not part of the recipe -- nothing executes
+        differently because of it -- so renaming appends no version and the
+        history stays a record of behaviour rather than of typos.
+        """
+        definition = await self.get_usecase(usecase_id)
+        if definition is None:
+            return False
+
+        definition["name"] = name
+        if description is not None:
+            definition["description"] = description
+
+        async with self.db.execute(
+            "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        await self.db.execute(
+            "UPDATE usecase_versions SET definition=? WHERE usecase_id=? AND version=?",
+            (json.dumps(definition), usecase_id, int(row["v"])),
+        )
+        await self.db.execute(
+            "UPDATE usecases SET name=?, description=?, updated_at=? WHERE id=?",
+            (name, definition.get("description", ""), _now(), usecase_id),
+        )
+        await self.db.commit()
+        return True
+
     async def delete_usecase(self, usecase_id: str) -> bool:
         """Archive: hide it from the active list but keep every reference intact."""
         return await self.set_usecase_status(usecase_id, "archived")

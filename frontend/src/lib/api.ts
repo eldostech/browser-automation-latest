@@ -127,6 +127,13 @@ export const api = {
       body: JSON.stringify(definition),
     }),
 
+  /** Change the label only. No new version — a name is not part of the recipe. */
+  renameUseCase: (id: string, name: string, description?: string) =>
+    request<{ usecase_id: string; name: string }>(`/api/usecases/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name, description }),
+    }),
+
   publishUseCase: (id: string) =>
     request<{ usecase_id: string; status: string }>(`/api/usecases/${id}/publish`, {
       method: 'POST',

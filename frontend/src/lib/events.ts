@@ -317,6 +317,8 @@ export interface DistillResult {
   usecase_id: string;
   version: number;
   name: string;
+  /** What the model proposed. Editable before you move on. */
+  suggested_name: string;
   status: UseCaseStatus;
   warnings: string[];
   setup_steps: number;

@@ -822,3 +822,20 @@ button.link.danger {
   display: flex;
   flex-direction: column;
 }
+
+/* Naming a use case immediately after it is recorded. */
+.card.naming {
+  border-color: var(--accent);
+}
+
+.card.naming .row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.run-header .task .row input[type='text'] {
+  flex: 1;
+  min-width: 220px;
+}

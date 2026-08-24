@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
-import type { RunDetail, ScreenshotEvent } from '../lib/events';
+import type { DistillResult, RunDetail, ScreenshotEvent } from '../lib/events';
 import { useRunStream, isTerminal } from '../lib/useRunStream';
 import { formatDuration } from '../lib/format';
 import { ApprovalBar } from './ApprovalBar';
+import { NameUseCase } from './NameUseCase';
 import { ResultPanel } from './ResultPanel';
 import { ScreenshotPane } from './ScreenshotPane';
 import { ConnectionIndicator, StatusBadge } from './StatusBadge';
@@ -26,6 +27,9 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [pinnedShot, setPinnedShot] = useState<number | null>(null);
   const [recording, setRecording] = useState(false);
+  // Held between distillation and the name being confirmed: the model's
+  // suggestion cannot exist until the recording has been read.
+  const [recorded, setRecorded] = useState<DistillResult | null>(null);
 
   const stream = useRunStream(runId);
 
@@ -88,14 +92,32 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
     setRecording(true);
     setActionError(null);
     try {
-      const result = await api.distillRun(runId);
-      onRecorded?.(result.usecase_id);
+      setRecorded(await api.distillRun(runId));
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setRecording(false);
     }
   }, [runId, onRecorded]);
+
+  /** Apply the confirmed name, then open the use case for review. */
+  const confirmName = useCallback(
+    async (name: string) => {
+      if (!recorded) return;
+      setRecording(true);
+      try {
+        if (name !== recorded.name) {
+          await api.renameUseCase(recorded.usecase_id, name);
+        }
+        onRecorded?.(recorded.usecase_id);
+      } catch (error) {
+        setActionError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setRecording(false);
+      }
+    },
+    [recorded, onRecorded],
+  );
 
   const status = stream.status;
   const running = !isTerminal(status);
@@ -142,6 +164,15 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
       </div>
 
       {actionError && <div className="banner error">{actionError}</div>}
+
+      {recorded && (
+        <NameUseCase
+          result={recorded}
+          busy={recording}
+          onConfirm={confirmName}
+          onCancel={() => onRecorded?.(recorded.usecase_id)}
+        />
+      )}
 
       {stream.pendingApproval && <ApprovalBar approval={stream.pendingApproval} onDecide={decide} />}
 

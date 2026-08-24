@@ -498,7 +498,10 @@ async def distill_run(
     return {
         "usecase_id": usecase_id,
         "version": version,
+        # A suggestion. The caller is expected to confirm or replace it via
+        # PATCH before moving on.
         "name": use_case.name,
+        "suggested_name": use_case.name,
         "status": use_case.status,
         "warnings": use_case.warnings,
         "setup_steps": len(use_case.setup_steps),
@@ -557,6 +560,40 @@ async def update_usecase(
 
     _, version = await store.save_usecase(use_case.model_dump(mode="json", by_alias=True))
     return {"usecase_id": usecase_id, "version": version, "status": use_case.status}
+
+
+class RenameRequest(BaseModel):
+    """A label change. Deliberately not the definition."""
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("name")
+    @classmethod
+    def _not_only_whitespace(cls, value: str) -> str:
+        # min_length counts characters, so "   " passes it and then strips to
+        # nothing -- leaving a use case with no name at all in the list.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("a name cannot be blank")
+        return stripped
+
+
+@app.patch("/api/usecases/{usecase_id}")
+async def rename_usecase(
+    usecase_id: str,
+    body: RenameRequest,
+    store: Store = Depends(get_store),
+) -> dict[str, Any]:
+    """Rename a use case in place.
+
+    No new version: a name is a label, not part of what executes, so renaming
+    must not appear in a history that exists to record behaviour. Use PUT to
+    change the steps.
+    """
+    if not await store.rename_usecase(usecase_id, body.name.strip(), body.description):
+        raise HTTPException(status_code=404, detail="use case not found")
+    return {"usecase_id": usecase_id, "name": body.name.strip()}
 
 
 @app.post("/api/usecases/{usecase_id}/publish")

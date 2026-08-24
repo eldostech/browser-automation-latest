@@ -329,3 +329,97 @@ async def test_purging_keeps_the_run_that_produced_it(client: TestClient):
 
 async def test_purging_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.delete("/api/usecases/nope", params={"purge": "true"}).status_code == 404
+
+
+# --- naming ----------------------------------------------------------------
+#
+# The model's suggestion can only exist after distillation has read the
+# recording, so the name is offered at that point and can be changed then or
+# later. A rename is a label change, not a change to what runs.
+
+
+async def test_distilling_returns_the_name_as_a_suggestion(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+
+    body = client.post(f"/api/runs/{run_id}/distill").json()
+
+    assert body["suggested_name"] == "Sign in and open a record"
+    assert body["name"] == body["suggested_name"]
+
+
+async def test_renaming_changes_the_label_without_creating_a_version(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    response = client.patch(f"/api/usecases/{usecase_id}", json={"name": "Nightly demo requests"})
+
+    assert response.status_code == 200
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert body["definition"]["name"] == "Nightly demo requests"
+    assert body["definition"]["version"] == 1, "a label change is not a new version"
+    assert [v["version"] for v in body["versions"]] == [1]
+
+
+async def test_a_rename_shows_up_in_the_list(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    client.patch(f"/api/usecases/{usecase_id}", json={"name": "Renamed"})
+
+    assert client.get("/api/usecases").json()["usecases"][0]["name"] == "Renamed"
+
+
+async def test_renaming_leaves_the_steps_alone(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    before = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+
+    client.patch(f"/api/usecases/{usecase_id}", json={"name": "Something else"})
+    after = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+
+    assert after["row_steps"] == before["row_steps"]
+    assert after["setup_steps"] == before["setup_steps"]
+    assert after["status"] == before["status"]
+
+
+async def test_a_description_can_be_changed_too(client: TestClient):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    client.patch(
+        f"/api/usecases/{usecase_id}",
+        json={"name": "Kept", "description": "One row per prospect."},
+    )
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    assert definition["description"] == "One row per prospect."
+
+
+async def test_renaming_a_published_use_case_does_not_unpublish_it(client: TestClient):
+    """A label change must not send something back for review."""
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    client.post(f"/api/usecases/{usecase_id}/publish")
+
+    client.patch(f"/api/usecases/{usecase_id}", json={"name": "Still ready"})
+
+    assert client.get(f"/api/usecases/{usecase_id}").json()["definition"]["status"] == "ready"
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 201])
+async def test_an_unusable_name_is_refused(client: TestClient, name: str):
+    run_id = await seed_run(client)
+    use_plan_llm(client)
+    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+
+    response = client.patch(f"/api/usecases/{usecase_id}", json={"name": name})
+    assert response.status_code == 422
+
+
+async def test_renaming_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.patch("/api/usecases/nope", json={"name": "x"}).status_code == 404

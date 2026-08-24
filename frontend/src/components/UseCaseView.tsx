@@ -27,6 +27,8 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  //: Non-null while the title is being edited in place.
+  const [draftName, setDraftName] = useState<string | null>(null);
 
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [credentialId, setCredentialId] = useState<string>('');
@@ -182,6 +184,17 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     });
 
+  const rename = (name: string) =>
+    act(async () => {
+      setDraftName(null);
+      if (!useCase || name === useCase.name) return;
+      // A rename creates no version: the name is a label, not part of what
+      // executes, so it does not belong in a history of behaviour.
+      await api.renameUseCase(usecaseId, name);
+      setNotice(`Renamed to ${name}.`);
+      await load();
+    });
+
   const archive = () =>
     act(async () => {
       await api.archiveUseCase(usecaseId);
@@ -240,7 +253,43 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               {useCase.row_steps.length} per row
             </span>
           </div>
-          <p>{useCase.name}</p>
+          {draftName === null ? (
+            <p>
+              {useCase.name}{' '}
+              <button
+                type="button"
+                className="link"
+                onClick={() => setDraftName(useCase.name)}
+                title="Rename — this does not create a new version"
+              >
+                rename
+              </button>
+            </p>
+          ) : (
+            <p className="row">
+              <input
+                type="text"
+                autoFocus
+                value={draftName}
+                maxLength={200}
+                onChange={(event) => setDraftName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && draftName.trim()) rename(draftName.trim());
+                  if (event.key === 'Escape') setDraftName(null);
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => draftName.trim() && rename(draftName.trim())}
+                disabled={busy || !draftName.trim()}
+              >
+                Save
+              </button>
+              <button type="button" onClick={() => setDraftName(null)} disabled={busy}>
+                Cancel
+              </button>
+            </p>
+          )}
         </div>
         {!isReady && (
           <button type="button" className="primary" onClick={publish} disabled={busy}>
