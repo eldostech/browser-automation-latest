@@ -191,6 +191,11 @@ class PreFilterResult:
     domains: list[str]
     #: Counters for the "34 calls -> 8 steps" line in the UI.
     stats: dict[str, int]
+    #: One line per recorded call that did NOT become a step, and why. A
+    #: dropped call is invisible otherwise: the summary counts them, but a
+    #: person reviewing a use case cannot tell whether something they needed
+    #: was lost to a mis-detected failure.
+    dropped: list[str] = field(default_factory=list)
 
     def to_prompt_payload(self) -> list[dict[str, Any]]:
         return [step.to_prompt_dict() for step in self.steps]
@@ -206,6 +211,19 @@ def _argument(arguments: dict[str, Any], keys: Iterable[str]) -> Any:
         if key in arguments and arguments[key] not in (None, ""):
             return arguments[key]
     return None
+
+
+def _failure_reason(text: str | None) -> str:
+    """The first line of a tool failure that actually says something.
+
+    Playwright MCP leads with a markdown header -- "### Error" -- so taking
+    the literal first line tells a reviewer nothing about what went wrong.
+    """
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("#", "```")):
+            return stripped[:160]
+    return "the tool reported failure"
 
 
 def _result_failed(event: Any) -> bool:
@@ -300,6 +318,7 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
         return best
 
     warnings: list[str] = []
+    dropped: list[str] = []
     literals: list[str] = []
     domains: list[str] = []
     start_url: str | None = None
@@ -314,11 +333,24 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
 
         if event.name in OBSERVATION_TOOLS:
             stats["observation"] += 1
+            dropped.append(
+                f"step {event.step}: {event.name} only looks at the page -- nothing to replay"
+            )
             continue
 
         result = results.get(event.call_id)
-        if result is None or _result_failed(result):
+        if result is None:
             stats["failed"] += 1
+            dropped.append(
+                f"step {event.step}: {event.name} never returned a result, so nothing proves "
+                "it happened"
+            )
+            continue
+        if _result_failed(result):
+            stats["failed"] += 1
+            dropped.append(
+                f"step {event.step}: {event.name} failed -- {_failure_reason(result.text)}"
+            )
             continue
 
         arguments = dict(event.arguments or {})
@@ -435,6 +467,7 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
     return PreFilterResult(
         steps=kept,
         warnings=warnings,
+        dropped=dropped,
         literals=literals,
         start_url=start_url,
         domains=domains,
@@ -893,6 +926,7 @@ def build_usecase(
         teardown_steps=teardown_steps,
         outputs=[o for o in (plan.get("outputs") or []) if isinstance(o, str)],
         warnings=warnings,
+        dropped=list(pre.dropped),
     )
     log.info(
         "distilled use case",

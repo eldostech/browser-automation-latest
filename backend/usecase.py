@@ -437,6 +437,10 @@ class UseCase(BaseModel):
 
     outputs: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    #: Recorded calls that did NOT become steps, and why. A recording keeps
+    #: only what succeeded, so this is how a reviewer checks that nothing they
+    #: needed was lost -- to a failure, or to a mis-detected one.
+    dropped: list[str] = Field(default_factory=list)
 
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)

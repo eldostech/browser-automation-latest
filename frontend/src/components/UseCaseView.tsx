@@ -401,6 +401,26 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             onRemove={removeStep('row_steps')}
           />
 
+          {(useCase.dropped ?? []).length > 0 && (
+            <details className="card dropped">
+              <summary>
+                {useCase.dropped.length} recorded call
+                {useCase.dropped.length === 1 ? '' : 's'} did not become a step
+              </summary>
+              <p className="hint">
+                A recording keeps only what actually worked. Everything the agent tried and
+                failed, and everything that only looked at the page, is left out — replaying a
+                failed action wastes time and can leave the page in a state the next step does
+                not expect. Check here if a step you expected is missing.
+              </p>
+              <ul>
+                {useCase.dropped.map((line, index) => (
+                  <li key={index}>{line}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+
           <div className="card">
             <h3>Inputs and credentials</h3>
             <p className="hint">

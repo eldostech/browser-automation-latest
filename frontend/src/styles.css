@@ -839,3 +839,21 @@ button.link.danger {
   flex: 1;
   min-width: 220px;
 }
+
+/* What the recording left out, and why. */
+.card.dropped summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.card.dropped ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.card.dropped li {
+  margin-bottom: 4px;
+}

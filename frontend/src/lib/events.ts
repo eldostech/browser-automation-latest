@@ -298,6 +298,8 @@ export interface UseCase {
   teardown_steps: UseCaseStep[];
   outputs: string[];
   warnings: string[];
+  /** Recorded calls that did NOT become steps, and why. */
+  dropped: string[];
   created_at: string;
   updated_at: string;
 }

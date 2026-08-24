@@ -732,3 +732,76 @@ def test_each_field_can_be_wired_to_its_own_input():
         "{{input.reason}}",
     ]
     assert not any("no step reads" in w for w in use_case.warnings)
+
+
+# --- what a recording leaves out, and why ----------------------------------
+#
+# A recording keeps only what worked. That is right -- replaying a failed
+# action wastes time and can leave the page in a state the next step does not
+# expect -- but it must not be silent, or a step lost to a mis-detected
+# failure is undiscoverable.
+
+
+def test_only_successful_calls_become_steps():
+    events = build_events(
+        ("browser_navigate", {"url": "https://example.com"}, True, "ok"),
+        ("browser_click", {"target": "#a"}, False, "### Error\nError: does not match any elements."),
+        ("browser_snapshot", {}, True, SNAPSHOT),
+        ("browser_click", {"target": "#b"}, True, "clicked"),
+    )
+    result = pre_filter(events)
+
+    assert [s.action for s in result.steps] == ["navigate", "click"]
+    assert [s.locators[0].selector for s in result.steps if s.locators] == ["#b"]
+
+
+def test_every_dropped_call_is_reported_with_a_reason():
+    events = build_events(
+        ("browser_navigate", {"url": "https://example.com"}, True, "ok"),
+        ("browser_click", {"target": "#a"}, False, "### Error\nError: does not match any elements."),
+        ("browser_snapshot", {}, True, SNAPSHOT),
+    )
+    dropped = pre_filter(events).dropped
+
+    assert len(dropped) == 2
+    assert any("browser_click failed" in line and "does not match" in line for line in dropped)
+    assert any("browser_snapshot only looks at the page" in line for line in dropped)
+
+
+def test_the_reason_skips_the_markdown_header():
+    """"### Error" as a reason tells a reviewer nothing."""
+    events = build_events(
+        ("browser_click", {"target": "#a"}, False, "### Error\n```\nError: the real reason\n```")
+    )
+    line = pre_filter(events).dropped[0]
+    assert "the real reason" in line
+    assert "###" not in line
+
+
+def test_a_call_with_no_result_says_so():
+    events = [
+        ToolCall(run_id="r", seq=1, step=1, call_id="c1", name="browser_click",
+                 arguments={"target": "#a"})
+    ]
+    assert "never returned a result" in pre_filter(events).dropped[0]
+
+
+def test_the_dropped_list_reaches_the_use_case():
+    recording = pre_filter(
+        build_events(
+            ("browser_navigate", {"url": "https://example.com"}, True, "ok"),
+            ("browser_click", {"target": "#a"}, False, "### Error\nError: nope"),
+        )
+    )
+    use_case = build_usecase({"name": "x", "row_step_ids": ["s1"]}, recording)
+
+    assert any("browser_click failed" in line for line in use_case.dropped)
+    assert len(use_case.row_steps) == 1
+
+
+def test_nothing_dropped_means_an_empty_list():
+    recording = pre_filter(
+        build_events(("browser_navigate", {"url": "https://example.com"}, True, "ok"))
+    )
+    assert recording.dropped == []
+    assert build_usecase({"name": "x", "row_step_ids": ["s1"]}, recording).dropped == []
