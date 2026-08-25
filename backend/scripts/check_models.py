@@ -7,8 +7,7 @@ cross-region inference profile's region prefix is stripped, so
 
 The two cases are distinguishable, and this tells them apart:
 
-* **400 "The provided model identifier is invalid"** -- the ID *shape* is
-  wrong. Fix the string.
+* **400 / ValidationException** -- the ID *shape* is wrong. Fix the string.
 * **403 "not available for this account"** -- the ID was understood. The
   account does not have that model; request access in the Bedrock console.
 
@@ -60,7 +59,7 @@ async def check(model: str) -> tuple[str, bool, str]:
 
 
 async def main_async(models: list[str]) -> int:
-    print(f"provider={settings.llm_provider} api={settings.bedrock_api}\n")
+    print(f"provider={settings.llm_provider}\n")
     results = await asyncio.gather(*(check(m) for m in models))
 
     usable: list[str] = []

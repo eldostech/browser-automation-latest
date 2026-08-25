@@ -109,7 +109,6 @@ def test_bedrock_settings_load_from_dotenv(tmp_path):
     )
     settings = Settings(_env_file=env)
     assert settings.llm_provider == "bedrock"
-    assert settings.bedrock_api == "mantle"
     assert settings.aws_region == "eu-west-1"
     assert settings.aws_profile == "work"
     # A colon in the value must survive -- dotenv splits on '=', not ':'.

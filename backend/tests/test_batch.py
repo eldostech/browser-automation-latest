@@ -361,3 +361,104 @@ def test_the_results_header_is_stable_for_an_empty_batch():
     assert csv_text.strip().splitlines() == [
         "record_url,answer,row_index,status,failed_step_id,error,duration_ms,llm_calls,llm_tokens"
     ]
+
+
+# --- spreadsheets ----------------------------------------------------------
+#
+# A re-saved CSV silently mangles leading zeros, dates and anything containing
+# a comma, so accepting .xlsx removes an export step that is easy to get wrong.
+
+
+def workbook(rows: list[list], sheet_name: str = "Sheet1") -> bytes:
+    import io as _io
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.title = sheet_name
+    for row in rows:
+        book.active.append(row)
+    buffer = _io.BytesIO()
+    book.save(buffer)
+    return buffer.getvalue()
+
+
+def test_a_workbook_is_parsed_like_a_csv():
+    from batch import parse_workbook
+
+    parsed = parse_workbook(
+        workbook([["record_url", "answer"], ["https://a", "1"], ["https://b", "2"]])
+    )
+    assert parsed.columns == ["record_url", "answer"]
+    assert parsed.rows == [
+        {"record_url": "https://a", "answer": "1"},
+        {"record_url": "https://b", "answer": "2"},
+    ]
+
+
+def test_whole_numbers_do_not_arrive_as_floats():
+    """Excel stores every number as a float, so an id would be typed '1234.0'."""
+    from batch import parse_workbook
+
+    parsed = parse_workbook(workbook([["record_url", "answer"], ["https://a", 1234]]))
+    assert parsed.rows[0]["answer"] == "1234"
+
+
+def test_dates_arrive_as_iso_not_a_timestamp():
+    from batch import parse_workbook
+    from datetime import datetime
+
+    parsed = parse_workbook(
+        workbook([["record_url", "answer"], ["https://a", datetime(2026, 8, 24)]])
+    )
+    assert parsed.rows[0]["answer"] == "2026-08-24"
+
+
+def test_trailing_blank_rows_are_ignored():
+    """An artefact of editing a spreadsheet, not data."""
+    from batch import parse_workbook
+
+    parsed = parse_workbook(
+        workbook([["record_url"], ["https://a"], [None], [""], [None]])
+    )
+    assert len(parsed) == 1
+
+
+def test_a_named_sheet_can_be_chosen():
+    from batch import parse_workbook
+
+    data = workbook([["record_url"], ["https://a"]], sheet_name="Prospects")
+    assert parse_workbook(data, "Prospects").rows[0]["record_url"] == "https://a"
+
+
+def test_an_unknown_sheet_names_the_ones_that_exist():
+    from batch import BatchInputError, parse_workbook
+
+    data = workbook([["record_url"], ["https://a"]], sheet_name="Prospects")
+    with pytest.raises(BatchInputError, match="Prospects"):
+        parse_workbook(data, "NotThere")
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [([], "empty"), ([["record_url"]], "no data rows"), ([[None, None]], "must name")],
+)
+def test_unusable_workbooks_are_refused(rows, message):
+    from batch import BatchInputError, parse_workbook
+
+    with pytest.raises(BatchInputError, match=message):
+        parse_workbook(workbook(rows))
+
+
+def test_a_file_that_is_not_a_workbook_is_refused():
+    from batch import BatchInputError, parse_workbook
+
+    with pytest.raises(BatchInputError, match="could not be read as a spreadsheet"):
+        parse_workbook(b"record_url\nhttps://a\n")
+
+
+def test_a_workbook_validates_against_a_use_case_like_a_csv():
+    from batch import parse_workbook, validate_rows
+
+    parsed = parse_workbook(workbook([["record_url", "answer"], ["https://a", "1"]]))
+    assert validate_rows(use_case(), parsed) == []

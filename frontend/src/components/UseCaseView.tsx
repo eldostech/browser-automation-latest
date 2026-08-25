@@ -33,6 +33,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [credentialId, setCredentialId] = useState<string>('');
   const [csv, setCsv] = useState('');
+  // A spreadsheet is sent as-is rather than converted here: re-saving one as
+  // CSV in the browser mangles leading zeros, dates and embedded commas.
+  const [workbook, setWorkbook] = useState<{ name: string; base64: string } | null>(null);
   // Watching the browser work is the fastest way to understand why a step
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
@@ -145,7 +148,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const runBatch = () =>
     act(async () => {
       const started = await api.startBatch(usecaseId, {
-        csv,
+        ...(workbook ? { xlsx_base64: workbook.base64 } : { csv }),
         credential_id: credentialId || null,
         headless: !watch,
       });
@@ -562,17 +565,37 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           />
           <input
             type="file"
-            accept=".csv,text/csv"
-            onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (file) setCsv(await file.text());
+            accept=".csv,.xlsx,text/csv"
+            onChange={async (event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              if (file.name.toLowerCase().endsWith('.xlsx')) {
+                const bytes = new Uint8Array(await file.arrayBuffer());
+                let binary = '';
+                bytes.forEach((byte) => {
+                  binary += String.fromCharCode(byte);
+                });
+                setWorkbook({ name: file.name, base64: btoa(binary) });
+                setCsv('');
+                return;
+              }
+              setWorkbook(null);
+              setCsv(await file.text());
             }}
           />
+          {workbook && (
+            <p className="hint">
+              Using <strong>{workbook.name}</strong> — the first sheet, header row first.{' '}
+              <button type="button" className="link" onClick={() => setWorkbook(null)}>
+                use the text box instead
+              </button>
+            </p>
+          )}
           <button
             type="button"
             className="primary"
             onClick={runBatch}
-            disabled={busy || !csv.trim() || missingSlots.length > 0}
+            disabled={busy || (!csv.trim() && !workbook) || missingSlots.length > 0}
           >
             {busy ? 'Starting...' : 'Start batch'}
           </button>

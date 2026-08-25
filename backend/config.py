@@ -59,12 +59,10 @@ class Settings(BaseSettings):
     #: driving the browser. Every step of a recording costs tokens here, so it
     #: is the one worth keeping fast.
     #:
-    #: On Bedrock this must be a Bedrock model ID. With BEDROCK_API=invoke,
-    #: current Claude models are only offered through cross-region inference
-    #: profiles, so the ID carries a region prefix ("us." / "eu." / "apac." /
-    #: "global."). Invoking the bare foundation-model ID fails with
-    #: "on-demand throughput isn't supported". With BEDROCK_API=mantle the ID
-    #: is the short "anthropic.claude-sonnet-5" form instead.
+    #: On Bedrock this must be a Bedrock model ID. Current Claude models are
+    #: only offered through cross-region inference profiles, so the ID carries
+    #: a region prefix ("us." / "eu." / "apac." / "global."). Naming the bare
+    #: foundation model fails with "on-demand throughput isn't supported".
     llm_model: str = "us.anthropic.claude-sonnet-5"
 
     #: The REPAIR model: self-healing mid-run, and repairing a failed use case
@@ -82,10 +80,6 @@ class Settings(BaseSettings):
 
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
-
-    #: Bedrock endpoint: "invoke" (bedrock-runtime, version-suffixed model IDs)
-    #: or "mantle" (newer Messages-API endpoint, short "anthropic.claude-*" IDs).
-    bedrock_api: Literal["invoke", "mantle"] = "invoke"
 
     #: Both are optional. Left unset, the AWS SDK resolves them itself from the
     #: environment, ~/.aws, or the attached IAM role -- which is what lets the

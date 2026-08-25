@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import uuid
+from datetime import date, datetime, time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -58,6 +59,75 @@ class BatchRows:
 
     def __len__(self) -> int:
         return len(self.rows)
+
+
+def parse_workbook(data: bytes, sheet: str | None = None) -> BatchRows:
+    """Read input rows from an .xlsx workbook.
+
+    Spreadsheets are how people actually keep lists of records, so accepting
+    one removes an export step that is easy to get wrong -- a re-saved CSV
+    silently mangles leading zeros, dates and anything containing a comma.
+
+    ``openpyxl`` rather than pandas: this needs cell values, not a dataframe,
+    and pandas would pull in numpy for nothing.
+    """
+    from openpyxl import load_workbook
+
+    try:
+        book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the uploader verbatim
+        raise BatchInputError(f"that file could not be read as a spreadsheet: {exc}") from exc
+
+    try:
+        worksheet = book[sheet] if sheet else book.worksheets[0]
+    except KeyError:
+        raise BatchInputError(
+            f"the workbook has no sheet named {sheet!r}. It has: "
+            + ", ".join(book.sheetnames)
+        ) from None
+
+    rows_iter = worksheet.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if header is None:
+        raise BatchInputError("that sheet is empty")
+
+    columns = [str(cell).strip() for cell in header if cell is not None and str(cell).strip()]
+    if not columns:
+        raise BatchInputError("the first row must name each input column")
+
+    rows: list[dict[str, Any]] = []
+    for cells in rows_iter:
+        row = {
+            column: _cell_text(value)
+            for column, value in zip(columns, cells)
+        }
+        # A spreadsheet's trailing blank rows are an artefact of editing it,
+        # not data.
+        if any(value not in (None, "") for value in row.values()):
+            rows.append(row)
+
+    if not rows:
+        raise BatchInputError("that sheet has a header but no data rows")
+    return BatchRows(rows=rows, columns=columns)
+
+
+def _cell_text(value: Any) -> str:
+    """One cell as the text a form would receive.
+
+    Excel stores every number as a float, so an integer id arrives as "1234.0"
+    and would be typed into the page that way.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, datetime):
+        return value.date().isoformat() if value.time() == time.min else value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value).strip()
 
 
 def parse_csv(text: str) -> BatchRows:

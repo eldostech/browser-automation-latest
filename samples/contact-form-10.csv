@@ -1,0 +1,11 @@
+full_name,work_email,company_name,reason_to_integrate
+Priya Raghavan,priya.raghavan@northwind.example.com,Northwind Logistics,"Mapping carrier EDI feeds into our warehouse system, currently done by hand"
+Tomas Lindqvist,t.lindqvist@arvika.example.org,Arvika Manufacturing,Need to sync supplier part numbers between SAP and our quoting tool
+Grace Mensah,grace.mensah@harborbank.example.net,Harbor Bank,"Evaluating field-level mapping for KYC onboarding, replacing a spreadsheet process"
+Daniel Okafor,d.okafor@meridianhealth.example.com,Meridian Health,Patient intake forms arrive in four formats and we normalise them manually
+Sofia Marchetti,sofia.marchetti@velacapital.example.org,Vela Capital,Want to automate the reconciliation between our CRM and the fund admin export
+Hiroshi Tanaka,h.tanaka@sakuraretail.example.net,Sakura Retail Group,"Product catalogue integration with three marketplaces, each with its own schema"
+Amelia Byrne,amelia.byrne@kestrelinsure.example.com,Kestrel Insurance,Claims data from brokers needs mapping before it reaches our policy system
+Rafael Duarte,r.duarte@andesfreight.example.org,Andes Freight,Looking at replacing a set of brittle scripts that map customs declarations
+Nadia Haddad,nadia.haddad@cedargrove.example.net,Cedar Grove Foods,"Supplier onboarding is slow because every new vendor sends a different file layout"
+Owen Whitfield,owen.whitfield@stellaraero.example.com,Stellar Aerospace,Compliance reporting pulls from six systems and the field mapping drifts constantly

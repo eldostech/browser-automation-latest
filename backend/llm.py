@@ -1,20 +1,18 @@
-"""LLM provider adapter.
+"""The LLM seam: one protocol, a LangChain-backed implementation.
 
-The agent loop depends on the :class:`LLMClient` protocol, not on a specific
-provider, so adding one means writing a class with a ``run_turn`` method that
-returns an :class:`LLMTurn`. The tests substitute a scripted implementation and
-never touch the network.
-
-Two providers ship here, both speaking the Anthropic Messages API:
+Callers depend on :class:`LLMClient`, not on a provider, so the tests can
+substitute a scripted implementation and never touch the network. That seam is
+the reason the provider underneath could be swapped for LangChain without
+touching distillation, healing or repair.
 
 ``bedrock`` (default)
-    Claude on Amazon Bedrock. **No API key.** Credentials come from the
-    standard AWS chain, so the same code works from a developer laptop
-    (``~/.aws/credentials`` or SSO) and from an EC2/ECS/EKS/Lambda role with no
-    configuration change.
+    Claude on Amazon Bedrock via ``langchain-aws``. **No API key required.**
+    Credentials resolve through the standard AWS chain -- environment,
+    ``~/.aws``, an attached role, or ``AWS_BEARER_TOKEN_BEDROCK`` -- so the
+    same build runs on a laptop and under an IAM role unchanged.
 
 ``anthropic``
-    The first-party Anthropic API, authenticated with ``ANTHROPIC_API_KEY``.
+    The first-party API via ``langchain-anthropic``, keyed by ANTHROPIC_API_KEY.
 
 Streaming matters here for UX, not for tokens: the dashboard shows the model's
 prose as it is produced, so a 6-second turn does not look like a hang.
@@ -91,24 +89,24 @@ class LLMClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Shared Messages API implementation
+# The client: a thin adapter over a LangChain chat model
 # ---------------------------------------------------------------------------
 
 
-class _MessagesAPILLM:
-    """Streaming turn logic shared by every Anthropic Messages API client.
+class LangChainLLM:
+    """Implements :class:`LLMClient` on top of a LangChain chat model.
 
-    Subclasses differ only in how they build and authenticate the client, so
-    the request/response handling lives here exactly once.
+    Provider wiring -- endpoints, auth, request shapes, model IDs -- is the
+    part that rots, and ``langchain-aws`` / ``langchain-anthropic`` track it.
+    What stays here is the small amount this codebase actually needs on top:
+    a normalised :class:`LLMTurn`, streamed text for the dashboard, and access
+    failures translated into something an operator can act on.
     """
 
-    provider = "unknown"
-
-    def __init__(self, client: Any, model: str, max_tokens: int, temperature: float) -> None:
-        self._client = client
-        self.model = model
-        self.max_tokens = max_tokens
-        self.temperature = temperature
+    def __init__(self, model: Any, model_name: str, provider: str) -> None:
+        self._model = model
+        self.model = model_name
+        self.provider = provider
 
     async def run_turn(
         self,
@@ -119,63 +117,37 @@ class _MessagesAPILLM:
         on_text_delta: TextDeltaHandler | None = None,
         timeout: float | None = None,
     ) -> LLMTurn:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "system": system,
-            "messages": messages,
-        }
-        if tools:
-            kwargs["tools"] = tools
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-
-        try:
-            async with self._client.messages.stream(**kwargs) as stream:
-                async for event in stream:
-                    if (
-                        on_text_delta is not None
-                        and event.type == "content_block_delta"
-                        and getattr(event.delta, "type", None) == "text_delta"
-                    ):
-                        await on_text_delta(event.delta.text)
-                final = await stream.get_final_message()
-        except Exception as exc:  # noqa: BLE001 - re-raised, narrowed below
-            raise self._translate(exc) from exc
-
-        text_parts: list[str] = []
-        tool_calls: list[ToolCallRequest] = []
-        raw_content: list[dict[str, Any]] = []
-
-        for block in final.content:
-            raw_content.append(block.model_dump(exclude_none=True))
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    ToolCallRequest(
-                        id=block.id,
-                        name=block.name,
-                        input=dict(block.input) if isinstance(block.input, dict) else {},
-                    )
-                )
-
-        usage = {
-            "input_tokens": getattr(final.usage, "input_tokens", 0) or 0,
-            "output_tokens": getattr(final.usage, "output_tokens", 0) or 0,
-        }
-        log.debug(
-            "llm turn complete",
-            extra={"stop_reason": final.stop_reason, "tool_calls": len(tool_calls), **usage},
+        from chat import (
+            text_of,
+            to_anthropic_blocks,
+            to_langchain,
+            tool_calls_of,
+            usage_of,
         )
 
+        model = self._model.bind_tools(tools) if tools else self._model
+        history = to_langchain(system, messages)
+
+        try:
+            final: Any = None
+            async for chunk in model.astream(history):
+                if on_text_delta is not None:
+                    piece = text_of(chunk)
+                    if piece:
+                        await on_text_delta(piece)
+                final = chunk if final is None else final + chunk
+        except Exception as exc:  # noqa: BLE001 - narrowed by _translate
+            raise self._translate(exc) from exc
+
+        if final is None:
+            return LLMTurn()
+
         return LLMTurn(
-            text="".join(text_parts).strip(),
-            tool_calls=tool_calls,
-            stop_reason=final.stop_reason or "end_turn",
-            raw_content=raw_content,
-            usage=usage,
+            text=text_of(final).strip(),
+            tool_calls=[ToolCallRequest(**call) for call in tool_calls_of(final)],
+            stop_reason="tool_use" if tool_calls_of(final) else "end_turn",
+            raw_content=to_anthropic_blocks(final),
+            usage=usage_of(final),
         )
 
     def _translate(self, exc: Exception) -> Exception:
@@ -183,14 +155,13 @@ class _MessagesAPILLM:
 
         Bedrock's own wording -- "anthropic.claude-sonnet-5 is not available
         for this account" -- names a model ID the operator never typed (the
-        region prefix is stripped), arrives as a traceback, and says nothing
-        about which of three configured models it was or where to change it.
+        inference profile's region prefix is stripped), and says nothing about
+        which of three configured models it was or where to change it.
         """
-        status = getattr(exc, "status_code", None)
+        status = getattr(exc, "status_code", None) or _status_from_message(str(exc))
         if status not in _ACCESS_STATUSES:
             return exc
 
-        detail = str(exc)
         if status == 404:
             reason = f"the provider has no model {self.model!r}"
         elif status == 401:
@@ -200,11 +171,14 @@ class _MessagesAPILLM:
 
         return LLMAccessError(
             f"{reason} on {self.provider}. Nothing will run until the model or the "
-            f"credentials change. Provider said: {detail[:300]}"
+            f"credentials change. Provider said: {str(exc)[:300]}"
         )
 
     def describe(self) -> dict[str, Any]:
-        return {"provider": self.provider, "model": self.model}
+        described: dict[str, Any] = {"provider": self.provider, "model": self.model}
+        if self.provider == "bedrock":
+            described["auth"] = bedrock_auth_status()
+        return described
 
     async def check_access(self) -> dict[str, Any]:
         """Can this client actually call its model? One tiny request.
@@ -213,9 +187,7 @@ class _MessagesAPILLM:
         run rather than one step into one.
         """
         try:
-            await self._client.messages.create(
-                model=self.model, max_tokens=1, messages=[{"role": "user", "content": "hi"}]
-            )
+            await self._model.ainvoke("hi")
         except Exception as exc:  # noqa: BLE001 - a probe must never raise
             translated = self._translate(exc)
             return {
@@ -227,9 +199,22 @@ class _MessagesAPILLM:
         return {"model": self.model, "ok": True}
 
 
-# ---------------------------------------------------------------------------
-# Amazon Bedrock
-# ---------------------------------------------------------------------------
+def _status_from_message(message: str) -> int | None:
+    """Recover an HTTP status a provider only reported in prose.
+
+    botocore raises ``AccessDeniedException`` / ``ValidationException`` rather
+    than anything carrying a status code, so the access check would miss the
+    very failure it exists to catch.
+    """
+    lowered = message.lower()
+    if "accessdenied" in lowered or "not available for this account" in lowered:
+        return 403
+    if "unrecognizedclient" in lowered or "invalid" in lowered and "token" in lowered:
+        return 401
+    if "resourcenotfound" in lowered or "could not be found" in lowered:
+        return 404
+    return None
+
 
 
 def bedrock_auth_status(profile: str | None = None) -> dict[str, Any]:
@@ -292,137 +277,6 @@ def bedrock_auth_status(profile: str | None = None) -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-class BedrockLLM(_MessagesAPILLM):
-    """Claude on Amazon Bedrock, authenticated by the standard AWS chain.
-
-    No API key is passed. Credentials resolve in botocore's usual order --
-    environment variables, then ``~/.aws/credentials`` / SSO, then the
-    instance/task/container IAM role -- so a laptop and a production role need
-    identical configuration.
-
-    ``api`` selects the endpoint:
-
-    ``invoke`` (default)
-        ``bedrock-runtime.{region}.amazonaws.com``. Model IDs are the
-        Bedrock-native, version-suffixed form, and for current models that
-        means a **cross-region inference profile** ID such as
-        ``us.anthropic.claude-haiku-4-5-20251001-v1:0``.
-
-    ``mantle``
-        The newer Messages-API Bedrock endpoint, whose model IDs are the short
-        ``anthropic.claude-haiku-4-5`` form.
-    """
-
-    provider = "bedrock"
-
-    def __init__(
-        self,
-        model: str,
-        max_tokens: int = 4096,
-        temperature: float = 0.0,
-        region: str | None = None,
-        profile: str | None = None,
-        api: str = "invoke",
-        max_retries: int = 3,
-    ) -> None:
-        try:
-            from anthropic import AsyncAnthropicBedrock, AsyncAnthropicBedrockMantle
-        except ImportError as exc:  # pragma: no cover - dependency guard
-            raise RuntimeError(
-                "The Bedrock client requires the AWS extra: pip install 'anthropic[bedrock]'"
-            ) from exc
-
-        # The SDK refuses a request that carries both a bearer token and AWS
-        # credential arguments. Catch it here with an actionable message
-        # instead of letting the SDK raise a generic ValueError at startup.
-        bearer_token_set = bool(os.environ.get(BEDROCK_BEARER_TOKEN_ENV))
-        if bearer_token_set and profile:
-            raise ValueError(
-                f"Both {BEDROCK_BEARER_TOKEN_ENV} and AWS_PROFILE are set. The Anthropic "
-                "SDK accepts one or the other, not both. Either unset "
-                f"{BEDROCK_BEARER_TOKEN_ENV} to authenticate with the IAM profile, or "
-                "clear AWS_PROFILE to authenticate with the Bedrock API key."
-            )
-
-        client_cls = AsyncAnthropicBedrockMantle if api == "mantle" else AsyncAnthropicBedrock
-
-        # Only pass what was explicitly configured. Passing nothing lets the
-        # SDK run its own resolution, which is what makes IAM roles work with
-        # no configuration at all.
-        kwargs: dict[str, Any] = {"max_retries": max_retries}
-        if region:
-            kwargs["aws_region"] = region
-        if profile:
-            kwargs["aws_profile"] = profile
-
-        self.api = api
-        self.region = region
-        self.profile = profile
-        self._auth = bedrock_auth_status(profile)
-
-        super().__init__(client_cls(**kwargs), model, max_tokens, temperature)
-
-        log.info(
-            "bedrock client ready",
-            extra={
-                "model": model,
-                "api": api,
-                "region": region or self._auth.get("region") or "(from AWS chain)",
-                "auth_method": self._auth.get("method"),
-                "auth_source": self._auth.get("source"),
-            },
-        )
-
-    def describe(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "model": self.model,
-            "api": self.api,
-            "region": self.region or self._auth.get("region"),
-            "profile": self.profile,
-            "auth": self._auth,
-        }
-
-
-# ---------------------------------------------------------------------------
-# First-party Anthropic API
-# ---------------------------------------------------------------------------
-
-
-class AnthropicLLM(_MessagesAPILLM):
-    """The first-party Anthropic API, authenticated with an API key."""
-
-    provider = "anthropic"
-
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        max_tokens: int = 4096,
-        temperature: float = 0.0,
-        max_retries: int = 3,
-    ) -> None:
-        if not api_key:
-            raise ValueError(
-                "LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY. Set it in .env "
-                "(backend only -- never in the frontend or a URL), or switch to "
-                "LLM_PROVIDER=bedrock to use AWS credentials instead."
-            )
-        from anthropic import AsyncAnthropic
-
-        super().__init__(
-            AsyncAnthropic(api_key=api_key, max_retries=max_retries),
-            model,
-            max_tokens,
-            temperature,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
-
-
 def llm_health(settings: Any) -> dict[str, Any]:
     """Report whether the configured provider could authenticate.
 
@@ -442,7 +296,6 @@ def llm_health(settings: Any) -> dict[str, Any]:
         auth = bedrock_auth_status(settings.aws_profile)
         return {
             **base,
-            "api": settings.bedrock_api,
             "region": settings.aws_region or auth.get("region"),
             "configured": bool(auth.get("ok")),
             "auth": auth,
@@ -455,31 +308,25 @@ def llm_health(settings: Any) -> dict[str, Any]:
 
 
 def build_llm(settings: Any, model: str | None = None) -> LLMClient:
-    """Construct the configured provider. Add new providers here.
+    """The configured model, wrapped in this codebase's client protocol.
 
     ``model`` overrides ``settings.llm_model`` so one process can run several
-    models at once -- a fast driver for the agent loop, a more capable one for
-    the rare repair calls -- without a second Settings object.
+    at once -- a fast driver for the agent loop, a more capable one for the
+    rare repair calls -- without a second Settings object.
     """
+    from chat import chat_model
+
     provider = (settings.llm_provider or "bedrock").lower()
-    model = model or settings.llm_model
+    resolved = model or settings.llm_model
 
-    if provider == "bedrock":
-        return BedrockLLM(
-            model=model,
-            max_tokens=settings.llm_max_tokens,
-            temperature=settings.llm_temperature,
-            region=settings.aws_region,
-            profile=settings.aws_profile,
-            api=settings.bedrock_api,
+    # The bearer token short-circuits SigV4 entirely, and boto3 rejects a
+    # request carrying both. Catch it here with an actionable message rather
+    # than letting a generic credentials error surface mid-run.
+    if provider == "bedrock" and os.environ.get(BEDROCK_BEARER_TOKEN_ENV) and settings.aws_profile:
+        raise ValueError(
+            f"Both {BEDROCK_BEARER_TOKEN_ENV} and AWS_PROFILE are set. Bedrock accepts one "
+            f"or the other, not both. Either unset {BEDROCK_BEARER_TOKEN_ENV} to authenticate "
+            "with the IAM profile, or clear AWS_PROFILE to use the Bedrock API key."
         )
 
-    if provider == "anthropic":
-        return AnthropicLLM(
-            api_key=settings.anthropic_api_key,
-            model=model,
-            max_tokens=settings.llm_max_tokens,
-            temperature=settings.llm_temperature,
-        )
-
-    raise ValueError(f"Unknown LLM_PROVIDER {provider!r}. Use 'bedrock' or 'anthropic'.")
+    return LangChainLLM(chat_model(settings, resolved), resolved, provider)

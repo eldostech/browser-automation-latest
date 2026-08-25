@@ -7,6 +7,8 @@ frontend sends a task; the backend decides what the browser does.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -26,7 +28,14 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from agent import RunOptions
-from batch import BatchInputError, parse_csv, results_csv, rows_from_json, validate_rows
+from batch import (
+    BatchInputError,
+    parse_csv,
+    parse_workbook,
+    results_csv,
+    rows_from_json,
+    validate_rows,
+)
 from config import Settings, settings
 from credentials import (
     NO_KEY_MESSAGE,
@@ -820,9 +829,14 @@ async def list_usecase_executions(
 
 
 class BatchRequestBody(BaseModel):
-    """Rows arrive either as raw CSV text or as a JSON array of objects."""
+    """Rows arrive as CSV text, a base64 .xlsx workbook, or JSON objects."""
 
     csv: str | None = None
+    #: A base64-encoded .xlsx. Spreadsheets are how people actually keep lists
+    #: of records, and re-saving one as CSV silently mangles leading zeros,
+    #: dates, and anything containing a comma.
+    xlsx_base64: str | None = None
+    sheet: str | None = None
     rows: list[dict[str, Any]] | None = None
     credential_id: str | None = None
     secrets: dict[str, str] | None = None
@@ -868,7 +882,7 @@ async def start_batch(
     use_case, version = await _load_usecase_for_execution(usecase_id, body.version, store)
 
     try:
-        parsed = parse_csv(body.csv) if body.csv is not None else rows_from_json(body.rows)
+        parsed = _rows_from_body(body)
     except BatchInputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -910,6 +924,19 @@ async def start_batch(
         "columns": parsed.columns,
         "warnings": parsed.warnings,
     }
+
+
+def _rows_from_body(body: BatchRequestBody):
+    """Whichever way the rows arrived, one shape comes out."""
+    if body.xlsx_base64 is not None:
+        try:
+            data = base64.b64decode(body.xlsx_base64, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise BatchInputError(f"the workbook was not valid base64: {exc}") from exc
+        return parse_workbook(data, body.sheet)
+    if body.csv is not None:
+        return parse_csv(body.csv)
+    return rows_from_json(body.rows)
 
 
 @app.get("/api/batches/{batch_id}")

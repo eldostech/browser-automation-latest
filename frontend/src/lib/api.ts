@@ -197,7 +197,14 @@ export const api = {
 
   startBatch: (
     id: string,
-    payload: { csv: string; credential_id?: string | null; headless?: boolean },
+    payload: {
+      csv?: string;
+      /** A base64 .xlsx, for people who keep their records in a spreadsheet. */
+      xlsx_base64?: string;
+      sheet?: string;
+      credential_id?: string | null;
+      headless?: boolean;
+    },
   ) =>
     request<{ batch_id: string; total: number; columns: string[]; warnings: string[] }>(
       `/api/usecases/${id}/batch`,

@@ -43,6 +43,19 @@ from events import (
     ToolCall,
     ToolResult,
 )
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.graph import END
+
+from chat import text_of, to_anthropic_blocks, tool_calls_of
+from graph import (
+    BUDGET_EXHAUSTED,
+    DEADLINE_EXCEEDED,
+    AgentState,
+    build_agent_graph,
+    initial_state,
+    last_ai_message,
+    tool_message,
+)
 from llm import LLMAccessError, LLMClient, ToolCallRequest
 from mcp_client import MCPBrowserSession, MCPConnectionError, MCPToolError
 from policy import Decision, check_navigation, classify
@@ -230,31 +243,124 @@ class BrowserAgent:
 
     # -- main loop ----------------------------------------------------------
     async def _loop(self) -> AgentOutcome:
-        options = self.spec.options
+        """Drive the LangGraph graph to completion.
 
-        while True:
-            self._check_deadline()
-            if self.step >= options.max_steps:
-                raise BudgetExhausted(
-                    f"Step budget of {options.max_steps} exhausted before the task finished."
+        The guardrails live in the node bodies below rather than in the graph,
+        because the graph should describe control flow and nothing else.
+        """
+        compiled = build_agent_graph(
+            think=self._think,
+            act=self._act,
+            should_continue=self._should_continue,
+        )
+        # recursion_limit bounds supersteps; the step budget below is the real
+        # ceiling, and this only stops a pathological graph spinning forever.
+        final: AgentState = await compiled.ainvoke(
+            initial_state(self._initial_prompt()),
+            config={
+                "configurable": {"thread_id": self.spec.run_id},
+                "recursion_limit": self.spec.options.max_steps * 2 + 8,
+            },
+        )
+
+        if final.get("halted") == BUDGET_EXHAUSTED:
+            raise BudgetExhausted(
+                f"Step budget of {self.spec.options.max_steps} exhausted before the task "
+                "finished."
+            )
+        if final.get("halted") == DEADLINE_EXCEEDED:
+            raise BudgetExhausted(
+                f"Wall-clock budget of {self.spec.options.timeout_seconds:.0f}s exhausted."
+            )
+        return await self._succeed(final.get("answer") or "")
+
+    # -- graph nodes --------------------------------------------------------
+    async def _think(self, state: AgentState) -> dict[str, Any]:
+        """One model turn. Budget and deadline are checked here, not in the graph."""
+        if state["step"] >= self.spec.options.max_steps:
+            return {"halted": BUDGET_EXHAUSTED}
+        if self._remaining() <= 0:
+            return {"halted": DEADLINE_EXCEEDED}
+
+        self.step = state["step"] + 1
+        # The history the model sees is rebuilt from graph state each turn, so
+        # a resumed run picks up exactly where it stopped.
+        self.messages = self._history_from(state)
+        turn = await self._llm_turn()
+
+        added: list[Any] = [
+            AIMessage(
+                content=turn.text,
+                tool_calls=[
+                    {"id": c.id, "name": c.name, "args": c.input} for c in turn.tool_calls
+                ],
+            )
+        ]
+        if turn.wants_tools:
+            return {"messages": added, "step": self.step}
+        return {"messages": added, "step": self.step, "answer": turn.text}
+
+    async def _act(self, state: AgentState) -> dict[str, Any]:
+        """Run every tool the turn asked for, through the same gates as before."""
+        message = last_ai_message(state)
+        results: list[Any] = []
+
+        for call in tool_calls_of(message):
+            request = ToolCallRequest(id=call["id"], name=call["name"], input=call["input"])
+            outcome = await self._handle_tool_call(request)
+            results.append(
+                tool_message(
+                    request.id,
+                    str(outcome.get("content") or ""),
+                    is_error=bool(outcome.get("is_error")),
                 )
-            self.step += 1
+            )
 
-            turn = await self._llm_turn()
-            self.messages.append({"role": "assistant", "content": turn.raw_content})
+        if self.spec.options.screenshot_every_step:
+            await self._capture_screenshot()
 
-            if not turn.wants_tools:
-                return await self._succeed(turn.text)
+        return {"messages": results}
 
-            tool_results: list[dict[str, Any]] = []
-            for call in turn.tool_calls:
-                tool_results.append(await self._handle_tool_call(call))
+    def _should_continue(self, state: AgentState) -> str:
+        """The graph's only decision: are there tools to run?"""
+        if state.get("halted") or state.get("answer") is not None:
+            return END
+        message = last_ai_message(state)
+        return "act" if tool_calls_of(message) else END
 
-            self.messages.append({"role": "user", "content": tool_results})
-            self._trim_history()
+    def _history_from(self, state: AgentState) -> list[dict[str, Any]]:
+        """Graph state as the Anthropic-shaped history the LLM seam expects.
 
-            if options.screenshot_every_step:
-                await self._capture_screenshot()
+        Trimming happens here rather than by mutating state: the checkpoint
+        keeps the full record of what happened, while the model sees only what
+        fits its budget.
+        """
+        history: list[dict[str, Any]] = []
+        for message in state.get("messages") or []:
+            if isinstance(message, AIMessage):
+                history.append(
+                    {"role": "assistant", "content": to_anthropic_blocks(message)}
+                )
+            elif isinstance(message, ToolMessage):
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id,
+                    "content": text_of(message),
+                    "is_error": getattr(message, "status", "success") == "error",
+                }
+                # Consecutive tool results belong in one user turn.
+                if history and history[-1]["role"] == "user" and isinstance(
+                    history[-1]["content"], list
+                ):
+                    history[-1]["content"].append(block)
+                else:
+                    history.append({"role": "user", "content": [block]})
+            else:
+                history.append({"role": "user", "content": text_of(message)})
+
+        self.messages = history
+        self._trim_history()
+        return self.messages
 
     async def _llm_turn(self):
         """One streamed LLM turn, with `thinking` events pushed as text arrives."""
