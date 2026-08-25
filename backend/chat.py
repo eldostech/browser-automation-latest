@@ -1,4 +1,4 @@
-"""LangChain chat models, and the bridge from this codebase's message shape.
+"""The Bedrock chat model, and the bridge from this codebase's message shape.
 
 Why LangChain here
 ------------------
@@ -43,43 +43,28 @@ log = logging.getLogger(__name__)
 
 
 def chat_model(settings: Any, model: str | None = None, **overrides: Any):
-    """Build the configured LangChain chat model.
+    """Build the configured Bedrock chat model.
 
     ``model`` overrides the driver model so one process can run several -- a
     fast driver for the agent loop, a more capable one for repair.
+
+    Credentials are left entirely to the AWS chain: environment variables,
+    ``~/.aws``, an attached IAM role, or ``AWS_BEARER_TOKEN_BEDROCK``. That is
+    what lets the same build run on a laptop and under a role unchanged.
     """
-    provider = (settings.llm_provider or "bedrock").lower()
-    model = model or settings.llm_model
+    from langchain_aws import ChatBedrockConverse
+
     kwargs: dict[str, Any] = {
-        "model": model,
+        "model": model or settings.llm_model,
         "max_tokens": settings.llm_max_tokens,
         "temperature": settings.llm_temperature,
         **overrides,
     }
-
-    if provider == "bedrock":
-        from langchain_aws import ChatBedrockConverse
-
-        if settings.aws_region:
-            kwargs["region_name"] = settings.aws_region
-        if settings.aws_profile:
-            kwargs["credentials_profile_name"] = settings.aws_profile
-        # Credentials themselves are left to the AWS chain, exactly as before:
-        # env vars, ~/.aws, an attached role, or AWS_BEARER_TOKEN_BEDROCK.
-        return ChatBedrockConverse(**kwargs)
-
-    if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-
-        if not settings.anthropic_api_key:
-            raise ValueError(
-                "LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY. Set it in .env "
-                "(backend only -- never in the frontend or a URL), or switch to "
-                "LLM_PROVIDER=bedrock to use AWS credentials instead."
-            )
-        return ChatAnthropic(api_key=settings.anthropic_api_key, **kwargs)
-
-    raise ValueError(f"Unknown LLM_PROVIDER {provider!r}. Use 'bedrock' or 'anthropic'.")
+    if settings.aws_region:
+        kwargs["region_name"] = settings.aws_region
+    if settings.aws_profile:
+        kwargs["credentials_profile_name"] = settings.aws_profile
+    return ChatBedrockConverse(**kwargs)
 
 
 # ---------------------------------------------------------------------------

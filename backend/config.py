@@ -52,8 +52,9 @@ class Settings(BaseSettings):
     )
 
     # --- LLM ---------------------------------------------------------------
-    #: "bedrock" (AWS credential chain, no API key) or "anthropic" (API key).
-    llm_provider: Literal["bedrock", "anthropic"] = "bedrock"
+    # Claude on Amazon Bedrock, authenticated by the standard AWS chain. There
+    # is no provider setting: adding one back means adding a second code path
+    # to keep working, and nothing here needs it.
 
     #: The DRIVER model: the agent loop that records a use case by actually
     #: driving the browser. Every step of a recording costs tokens here, so it
@@ -87,9 +88,6 @@ class Settings(BaseSettings):
     #: These map to the standard AWS_REGION / AWS_PROFILE variables.
     aws_region: str | None = None
     aws_profile: str | None = None
-
-    #: Only required when llm_provider == "anthropic".
-    anthropic_api_key: str = ""
 
     # --- MCP ---------------------------------------------------------------
     mcp_transport: Literal["stdio", "http"] = "stdio"

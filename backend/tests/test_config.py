@@ -51,7 +51,6 @@ def test_the_shipped_env_example_parses(tmp_path):
     settings = Settings(_env_file=write_env(tmp_path, active))
     assert settings.agent_allowed_domains
     assert settings.cors_origins
-    assert settings.llm_provider == "bedrock"
     assert settings.llm_model.startswith(("us.", "eu.", "apac.", "global."))
 
 
@@ -108,7 +107,6 @@ def test_bedrock_settings_load_from_dotenv(tmp_path):
         "AWS_PROFILE=work\n",
     )
     settings = Settings(_env_file=env)
-    assert settings.llm_provider == "bedrock"
     assert settings.aws_region == "eu-west-1"
     assert settings.aws_profile == "work"
     # A colon in the value must survive -- dotenv splits on '=', not ':'.
@@ -116,15 +114,32 @@ def test_bedrock_settings_load_from_dotenv(tmp_path):
 
 
 def test_a_typo_in_a_typed_setting_fails_at_load(tmp_path):
-    env = write_env(tmp_path, "LLM_PROVIDER=bedrockk\n")
-    with pytest.raises(Exception, match="bedrock"):
+    env = write_env(tmp_path, "AGENT_MAX_STEPS=not-a-number\n")
+    with pytest.raises(Exception, match="agent_max_steps"):
         Settings(_env_file=env)
+
+
+def test_a_setting_that_no_longer_exists_is_ignored_not_fatal(tmp_path):
+    """An old .env keeps working.
+
+    LLM_PROVIDER, ANTHROPIC_API_KEY and BEDROCK_API are gone; a stale line for
+    any of them must not stop the backend starting.
+    """
+    env = write_env(
+        tmp_path,
+        "LLM_PROVIDER=anthropic\nANTHROPIC_API_KEY=sk-ant-stale\nBEDROCK_API=mantle\n",
+    )
+    settings = Settings(_env_file=env)
+
+    assert not hasattr(settings, "llm_provider")
+    assert not hasattr(settings, "anthropic_api_key")
+    assert not hasattr(settings, "bedrock_api")
 
 
 def test_defaults_apply_with_no_dotenv_file(tmp_path):
     settings = Settings(_env_file=str(tmp_path / "does-not-exist.env"))
     assert settings.agent_allowed_domains == ["example.com", "*.example.com"]
-    assert settings.llm_provider == "bedrock"
+    assert settings.llm_model.startswith(("us.", "eu.", "apac.", "global."))
 
 
 # --- the parser itself -----------------------------------------------------

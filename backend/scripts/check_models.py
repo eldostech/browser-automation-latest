@@ -59,7 +59,7 @@ async def check(model: str) -> tuple[str, bool, str]:
 
 
 async def main_async(models: list[str]) -> int:
-    print(f"provider={settings.llm_provider}\n")
+    print(f"region={settings.aws_region or '(from the AWS chain)'}\n")
     results = await asyncio.gather(*(check(m) for m in models))
 
     usable: list[str] = []

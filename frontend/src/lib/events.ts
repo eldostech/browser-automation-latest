@@ -206,7 +206,7 @@ export interface ServerConfig {
     browser: string;
   };
   model: string;
-  /** "bedrock" or "anthropic" — which backend provider is serving the model. */
+  /** Always "bedrock" — the only provider. */
   provider: string;
   transport: string;
 }

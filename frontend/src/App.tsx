@@ -108,7 +108,7 @@ export default function App() {
             {health?.status === 'degraded' && (
               <div className="banner error">
                 The backend reports a degraded state. Check <code>/healthz</code> -- usually a
-                missing <code>ANTHROPIC_API_KEY</code> or an MCP server that will not start.
+                AWS credentials Bedrock will not accept, or an MCP server that will not start.
               </div>
             )}
             <TaskComposer onStarted={(runId) => navigate({ name: 'run', runId })} />

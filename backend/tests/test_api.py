@@ -41,8 +41,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main.settings, "artifacts_dir", str(tmp_path / "artifacts"))
     # Pin the API tests to the key-based provider so /healthz is deterministic
     # and never reads the developer's real AWS environment.
-    monkeypatch.setattr(main.settings, "llm_provider", "anthropic")
-    monkeypatch.setattr(main.settings, "anthropic_api_key", "test-key-not-used")
+    # Bedrock is the only provider, so /healthz is made deterministic with
+    # fake AWS credentials rather than by pinning a different one.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTONLY")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-not-used")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.setattr(main.settings, "agent_allowed_domains", ["example.com"])
     monkeypatch.setattr(main.settings, "agent_screenshot_every_step", False)
     monkeypatch.setattr(main.settings, "agent_max_steps", 6)

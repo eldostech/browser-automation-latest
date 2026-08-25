@@ -1,18 +1,15 @@
-"""The LLM seam: one protocol, a LangChain-backed implementation.
+"""The LLM seam: one protocol, a LangChain-backed Bedrock implementation.
 
 Callers depend on :class:`LLMClient`, not on a provider, so the tests can
 substitute a scripted implementation and never touch the network. That seam is
 the reason the provider underneath could be swapped for LangChain without
 touching distillation, healing or repair.
 
-``bedrock`` (default)
-    Claude on Amazon Bedrock via ``langchain-aws``. **No API key required.**
-    Credentials resolve through the standard AWS chain -- environment,
-    ``~/.aws``, an attached role, or ``AWS_BEARER_TOKEN_BEDROCK`` -- so the
-    same build runs on a laptop and under an IAM role unchanged.
-
-``anthropic``
-    The first-party API via ``langchain-anthropic``, keyed by ANTHROPIC_API_KEY.
+Claude on Amazon Bedrock via ``langchain-aws``, and only that. **No API key
+required:** credentials resolve through the standard AWS chain -- environment,
+``~/.aws``, an attached role, or ``AWS_BEARER_TOKEN_BEDROCK`` -- so the same
+build runs on a laptop and under an IAM role unchanged. A second provider is a
+second code path to keep working, and nothing here needs one.
 
 Streaming matters here for UX, not for tokens: the dashboard shows the model's
 prose as it is produced, so a 6-second turn does not look like a hang.
@@ -28,6 +25,10 @@ from typing import Any, Awaitable, Callable, Protocol
 log = logging.getLogger(__name__)
 
 TextDeltaHandler = Callable[[str], Awaitable[None]]
+
+#: The only provider. Named rather than configured, so /healthz and the client
+#: still report it without a setting that has one legal value.
+PROVIDER = "bedrock"
 
 
 class LLMAccessError(RuntimeError):
@@ -97,16 +98,16 @@ class LangChainLLM:
     """Implements :class:`LLMClient` on top of a LangChain chat model.
 
     Provider wiring -- endpoints, auth, request shapes, model IDs -- is the
-    part that rots, and ``langchain-aws`` / ``langchain-anthropic`` track it.
+    part that rots, and ``langchain-aws`` tracks it.
     What stays here is the small amount this codebase actually needs on top:
     a normalised :class:`LLMTurn`, streamed text for the dashboard, and access
     failures translated into something an operator can act on.
     """
 
-    def __init__(self, model: Any, model_name: str, provider: str) -> None:
+    def __init__(self, model: Any, model_name: str) -> None:
         self._model = model
         self.model = model_name
-        self.provider = provider
+        self.provider = PROVIDER
 
     async def run_turn(
         self,
@@ -175,10 +176,7 @@ class LangChainLLM:
         )
 
     def describe(self) -> dict[str, Any]:
-        described: dict[str, Any] = {"provider": self.provider, "model": self.model}
-        if self.provider == "bedrock":
-            described["auth"] = bedrock_auth_status()
-        return described
+        return {"provider": PROVIDER, "model": self.model, "auth": bedrock_auth_status()}
 
     async def check_access(self) -> dict[str, Any]:
         """Can this client actually call its model? One tiny request.
@@ -228,7 +226,7 @@ def bedrock_auth_status(profile: str | None = None) -> dict[str, Any]:
     except ImportError:
         return {
             "ok": False,
-            "error": "botocore is not installed -- run: pip install 'anthropic[bedrock]'",
+            "error": "botocore is not installed -- run: pip install botocore",
         }
 
     def resolve_region() -> str | None:
@@ -278,33 +276,22 @@ def bedrock_auth_status(profile: str | None = None) -> dict[str, Any]:
 
 
 def llm_health(settings: Any) -> dict[str, Any]:
-    """Report whether the configured provider could authenticate.
+    """Report whether Bedrock could authenticate.
 
-    Cheap and offline: for Bedrock this resolves the credential chain locally
-    without calling AWS, so ``/healthz`` stays safe to poll.
+    Cheap and offline: this resolves the credential chain locally without
+    calling AWS, so ``/healthz`` stays safe to poll.
     """
-    provider = (settings.llm_provider or "bedrock").lower()
-    base: dict[str, Any] = {
-        "provider": provider,
+    auth = bedrock_auth_status(settings.aws_profile)
+    return {
+        "provider": PROVIDER,
         # `model` stays the driver, so existing consumers keep working.
         "model": settings.llm_model,
         # Which model does what -- three roles can differ.
         "models": getattr(settings, "models_in_use", {"driver": settings.llm_model}),
+        "region": settings.aws_region or auth.get("region"),
+        "configured": bool(auth.get("ok")),
+        "auth": auth,
     }
-
-    if provider == "bedrock":
-        auth = bedrock_auth_status(settings.aws_profile)
-        return {
-            **base,
-            "region": settings.aws_region or auth.get("region"),
-            "configured": bool(auth.get("ok")),
-            "auth": auth,
-        }
-
-    if provider == "anthropic":
-        return {**base, "configured": bool(settings.anthropic_api_key)}
-
-    return {**base, "configured": False, "error": f"unknown provider {provider!r}"}
 
 
 def build_llm(settings: Any, model: str | None = None) -> LLMClient:
@@ -316,17 +303,16 @@ def build_llm(settings: Any, model: str | None = None) -> LLMClient:
     """
     from chat import chat_model
 
-    provider = (settings.llm_provider or "bedrock").lower()
     resolved = model or settings.llm_model
 
     # The bearer token short-circuits SigV4 entirely, and boto3 rejects a
     # request carrying both. Catch it here with an actionable message rather
     # than letting a generic credentials error surface mid-run.
-    if provider == "bedrock" and os.environ.get(BEDROCK_BEARER_TOKEN_ENV) and settings.aws_profile:
+    if os.environ.get(BEDROCK_BEARER_TOKEN_ENV) and settings.aws_profile:
         raise ValueError(
             f"Both {BEDROCK_BEARER_TOKEN_ENV} and AWS_PROFILE are set. Bedrock accepts one "
             f"or the other, not both. Either unset {BEDROCK_BEARER_TOKEN_ENV} to authenticate "
             "with the IAM profile, or clear AWS_PROFILE to use the Bedrock API key."
         )
 
-    return LangChainLLM(chat_model(settings, resolved), resolved, provider)
+    return LangChainLLM(chat_model(settings, resolved), resolved)

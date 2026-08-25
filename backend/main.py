@@ -46,7 +46,7 @@ from credentials import (
 )
 from distill import DistillationError, distill
 from events import TERMINAL_STATUSES, dump_event
-from llm import llm_health
+from llm import PROVIDER, llm_health
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
 from repair import (
@@ -147,7 +147,6 @@ async def lifespan(app: FastAPI):
     log.info(
         "starting backend",
         extra={
-            "llm_provider": settings.llm_provider,
             "models": settings.models_in_use,
             "mcp_transport": settings.mcp_transport,
             "allowed_domains": settings.agent_allowed_domains,
@@ -320,7 +319,7 @@ async def get_config(settings_dep: Settings = Depends(get_settings_dep)) -> dict
         },
         "model": settings_dep.llm_model,
         "models": settings_dep.models_in_use,
-        "provider": settings_dep.llm_provider,
+        "provider": PROVIDER,
         "transport": settings_dep.mcp_transport,
     }
 

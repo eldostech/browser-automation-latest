@@ -4,10 +4,10 @@ Every test here is offline. Credential resolution is a local operation
 (environment variables and ``~/.aws``), so none of this calls AWS, and the
 developer's own environment is masked out so results are deterministic.
 
-Provider wiring now lives in ``langchain-aws`` / ``langchain-anthropic``. What
-remains ours -- and therefore what is tested here -- is the seam: which model
-each role gets, how credentials are reported, and turning a provider access
-failure into something an operator can act on.
+Provider wiring now lives in ``langchain-aws``. What remains ours -- and
+therefore what is tested here -- is the seam: which model each role gets, how
+credentials are reported, and turning a provider access failure into something
+an operator can act on.
 """
 
 from __future__ import annotations
@@ -52,10 +52,8 @@ def settings(**overrides) -> Settings:
     """
     base = {
         "_env_file": None,
-        "llm_provider": "bedrock",
         "aws_region": "us-east-1",
         "aws_profile": None,
-        "anthropic_api_key": "",
         "llm_max_tokens": 4096,
         "llm_temperature": 0.0,
     }
@@ -64,10 +62,6 @@ def settings(**overrides) -> Settings:
 
 
 # --- defaults --------------------------------------------------------------
-
-
-def test_bedrock_is_the_default_provider():
-    assert Settings(_env_file=None).llm_provider == "bedrock"
 
 
 @pytest.mark.parametrize("field", ["llm_model", "llm_repair_model"])
@@ -81,10 +75,14 @@ def test_default_models_are_inference_profiles_not_bare_model_ids(field):
     assert model.startswith(("us.", "eu.", "apac.", "global.")), model
 
 
-def test_no_api_key_is_required_for_bedrock(monkeypatch):
-    """The whole point: Bedrock authenticates with AWS credentials."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    assert Settings(_env_file=None).anthropic_api_key == ""
+def test_no_api_key_setting_exists_at_all():
+    """Bedrock authenticates with AWS credentials, so there is nothing to set.
+
+    An unused ANTHROPIC_API_KEY in .env is now ignored rather than quietly
+    looking like configuration that matters.
+    """
+    assert not hasattr(Settings(_env_file=None), "anthropic_api_key")
+    assert not hasattr(Settings(_env_file=None), "llm_provider")
     assert build_llm(settings()).provider == "bedrock"
 
 
@@ -103,19 +101,6 @@ def test_a_named_profile_is_passed_through():
     with pytest.raises(Exception) as excinfo:
         chat_model(settings(aws_profile="no-such-profile"), "us.anthropic.claude-sonnet-4-6")
     assert "no-such-profile" in str(excinfo.value)
-
-
-def test_an_unknown_provider_is_refused():
-    """Settings' own Literal blocks this, so the guard needs a stub to reach."""
-
-    class Stub:
-        llm_provider = "mistral"
-        llm_model = "x"
-        llm_max_tokens = 10
-        llm_temperature = 0.0
-
-    with pytest.raises(ValueError, match="Unknown LLM_PROVIDER"):
-        chat_model(Stub())
 
 
 # --- the bearer-token / profile conflict -----------------------------------
@@ -204,11 +189,8 @@ def test_health_reports_missing_aws_credentials(monkeypatch):
     assert llm_health(settings())["configured"] is False
 
 
-def test_health_reports_anthropic_provider():
-    health = llm_health(settings(llm_provider="anthropic", anthropic_api_key="sk-ant-x"))
-    assert health["provider"] == "anthropic"
-    assert health["configured"] is True
-    assert "sk-ant-x" not in str(health)
+def test_health_always_reports_bedrock():
+    assert llm_health(settings())["provider"] == "bedrock"
 
 
 # --- one process, three models ---------------------------------------------
