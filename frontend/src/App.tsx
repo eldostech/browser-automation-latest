@@ -154,6 +154,7 @@ export default function App() {
             runId={view.runId}
             onBack={() => navigate({ name: 'history' })}
             onRecorded={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
+            onOpenUseCase={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
           />
         )}
 

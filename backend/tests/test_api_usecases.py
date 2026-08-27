@@ -417,3 +417,30 @@ async def test_an_unusable_name_is_refused(client: TestClient, name: str):
 
 async def test_renaming_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.patch("/api/usecases/nope", json={"name": "x"}).status_code == 404
+
+
+async def test_a_replay_run_cannot_be_distilled(client: TestClient):
+    """A replay is a use case being executed, not a recording of new work.
+
+    Distilling one would spend an LLM call to derive a use case from a use
+    case -- and because the original's parameters are already substituted into
+    the executed steps, the "inputs" it inferred would be whichever row
+    happened to run. The UI no longer offers it; this is the guard that makes
+    the API correct regardless of the client.
+    """
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
+    await store.create_run(
+        "replay-run",
+        "Replay: Contact form",
+        None,
+        {"usecase_id": "uc-1", "version": 1, "replay": True},
+    )
+    await store.finish_run("replay-run", "succeeded", steps=3, duration_ms=100)
+
+    response = client.post("/api/runs/replay-run/distill")
+
+    assert response.status_code == 409
+    assert "nothing here to distil" in response.json()["detail"]
+    assert "uc-1" in response.json()["detail"]

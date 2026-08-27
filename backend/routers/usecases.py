@@ -69,6 +69,24 @@ async def distill_run(
             ),
         )
 
+    # A replay is a use case being *executed*. Distilling one would spend an
+    # LLM call to derive a use case from a use case -- a copy of the original
+    # with its parameters already substituted into the steps, so the "inputs"
+    # would be whichever row happened to run. The button that offered this is
+    # gone from the UI, but the guard belongs here: the API is the contract.
+    options = run.options or {}
+    if options.get("replay"):
+        source = options.get("usecase_id")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This run executed an existing use case rather than recording a new "
+                "one, so there is nothing here to distil"
+                + (f" -- it ran use case {source}." if source else ".")
+                + " To change that use case, edit it or use Fix with AI on a failure."
+            ),
+        )
+
     events = await data.get_events(run_id)
     # What the user named before recording. Present, parameterisation is a
     # lookup rather than a judgement -- see fields.py.

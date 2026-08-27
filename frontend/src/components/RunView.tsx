@@ -16,6 +16,8 @@ interface Props {
   onBack: () => void;
   /** Opens the review screen for a use case distilled from this run. */
   onRecorded?: (usecaseId: string) => void;
+  /** Opens the use case a replay run was executing. */
+  onOpenUseCase?: (usecaseId: string) => void;
 }
 
 /**
@@ -33,7 +35,7 @@ function hostOf(url: string | null | undefined): string {
   }
 }
 
-export function RunView({ runId, onBack, onRecorded }: Props) {
+export function RunView({ runId, onBack, onRecorded, onOpenUseCase }: Props) {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pinnedShot, setPinnedShot] = useState<number | null>(null);
@@ -48,6 +50,19 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
   const [decidingCredentials, setDecidingCredentials] = useState(false);
 
   const stream = useRunStream(runId);
+
+  /**
+   * Did this run *execute* a stored use case, rather than record a new one?
+   *
+   * The two look identical in the timeline, but only one of them can become a
+   * use case. Offering "Save as use case" on a replay invited spending an LLM
+   * call to derive a use case from a use case -- a copy of the original with
+   * one row's values already baked into its steps. The API refuses it; this
+   * stops the button being there to press.
+   */
+  const isReplay = Boolean(detail?.options?.replay);
+  const sourceUseCaseId =
+    typeof detail?.options?.usecase_id === 'string' ? detail.options.usecase_id : null;
 
   useEffect(() => {
     let alive = true;
@@ -183,7 +198,7 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
           </div>
           <p>{detail?.task ?? 'Loading task...'}</p>
         </div>
-        {status === 'succeeded' && (
+        {status === 'succeeded' && !isReplay && (
           <button
             type="button"
             className="primary"
@@ -192,6 +207,15 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
             title="Record these steps so they can be replayed with no LLM calls"
           >
             {recording ? 'Recording...' : 'Save as use case'}
+          </button>
+        )}
+        {isReplay && sourceUseCaseId && (
+          <button
+            type="button"
+            onClick={() => onOpenUseCase?.(sourceUseCaseId)}
+            title="This run executed a stored use case"
+          >
+            Open the use case
           </button>
         )}
         {running && (
