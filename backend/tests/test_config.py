@@ -162,3 +162,59 @@ def test_defaults_apply_with_no_dotenv_file(tmp_path):
 )
 def test_split_csv(raw, expected):
     assert _split_csv(raw) == expected
+
+
+# --- the example file is the documentation ---------------------------------
+
+
+def test_every_setting_appears_in_the_env_example():
+    """A setting nobody can discover may as well not be configurable.
+
+    `.env.example` is where an operator finds out what they can change, so a
+    field added without a line here is invisible. Eight had already drifted out
+    of it by the time this was written, including the two AWS variables the
+    header explicitly promised were documented "below" -- in a section that no
+    longer existed.
+
+    A commented-out line counts: some settings are best left unset, and showing
+    the name with its default is the documentation.
+    """
+    import re
+    from pathlib import Path
+
+    from config import Settings
+
+    example = (
+        Path(__file__).resolve().parents[2] / ".env.example"
+    ).read_text(encoding="utf-8")
+    documented = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", example, re.MULTILINE))
+
+    missing = sorted({name.upper() for name in Settings.model_fields} - documented)
+    assert not missing, (
+        "these settings exist but are not in .env.example, so nobody will find "
+        f"them: {missing}"
+    )
+
+
+def test_the_env_example_mentions_nothing_that_is_not_a_setting():
+    """The reverse drift: a line for a setting that has since been removed.
+
+    ``VITE_API_BASE`` is the one deliberate exception -- it is read by Vite at
+    build time, not by the backend, and it belongs in the same file because it
+    is the same thing an operator has to fill in.
+    """
+    import re
+    from pathlib import Path
+
+    from config import Settings
+
+    example = (
+        Path(__file__).resolve().parents[2] / ".env.example"
+    ).read_text(encoding="utf-8")
+    documented = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", example, re.MULTILINE))
+
+    known = {name.upper() for name in Settings.model_fields} | {"VITE_API_BASE"}
+    stale = sorted(documented - known)
+    assert not stale, (
+        f"these appear in .env.example but are not settings any more: {stale}"
+    )
