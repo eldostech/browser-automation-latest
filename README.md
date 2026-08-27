@@ -104,13 +104,20 @@ same tool surface — that is the whole point of the architecture.
 | **Node.js** | 20+ | Runs the Playwright MCP server via `npx`, and builds the frontend. |
 | **npm** | 10+ | Ships with Node 20. |
 | **Chromium** | installed by Playwright | The browser the MCP server drives. |
+| **PostgreSQL** | 14+ (18 tested) | Runs, use cases, credentials, the job queue, and the event fan-out. |
 | **AWS credentials** | — | Claude runs on Amazon Bedrock. No API key needed. |
 
 Check what you have:
 
 ```bash
-python --version && node --version && npm --version
+python --version && node --version && npm --version && psql --version
 ```
+
+**PostgreSQL** — the application keeps its tables in a named schema (`browser`
+by default), so it can share a database with other systems without colliding.
+Point `DB_*` in `.env` at any reachable Postgres; `make db-upgrade` creates the
+schema and everything in it. If you would rather not install one,
+`docker compose up` brings its own.
 
 **AWS access** — the backend authenticates with the standard credential chain,
 so anything that already works with the AWS CLI works here:
@@ -151,7 +158,30 @@ aws bedrock list-inference-profiles --region us-east-1 --query "inferenceProfile
 
 Then install the three pieces. Run these from the **repository root**.
 
-### 1. Python backend
+### 1. Database
+
+Set the connection in `.env`:
+
+```ini
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=postgres
+DB_USER=postgres
+DB_PASSWORD=your-password
+DB_SCHEMA=browser
+```
+
+Supplied in parts rather than as one URL on purpose: a password containing `@`,
+`:` or `/` cannot be safely pasted into a connection string, and the code
+escapes each part itself.
+
+Then create the schema:
+
+```bash
+make db-upgrade
+```
+
+### 2. Python backend
 
 **Windows (PowerShell)**
 
@@ -175,7 +205,7 @@ source .venv/bin/activate
 pip install -r backend/requirements.txt
 ```
 
-### 2. Frontend
+### 3. Frontend
 
 ```bash
 cd frontend
@@ -183,7 +213,7 @@ npm install
 cd ..
 ```
 
-### 3. Browser
+### 4. Browser
 
 The browser revision must match the Playwright version bundled *inside*
 `@playwright/mcp`, which is **not** necessarily `playwright@latest`. Installing
@@ -233,6 +263,60 @@ node -p "require('./node_modules/playwright/package.json').version"
 > ```powershell
 > .venv\Scripts\pip.exe freeze > backend\requirements.lock.txt
 > ```
+
+---
+
+## Signing in
+
+The application requires an account. On the backend's **first start**, if the
+database holds no users at all, it creates an administrator and prints a
+one-time password to the log:
+
+```
+========================================================================
+Created the first administrator: admin@localhost
+One-time password: 8Kd2mQv...
+Sign in and change it. This will not be shown again.
+========================================================================
+```
+
+Only the bcrypt hash is stored, so that line is the only time the password
+exists in readable form. If it scrolls past, reset it:
+
+```bash
+.venv/Scripts/python backend/scripts/manage.py reset-password admin@localhost
+```
+
+Other account management, before the admin UI is convenient:
+
+```bash
+python backend/scripts/manage.py users                       # who exists
+python backend/scripts/manage.py add-user sam@example.com --role author
+python backend/scripts/manage.py set-role sam@example.com admin
+```
+
+Passwords are never taken as command arguments — an argument lands in shell
+history and in the process list. Omit `--password` and one is generated and
+printed, or pass `--ask` to be prompted without echo.
+
+### Roles
+
+| Role | Can |
+|---|---|
+| `viewer` | See runs, use cases, batches and credential *names*. |
+| `operator` | The above, plus start runs, approve steps, run batches, save credentials. |
+| `author` | The above, plus create, edit, publish, repair and delete use cases. |
+| `admin` | Everything, plus manage accounts, read the audit log, and permit script steps. |
+
+Two authorities are deliberately admin-only. **Managing accounts** is obvious.
+**Permitting script steps** is less so: a `script` step runs arbitrary
+JavaScript inside a browser session that may be signed in with someone else's
+credentials, so the authority to write a use case and the authority to let it
+execute code are kept separate — an author cannot grant themselves the second
+by editing `allow_scripts` in the definition.
+
+Everything a role may do is enforced server-side. The frontend uses the same
+list only to decide which buttons to draw.
 
 ---
 
@@ -500,12 +584,33 @@ itself.
 | `AGENT_APPROVAL_TIMEOUT_SECONDS` | `300` | Unanswered requests auto-reject. |
 | `AGENT_SCREENSHOT_EVERY_STEP` | `true` | Dashboard only; screenshots never reach the model. |
 
+### Database
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DB_HOST` / `DB_PORT` | `localhost` / `5432` | |
+| `DB_NAME` / `DB_USER` / `DB_PASSWORD` | `postgres` / `postgres` / — | Separate parts, not a URL: a password containing `@`, `:` or `/` cannot be safely interpolated into one. |
+| `DB_SCHEMA` | `browser` | A named schema, so this app can share a database. Read when the models are imported, so it must be set in the environment rather than passed at runtime. |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `5` | Keep `(size + overflow) × workers` under the server's `max_connections`. |
+| `DB_POOL_RECYCLE` | `1800` | Below any proxy idle timeout, or a pooled connection becomes a mystery 500 hours later. |
+| `CHECKPOINT_ENABLED` | `true` | LangGraph state, so a run in flight survives a restart. |
+| `CHECKPOINT_PATH` | `./data/checkpoints.sqlite` | Only used where the Postgres checkpointer cannot run — see `backend/checkpoints.py`. |
+
+### Authentication
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AUTH_SESSION_TTL_HOURS` | `12` | Sessions are opaque tokens hashed at rest; there is no signing secret. |
+| `AUTH_BCRYPT_ROUNDS` | `12` | ~250 ms per login. Lower only in tests. |
+| `BOOTSTRAP_ADMIN_EMAIL` | `admin@localhost` | Created only when the database holds no users at all. |
+| `BOOTSTRAP_ADMIN_PASSWORD` | unset | Blank generates one and prints it once to the log. |
+| `BOOTSTRAP_WORKSPACE_NAME` | `Default` | |
+
 ### Server
 
 | Variable | Default |
 |---|---|
 | `HOST` / `PORT` | `0.0.0.0` / `8000` |
-| `DATABASE_PATH` | `./data/runs.db` |
 | `ARTIFACTS_DIR` | `./artifacts` |
 | `LOG_LEVEL` | `INFO` |
 | `CORS_ORIGINS` | `http://localhost:5173` |

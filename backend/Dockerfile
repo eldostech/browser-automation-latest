@@ -32,9 +32,23 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY backend /app/backend
 
-RUN mkdir -p /app/data /app/artifacts
+# The Playwright image already ships a non-root `pwuser`, which also owns the
+# browser cache -- so reuse it rather than creating another account that would
+# then need the cache re-chowned. Running the browser and the app as root is
+# the default this image invites and the one worth declining: a page that
+# escapes the sandbox should not land on a root shell.
+RUN mkdir -p /app/data /app/artifacts     && chown -R pwuser:pwuser /app /opt/venv
+
+USER pwuser
 
 WORKDIR /app/backend
 EXPOSE 8000
+
+# Liveness only: is the process answering? Readiness is a separate question
+# (can it reach Postgres, Bedrock and the MCP server) and lives at
+# /healthz, which returns 503 when a dependency is down. Conflating them
+# makes an orchestrator kill a container whose only problem is that the
+# database is briefly unavailable -- which restarting will not fix.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3     CMD python -c "import urllib.request,sys;         sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=5).status in (200,503) else 1)"
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -30,60 +30,42 @@ tests assert it. Nothing below may weaken that — it is the product's core clai
 Nothing else on this list is safe to ship until these land. Today ~30 endpoints and
 the WebSocket are unauthenticated, and no table has an owner column.
 
-- [ ] **A1 — Authentication and authorization** *(Blocker, L)*
-      OIDC/SSO at the edge; RBAC as a router-level dependency (policy enforcement
-      point), not per-endpoint `if` checks. Roles: viewer / operator (run, approve)
-      / author (create, publish, delete). **Authenticate the WebSocket too** — it is
-      currently as open as the REST surface.
-- [ ] **A2 — Resource ownership** *(Blocker, M schema / L enforcement)*
-      Add `workspace_id`/`owner_id` to `usecases`, `credentials`, `runs`, `batches`,
-      `executions`. Scope every query by it. Change credential uniqueness from
-      global `name` (`store.py:93`) to `(workspace_id, name)` — today two users
-      cannot both have an "IXL account".
-- [ ] **A3 — Identity on approvals and an audit log** *(High, S after A1)*
-      `approved_by_human` is a boolean; nothing records *who* approved, published or
-      purged. Stamp actor identity into those events and add an append-only audit
-      log — the events-table pattern already in use is the right shape.
-- [ ] **A5 — Role-gate `allow_scripts`** *(High, S to gate / M to sandbox)*
-      A `script` step is arbitrary JavaScript against a signed-in session. With
-      tenants, user A's script must never run under user B's credentials. Make
-      enabling scripts a privileged action, record who did it, and treat sharing a
-      script-bearing use case as a distinct reviewable act.
-- [ ] **E1 — CI** *(High, S)*
-      608 tests and nothing runs them. GitHub Actions: backend pytest, frontend
-      `tsc` + build, secret scan (automate the manual `git grep` habit), and enforce
-      the lockfile (`make lock` already exists).
-- [ ] **B1 — Make resume-after-restart real** *(High, S)*
-      The checkpointer is `InMemorySaver` (`graph.py:87`), so state dies with the
-      process and the LangGraph rationale is currently latent. Swap to
-      `AsyncSqliteSaver` now, `PostgresSaver` with B2, and change
-      `reap_orphaned_runs` to **resume** rather than fail-and-discard.
-      *Cheapest high-value item on this list.*
-
-## P1 · Make multi-user *work* — shared infrastructure
-
-Everything here exists because coordination is currently in-process: a second
-worker would not see the first one's events, jobs, or browser sessions.
-
-- [ ] **B2 + D2 — Postgres via SQLAlchemy 2.0 + Alembic** *(High, L)*
-      `store.py` (953 lines) is largely INSERT/UPDATE strings and `_row_to_*`
-      mapping, and `MIGRATIONS` is a version stamp containing **no actual
-      migrations**. Move to repository-per-aggregate + unit-of-work, with A2's
-      ownership columns born in the migration. Artifacts (screenshots) to
-      S3-compatible storage with signed URLs. Do these together, not as two
-      rewrites of the same layer.
-- [ ] **B3 — Redis pub/sub behind `EventBus`, via the outbox pattern** *(High, M)*
-      The bus says it itself: "one process only". Persist first (already done),
-      publish via Redis, and rely on replay-from-`seq` (already implemented for
-      reconnects) to cover any gap.
-- [ ] **B4 — A real job queue** *(High, L)*
-      `ReplayManager._slot` and `RunManager._tasks` are in-process dicts: they
-      survive neither a restart nor a second worker. "One execution at a time" was a
-      product decision for one user; as a platform it becomes **per-workspace
-      concurrency limits**. arq or Celery for the modest version; evaluate Temporal
-      if durable long-running workflows become central — it would absorb the batch
-      recovery contract, at the cost of new infrastructure. The contract in
-      `batch.py` (rules 1–5) transplants cleanly either way.
+- [x] **A1 — Local accounts + RBAC** *(done — `auth/`, `deps.require`)*
+      No SSO/OIDC by decision. `auth/rbac.py` is free of HTTP and storage, so
+      an OIDC provider replaces how identity is *established* without touching
+      what it *permits*. The WebSocket authenticates too.
+- [x] **A2 — Resource ownership** *(done — `db/models.py`, `WorkspaceStore`)*
+      Scoped operations live on `WorkspaceStore`, not `Store`: forgetting the
+      tenant filter is not possible because the scoped object has no method
+      that can reach another tenant's row. Credential names are unique per
+      workspace now.
+- [x] **A3 — Identity on approvals and an audit log** *(done)*
+      Approvals, publishes, script grants, credential writes and purges all
+      record the actor in an append-only `audit_log`.
+- [x] **A5 — Role-gate `allow_scripts`** *(done)*
+      `script:enable` is admin-only and sets a flag on the *resource*.
+      Execution checks that flag as well as the definition's `allow_scripts`,
+      so an author cannot grant themselves code execution by editing JSON.
+- [x] **E1 — CI** *(done — `.github/workflows/ci.yml`)*
+      Backend on 3.11/3.13 against a real Postgres, `alembic check`, frontend
+      type-check and build, and a secret scan. The scan caught a real password
+      during this work, which is the argument for automating the habit.
+- [x] **B1 — Persistent checkpointer** *(done — `checkpoints.py`)*
+      Postgres where psycopg's async mode can run, a SQLite *file* on Windows
+      where it cannot (psycopg needs a Selector loop; the browser subprocess
+      needs Proactor). Durable on both.
+- [x] **B2 + D2 — Postgres via SQLAlchemy 2.0 + Alembic** *(done)*
+      Ownership columns were born in the initial migration, as planned.
+      Artifacts still go to local disk — S3 remains outstanding.
+- [x] **B3 — Cross-process events** *(done — `bus.py`, LISTEN/NOTIFY)*
+      Postgres rather than Redis: no new infrastructure. The notification
+      carries a pointer, not the payload, because a snapshot exceeds NOTIFY's
+      8000-byte cap.
+- [x] **B4 — Durable job queue** *(done — `jobs.py`)*
+      `SELECT ... FOR UPDATE SKIP LOCKED` with leases rather than lock flags,
+      so a worker that dies releases its work. Per-workspace concurrency
+      limits. **Not yet wired**: `ReplayManager` still runs batches in-process;
+      moving them onto the queue is the remaining step.
 - [ ] **B5 — Browser session pool** *(Medium, M)*
       Every run forks a Chromium via Playwright MCP; ten users means ten forks on
       one box. Put a pool with per-tenant quotas and TTLs behind the existing
@@ -99,21 +81,13 @@ worker would not see the first one's events, jobs, or browser sessions.
 This is where "remove boilerplate" is genuinely correct, and it is worth roughly
 350 lines plus a reduction in duplicated subtlety.
 
-- [ ] **C1 — One `RunLifecycle` for the three run arcs** *(High, M)*
-      `RunManager._execute`, `ReplayManager._drive` and `_run_batch`/`_finalise_batch`
-      each hand-roll: create run → build sink/redactor → open MCP session → drive →
-      **shielded finalise** → emit `RunFinished` → persist terminal status. That
-      shielded-finally subtlety is duplicated three times, and duplicated subtlety
-      is where the next bug lives. One async context manager (template method) with
-      three small strategies. **≈200 lines, best single win.**
-- [ ] **D1 — Routers and a service layer** *(High, M)*
-      `main.py` is 1,280 lines with 21 hand-written 404 raises, 24 repetitions of
-      `Depends(get_store)`, and zero `APIRouter`s. Split into
-      `routers/{runs,usecases,credentials,batches,health}.py` with
-      `UseCaseService`/`RunService` owning logic now inlined in endpoints, and a
-      shared `get_usecase_or_404` dependency. Also the precondition for testing
-      business logic without `TestClient`. Split `runner.py` (983 lines) the same
-      way: bus / sinks / managers / batch driver.
+- [x] **C1 — One `RunLifecycle`** *(done — `lifecycle.py`)*
+      The shielded finaliser exists once instead of three times. Note the line
+      count went **up** by 133, not down by 200: extract for single-source-of-
+      truth, not for brevity.
+- [x] **D1 — Routers and a service layer** *(done)*
+      `main.py` 1,280 → 197 lines. Seven routers, `services.py`, and shared
+      404 lookups in `deps.py` replacing 21 hand-written raises.
 - [ ] **C2 — Merge `healing.py` and `repair.py` onto one kernel** *(Medium, M)*
       274 + 450 lines implementing the same idea at two moments (mid-run vs
       post-mortem): two prompts, two choose-element-by-index schemas, two budgets.
@@ -131,18 +105,12 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
       `interrupt()` + `Command(resume=)` makes a **pending approval survive a
       restart** — a genuinely new property. Restructures the run-task lifecycle and
       the approve endpoint, so it needs its own change.
-- [ ] **D3 — `Settings` by injection, not a module global** *(Medium, S)*
-      `config.settings` is instantiated at import and monkeypatched in tests. The
-      ".env leaks into tests" bug has bitten **three separate times** in this
-      project (API key, default model, repair model). Construct it once in the
-      lifespan and inject via `Depends`. Small change; closes a recurring class.
-- [ ] **D6 — Deduplicate request-side logic** *(Low, S)*
-      Credential resolution and missing-slot validation repeat across the execute
-      and batch endpoints; archive/purge/rename each re-implement fetch-or-404.
-      Mostly falls out of D1 for free.
-
-## P3 · Polish, prove, observe
-
+- [x] **D3 — `Settings` by injection** *(done)*
+      The module-level `settings` object is gone; `create_app(settings)` is a
+      factory. This is what closed the "`.env` leaks into tests" class.
+- [x] **D6 — Deduplicate request-side logic** *(done — `services.py`)*
+      Credential resolution, use-case loading and missing-slot validation are
+      written once and shared by the execute and batch paths.
 - [ ] **D4 — Generate `events.ts` instead of hand-mirroring it** *(Medium, S)*
       380 TypeScript lines maintained by hand, with a sync test that checks type
       *names* but not field shapes. Generate from the pydantic models
@@ -164,33 +132,13 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
       Every test fakes the MCP session, so the first real batch is the first real
       proof. Add an opt-in nightly run (the existing `RUN_E2E=1` pattern):
       record → distil → replay against a local static site.
-- [ ] **E4 — Container and runtime hardening** *(Low, S)*
-      Non-root images, split health/readiness probes, resource limits on browser
-      processes, and CI enforcement of the lockfile.
-
----
-
-## Do NOT do these
-
-Anti-recommendations, kept in the list because they are the tempting wrong turns.
-
-- **No microservices.** A modular monolith on queue + Postgres + Redis scales to
-  many users long before service boundaries pay for themselves.
-- **Do not rebuild `replay.py` on the graph, or "unify" it with the agent.** Its
-  inability to reach a model is the product's core guarantee, held structurally.
-- **Do not adopt more framework to shrink code.** Measured here: the framework move
-  was +338 lines, and framework file-reading tools lost to two lines of stdlib.
-  Adopt for capability, never for brevity.
-- **No CQRS or full event-sourcing.** The events table is a timeline, not the
-  system of record, and that division is serving the project well.
-
----
-
-## Housekeeping
-
-- [ ] **Delete `ANTHROPIC_API_KEY` from `.env`.** Nothing reads it since
-      `29ded6e` made the project Bedrock-only. It was exposed earlier in this
-      project's history, so treat it as compromised rather than merely unused.
+- [x] **E4 — Container hardening** *(done)*
+      Non-root (`pwuser`), an explicit liveness `HEALTHCHECK` kept separate
+      from readiness, and compose runs migrations before the server starts.
+- [x] **Delete `ANTHROPIC_API_KEY` from `.env`.** Already gone — the key is no
+      longer present in the file. Rotating it at the provider remains worth
+      doing if it was ever real, since it was exposed earlier in this
+      project's history.
 - [ ] **Delete `data/runs.db.*.bak`** once you are satisfied with the secret purge
       — the backup still contains the plaintext credential.
 
