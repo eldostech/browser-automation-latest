@@ -771,6 +771,7 @@ class ReplayManager:
                     secrets=request.secrets,
                     redactor=redactor,
                     step_timeout=self.settings.replay_step_timeout,
+                    screenshots=self.settings.replay_screenshots,
                     healer=self.make_healer(),
                 )
                 setup = await executor.run_setup()
@@ -916,6 +917,7 @@ async def _drive_batch(
                 secrets=request.secrets,
                 redactor=redactor,
                 step_timeout=manager.settings.replay_step_timeout,
+                screenshots=manager.settings.replay_screenshots,
                 healer=manager.make_healer(),
             )
 

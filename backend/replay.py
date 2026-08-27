@@ -177,7 +177,7 @@ class UseCaseExecutor:
         run_id: str,
         secrets: dict[str, str] | None = None,
         redactor: Redactor | None = None,
-        screenshot_on_failure: bool = True,
+        screenshots: str = "final",
         step_timeout: float = 30.0,
         healer: "Healer | None" = None,
     ) -> None:
@@ -187,7 +187,22 @@ class UseCaseExecutor:
         self.run_id = run_id
         self.secrets = dict(secrets or {})
         self.redactor = redactor or Redactor(self.secrets.values())
-        self.screenshot_on_failure = screenshot_on_failure
+        #: How much of a replay to photograph. Executing a use case used to
+        #: capture nothing except at the moment of failure, so a successful run
+        #: -- the overwhelming majority -- left no visual record at all, and
+        #: there was nothing to audit or to look at when a result was
+        #: questioned later.
+        #:
+        #:   off        nothing, not even failures
+        #:   failure    only where a step failed (the old behaviour)
+        #:   final      one per row, showing the end state  (default)
+        #:   every_step everything, for troubleshooting
+        #:
+        #: "final" is the default because it is the one that answers "what
+        #: actually happened to record 700" at one image per row. "every_step"
+        #: multiplies that by the step count, which over a thousand-row batch
+        #: is gigabytes.
+        self.screenshots = screenshots
         self.step_timeout = step_timeout
         #: Optional and off by default. See :class:`Healer`.
         self.healer = healer
@@ -259,6 +274,7 @@ class UseCaseExecutor:
                 steps=outcomes,
             )
 
+        await self._capture_row(ok=True)
         return RowResult(
             ok=True,
             outputs=outputs,
@@ -352,6 +368,9 @@ class UseCaseExecutor:
         )
 
         if outcome.ok or outcome.skipped:
+            # Only in "every_step" mode; the check is inside so the common
+            # case is one attribute comparison rather than a tool call.
+            await self._capture_step(step)
             return outcome
 
         # An optional step, or one told to continue, is a recorded failure that
@@ -877,9 +896,33 @@ class UseCaseExecutor:
         )
 
     async def _capture_failure(self) -> str | None:
-        """Screenshot at the moment of failure. Never fails the row."""
-        if not self.screenshot_on_failure:
+        """Screenshot at the moment of failure."""
+        if self.screenshots == "off":
             return None
+        return await self._capture("failure")
+
+    async def _capture_step(self, step: Step) -> None:
+        """Screenshot after a step, when the mode asks for every one."""
+        if self.screenshots == "every_step":
+            await self._capture(f"after {step.id}")
+
+    async def _capture_row(self, ok: bool) -> None:
+        """Screenshot the end state of a row.
+
+        This is the audit artifact: one image per record showing what the page
+        looked like when the work finished. A failure is captured separately at
+        the point it happened, which is more useful than the state afterwards.
+        """
+        if self.screenshots in ("final", "every_step") and ok:
+            await self._capture("row finished")
+
+    async def _capture(self, caption: str) -> str | None:
+        """Take one screenshot. Never fails the row.
+
+        A screenshot is a diagnostic aid; the row is the work. Every failure
+        path here returns None rather than raising -- losing an image must not
+        turn a successful record into a failed one.
+        """
         tool = self.mcp.find_tool("browser_take_screenshot", contains=("screenshot",))
         if tool is None:
             return None
@@ -900,7 +943,7 @@ class UseCaseExecutor:
                     step=self.step_number,
                     artifact_id=artifact_id,
                     url=url,
-                    caption="failure",
+                    caption=caption,
                     page_url=self._last_page_url,
                 )
             )

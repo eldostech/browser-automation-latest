@@ -615,3 +615,70 @@ async def test_a_wait_step_is_honoured():
     mcp = ScriptedMCP([SIGNED_OUT])
     assert (await executor(use_case, mcp).run_row({})).ok
     assert mcp.calls_to("browser_wait_for")[0]["time"] == 0.01
+
+
+# --- screenshots during replay ---------------------------------------------
+#
+# Executing a use case used to photograph only failures, so a successful run --
+# the overwhelming majority -- left nothing to audit or to look at when a
+# result was questioned later. Headless was never the reason: no screenshot
+# code anywhere consults it.
+
+
+def _one_step_usecase() -> UseCase:
+    return UseCase(
+        name="x",
+        allowed_domains=["example.com"],
+        row_steps=[Step(id="s1", action="click", locators=[role("Sign in")])],
+    )
+
+
+def _captions(runner: UseCaseExecutor) -> list[str]:
+    return [e.caption for e in runner.sink.events if e.type == "screenshot"]
+
+
+async def test_a_successful_row_is_photographed_by_default():
+    """The default answers "what happened to record 700", at one image per row."""
+    runner = executor(_one_step_usecase(), ScriptedMCP([SIGNED_OUT]))
+    result = await runner.run_row({})
+
+    assert result.ok, result.error
+    assert _captions(runner) == ["row finished"]
+
+
+async def test_off_captures_nothing():
+    runner = executor(_one_step_usecase(), ScriptedMCP([SIGNED_OUT]), screenshots="off")
+    assert (await runner.run_row({})).ok
+    assert _captions(runner) == []
+
+
+async def test_failure_only_mode_leaves_a_successful_row_unphotographed():
+    """The behaviour that made a successful replay invisible, kept as an option."""
+    runner = executor(_one_step_usecase(), ScriptedMCP([SIGNED_OUT]), screenshots="failure")
+    assert (await runner.run_row({})).ok
+    assert _captions(runner) == []
+
+
+async def test_every_step_photographs_each_step_and_the_end():
+    runner = executor(
+        _one_step_usecase(), ScriptedMCP([SIGNED_OUT]), screenshots="every_step"
+    )
+    assert (await runner.run_row({})).ok
+
+    captions = _captions(runner)
+    assert "after s1" in captions
+    assert captions[-1] == "row finished"
+
+
+async def test_a_failed_row_is_photographed_where_it_failed():
+    """A failure shot beats an end-of-row shot: it shows the moment, not the aftermath."""
+    use_case = UseCase(
+        name="x",
+        allowed_domains=["example.com"],
+        row_steps=[Step(id="s1", action="click", locators=[role("Nothing Like This")])],
+    )
+    runner = executor(use_case, ScriptedMCP([SIGNED_OUT]))
+    result = await runner.run_row({})
+
+    assert not result.ok
+    assert _captions(runner) == ["failure"]

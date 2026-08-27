@@ -466,6 +466,33 @@ Redaction still runs as a second line of defence: the model is never given the
 credential, but a *page* can echo one back into a tool result, and that path
 still needs cleaning.
 
+### Screenshots, and what gets photographed when
+
+Two different things, often confused:
+
+* **Recording** a use case screenshots every step, controlled by
+  `AGENT_SCREENSHOT_EVERY_STEP`. This is what fills the timeline while you
+  watch the agent work.
+* **Running** a use case is separate, and controlled by `REPLAY_SCREENSHOTS`.
+  It used to capture nothing unless a step failed, which meant a *successful*
+  batch — the overwhelming majority — left no visual record at all.
+
+| `REPLAY_SCREENSHOTS` | Captures | Use it when |
+|---|---|---|
+| `off` | nothing | throughput matters more than evidence |
+| `failure` | only where a step failed | the old behaviour |
+| `final` *(default)* | one per row, showing the end state | you want to audit what happened |
+| `every_step` | everything | troubleshooting one broken use case |
+
+`final` is the default because it answers "what actually happened to record
+700" at one image per row. `every_step` multiplies that by the step count,
+which over a thousand rows is gigabytes — point `STORAGE_BACKEND` at S3 before
+choosing it for a large batch.
+
+**Headless makes no difference.** Screenshots work identically with no visible
+window; nothing in the capture path consults the setting. If images are
+missing, it is the mode above, not headless.
+
 ### What happens to the credentials afterwards
 
 They are held in the backend's memory for the life of the recording, and

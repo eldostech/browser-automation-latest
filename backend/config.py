@@ -140,6 +140,21 @@ class Settings(BaseSettings):
     #: Per-step wall clock ceiling inside a replay.
     replay_step_timeout: float = 30.0
 
+    #: How much of an executed use case to photograph.
+    #:
+    #:   off        nothing at all
+    #:   failure    only where a step failed
+    #:   final      one per row, showing the end state  (default)
+    #:   every_step everything -- for troubleshooting, not for a large batch
+    #:
+    #: Executing a use case used to capture only failures, so a *successful*
+    #: run left no visual record: nothing to audit, and nothing to look at when
+    #: a result was questioned afterwards. "final" answers "what actually
+    #: happened to record 700" at one image per row. "every_step" multiplies
+    #: that by the step count, which over a thousand rows is gigabytes -- put
+    #: STORAGE_BACKEND on S3 before choosing it for a large batch.
+    replay_screenshots: Literal["off", "failure", "final", "every_step"] = "final"
+
     #: Self-healing. OFF by default, and deliberately so: it is the best
     #: defence against a site redesign and also the easiest way to turn a free
     #: batch back into an expensive one. Only steps whose `on_failure` is
