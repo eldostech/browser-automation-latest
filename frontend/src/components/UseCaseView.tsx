@@ -3,6 +3,7 @@ import { api, batchResultsUrl } from '../lib/api';
 import type { BatchDetail, CredentialSummary, UseCase } from '../lib/events';
 import { formatDuration } from '../lib/format';
 import { CredentialsPanel } from './CredentialsPanel';
+import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
 
 interface Props {
@@ -23,6 +24,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [useCase, setUseCase] = useState<UseCase | null>(null);
   const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
   const [vaultAvailable, setVaultAvailable] = useState(true);
+  // Resource-level permission, distinct from `allow_scripts` in the definition.
+  // Both must be true before a script step runs; only an admin can set this one.
+  const [scriptsEnabled, setScriptsEnabled] = useState(false);
   const [mode, setMode] = useState<Mode>('review');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -51,6 +55,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         api.listCredentials(),
       ]);
       setUseCase(detail.definition);
+      setScriptsEnabled(Boolean(detail.meta?.scripts_enabled));
       setCredentials(creds.credentials);
       setVaultAvailable(creds.vault_available);
       setError(null);
@@ -117,11 +122,24 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     });
 
+  /** The author half: this definition is allowed to contain scripts. */
   const allowScripts = () =>
     act(async () => {
       if (!useCase) return;
       await api.updateUseCase(usecaseId, { ...useCase, allow_scripts: true });
-      setNotice('Raw-JavaScript steps enabled for this use case.');
+      setNotice('Raw-JavaScript steps marked as reviewed in this definition.');
+      await load();
+    });
+
+  /** The administrator half: this use case may actually execute them. */
+  const enableScripts = (enabled: boolean) =>
+    act(async () => {
+      await api.setScriptsEnabled(usecaseId, enabled, 'Reviewed in the use case editor.');
+      setNotice(
+        enabled
+          ? 'Script execution enabled. This use case can now run its JavaScript steps.'
+          : 'Script execution disabled for this use case.',
+      );
       await load();
     });
 
@@ -246,9 +264,15 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   }
 
   const isReady = useCase.status === 'ready';
-  const blockedScripts = useCase.allow_scripts
-    ? []
-    : [...useCase.setup_steps, ...useCase.row_steps].filter((s) => s.action === 'script');
+  const scriptSteps = [...useCase.setup_steps, ...useCase.row_steps].filter(
+    (s) => s.action === 'script',
+  );
+  const blockedScripts = useCase.allow_scripts ? [] : scriptSteps;
+  // Two separate permissions, and running needs both. `allow_scripts` lives in
+  // the definition an author edits; `scripts_enabled` lives on the resource and
+  // only an administrator can set it -- otherwise an author could grant
+  // themselves code execution by editing JSON.
+  const scriptsNeedAdmin = scriptSteps.length > 0 && !scriptsEnabled;
 
   return (
     <div>
@@ -356,6 +380,41 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           </p>
           <button type="button" onClick={allowScripts} disabled={busy}>
             I have read the code — enable scripts
+          </button>
+        </div>
+      )}
+
+      {blockedScripts.length === 0 && scriptsNeedAdmin && (
+        <div className="banner error">
+          <strong>Script execution is not enabled for this use case</strong>
+          <p style={{ margin: '6px 0' }}>
+            You have marked the {scriptSteps.length} JavaScript step(s) as reviewed, which
+            is the author's half. Executing them is a separate permission held by an
+            administrator, so that editing a definition cannot grant code execution to
+            whoever edited it.
+          </p>
+          {session.can('script:enable') ? (
+            <button type="button" onClick={() => enableScripts(true)} disabled={busy}>
+              I have read the code — allow this use case to run it
+            </button>
+          ) : (
+            <p style={{ margin: 0 }}>
+              Ask an administrator to enable it, or remove the script steps.
+            </p>
+          )}
+        </div>
+      )}
+
+      {scriptSteps.length > 0 && scriptsEnabled && session.can('script:enable') && (
+        <div className="banner">
+          Script execution is enabled for this use case.{' '}
+          <button
+            type="button"
+            className="linkish"
+            onClick={() => enableScripts(false)}
+            disabled={busy}
+          >
+            Withdraw it
           </button>
         </div>
       )}

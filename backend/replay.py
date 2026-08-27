@@ -54,6 +54,7 @@ from policy import check_navigation
 from redaction import Redactor
 from snapshot import Snapshot, parse as parse_snapshot
 from usecase import (
+    render_code,
     OPTIONAL_LOCATOR_ACTIONS,
     Assertion,
     Locator,
@@ -437,7 +438,7 @@ class UseCaseExecutor:
         if step.action == "extract":
             return await self._do_extract(step, outputs)
         if step.action == "script":
-            return await self._do_script(step)
+            return await self._do_script(step, values)
         return await self._do_element_action(step, values)
 
     # -- actions ------------------------------------------------------------
@@ -614,13 +615,32 @@ class UseCaseExecutor:
             step.id, True, 0, f"extracted {value!r}", matched_locator=described, locator_rung=rung
         )
 
-    async def _do_script(self, step: Step) -> StepOutcome:
+    async def _do_script(self, step: Step, inputs: dict[str, Any] | None = None) -> StepOutcome:
         tool = self.mcp.find_tool(
             "browser_run_code_unsafe", "browser_evaluate", contains=("run_code", "evaluate")
         )
         if tool is None:
             return StepOutcome(step.id, False, 0, "the MCP server exposes no script tool")
-        return await self._call(tool, {"code": step.code or ""}, step)
+
+        # Script code used to be sent verbatim, so a recording that drove a
+        # form through JavaScript could not read inputs at all -- it typed the
+        # literal "{{input.full_name}}" into the page. render_code substitutes
+        # them, and does so by emitting JSON literals rather than splicing raw
+        # values into source: a spreadsheet cell is untrusted input, and
+        # splicing it into JavaScript is code injection.
+        code = self._render_code(step, inputs or {})
+        return await self._call(tool, {"code": code}, step)
+
+    def _render_code(self, step: Step, inputs: dict[str, Any]) -> str:
+        try:
+            return render_code(step.code or "", inputs=inputs, secrets=self.secrets)
+        except MissingValue as exc:
+            raise StepFailed(
+                step.id,
+                f"{exc.args[0]} was referenced by a script step but not supplied. "
+                "Refusing to run it: a script with a missing value would either "
+                "throw or silently submit nothing.",
+            ) from exc
 
     # -- locator ladder -----------------------------------------------------
     async def _resolve(

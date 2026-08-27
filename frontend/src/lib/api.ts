@@ -201,10 +201,26 @@ export const api = {
   getUseCase: (id: string, version?: number) => {
     const params = new URLSearchParams();
     if (version) params.set('version', String(version));
-    return request<{ definition: UseCase; versions: { version: number; created_at: string }[] }>(
-      `/api/usecases/${id}?${params}`,
-    );
+    return request<{
+      definition: UseCase;
+      versions: { version: number; created_at: string }[];
+      /** Resource-level state, separate from the definition a reviewer edits. */
+      meta: { scripts_enabled: boolean; scripts_enabled_by: string | null } | null;
+    }>(`/api/usecases/${id}?${params}`);
   },
+
+  /**
+   * Permit script steps on one use case. Administrators only.
+   *
+   * Separate from `allow_scripts` in the definition on purpose: that field is
+   * part of a document an author can edit, so on its own it would let an author
+   * grant themselves code execution. Both must agree before a script runs.
+   */
+  setScriptsEnabled: (id: string, enabled: boolean, reason = '') =>
+    request<{ usecase_id: string; scripts_enabled: boolean; by: string }>(
+      `/api/usecases/${id}/scripts`,
+      { method: 'POST', body: JSON.stringify({ enabled, reason }) },
+    ),
 
   /** Saves reviewer edits as a NEW version; existing versions are immutable. */
   updateUseCase: (id: string, definition: UseCase) =>

