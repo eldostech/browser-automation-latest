@@ -173,6 +173,18 @@ export function isAgentEvent(message: unknown): message is AgentEvent {
     EVENT_TYPES.includes(type as AgentEventType);
 }
 
+/** One entry in the audit trail. */
+export interface AuditEntry {
+  id: number;
+  actor_id: string | null;
+  actor_email: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  detail: Record<string, unknown>;
+  created_at: string;
+}
+
 export interface RunSummary {
   id: string;
   task: string;
@@ -187,6 +199,9 @@ export interface RunSummary {
   summary: string | null;
   result: { answer?: string; data?: unknown } | null;
   error: string | null;
+  /** Who started it. Denormalized, so it outlives the account. */
+  owner_id: string | null;
+  owner_email: string;
 }
 
 export interface RunDetail extends RunSummary {
@@ -347,6 +362,9 @@ export interface ExecutionRecord {
   llm_tokens: number;
   duration_ms: number | null;
   created_at: string;
+  /** Who ran this row. Denormalized, so it survives the account's deletion. */
+  owner_id: string | null;
+  owner_email: string;
 }
 
 export interface BatchSummary {

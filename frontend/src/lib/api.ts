@@ -9,6 +9,7 @@
 
 import type {
   AgentEvent,
+  AuditEntry,
   BatchDetail,
   BatchSummary,
   CredentialSummary,
@@ -191,6 +192,20 @@ export const api = {
   /** Which credential slots this run still holds values for. Names only. */
   heldCredentialSlots: (runId: string) =>
     request<{ run_id: string; slots: string[] }>(`/api/runs/${runId}/credential-slots`),
+
+  /** Who did what to one use case. Readable by anyone who can see it. */
+  useCaseActivity: (id: string, limit = 100) =>
+    request<{ usecase_id: string; entries: AuditEntry[] }>(
+      `/api/usecases/${id}/activity?limit=${limit}`,
+    ),
+
+  /** The workspace-wide audit log. Administrators only. */
+  auditLog: (params: { resource_type?: string; limit?: number } = {}) => {
+    const query = new URLSearchParams();
+    if (params.resource_type) query.set('resource_type', params.resource_type);
+    query.set('limit', String(params.limit ?? 200));
+    return request<{ entries: AuditEntry[] }>(`/api/admin/audit?${query}`);
+  },
 
   listUseCases: (status?: string) => {
     const params = new URLSearchParams();

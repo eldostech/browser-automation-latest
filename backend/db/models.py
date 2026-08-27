@@ -171,6 +171,17 @@ class Run(Base):
     owner_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("users.id", ondelete="SET NULL")
     )
+    #: Denormalized, like ``audit_log.actor_email`` and for the same reason: a
+    #: record of who did something has to stay readable after the account is
+    #: deleted, and ``owner_id`` is ON DELETE SET NULL. An id alone is also
+    #: unreadable in a UI without a join on every row.
+    #: ``server_default`` as well as ``default``: the column was added to
+    #: populated tables, so the database needs a value for the rows that
+    #: predate it. Blank means "nobody recorded who", which is the truth about
+    #: those rows rather than a placeholder pretending otherwise.
+    owner_email: Mapped[str] = mapped_column(
+        String(320), nullable=False, default="", server_default=""
+    )
     task: Mapped[str] = mapped_column(Text, nullable=False)
     start_url: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -331,6 +342,17 @@ class Batch(Base):
     owner_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("users.id", ondelete="SET NULL")
     )
+    #: Denormalized, like ``audit_log.actor_email`` and for the same reason: a
+    #: record of who did something has to stay readable after the account is
+    #: deleted, and ``owner_id`` is ON DELETE SET NULL. An id alone is also
+    #: unreadable in a UI without a join on every row.
+    #: ``server_default`` as well as ``default``: the column was added to
+    #: populated tables, so the database needs a value for the rows that
+    #: predate it. Blank means "nobody recorded who", which is the truth about
+    #: those rows rather than a placeholder pretending otherwise.
+    owner_email: Mapped[str] = mapped_column(
+        String(320), nullable=False, default="", server_default=""
+    )
     usecase_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("usecases.id", ondelete="CASCADE"), nullable=False
     )
@@ -355,6 +377,22 @@ class Execution(Base):
     id: Mapped[str] = id_column()
     workspace_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Who ran it. A single-row execution recorded nobody at all before this,
+    #: so "who ran that record and with what" had no answer.
+    owner_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    #: Denormalized, like ``audit_log.actor_email`` and for the same reason: a
+    #: record of who did something has to stay readable after the account is
+    #: deleted, and ``owner_id`` is ON DELETE SET NULL. An id alone is also
+    #: unreadable in a UI without a join on every row.
+    #: ``server_default`` as well as ``default``: the column was added to
+    #: populated tables, so the database needs a value for the rows that
+    #: predate it. Blank means "nobody recorded who", which is the truth about
+    #: those rows rather than a placeholder pretending otherwise.
+    owner_email: Mapped[str] = mapped_column(
+        String(320), nullable=False, default="", server_default=""
     )
     batch_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("batches.id", ondelete="CASCADE")

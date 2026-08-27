@@ -447,9 +447,21 @@ def authenticate(test_client, email: str = TEST_ADMIN_EMAIL, password: str = TES
 
 
 async def make_user(app, email: str, role: str, password: str = TEST_ADMIN_PASSWORD) -> str:
-    """Create an account in the app's own workspace and return its email."""
-    workspace_id = await app.state.store.default_workspace_id()
-    await app.state.auth.create_user(
+    """Create an account in the app's workspace and return its email.
+
+    Opens its own connection rather than using ``app.state.auth``, for the same
+    loop-affinity reason as ``app_workspace`` above: the app's pool belongs to
+    TestClient's portal loop, and awaiting it from a test raises "attached to a
+    different loop". The database is shared, so the account is visible to the
+    app immediately.
+    """
+    from auth.service import AuthService
+
+    store = Store(app.state.settings)
+    await store.connect()
+    _TEST_LOOP_STORES.append(store)
+    workspace_id = await store.default_workspace_id()
+    await AuthService(store.sessions, app.state.settings).create_user(
         workspace_id=workspace_id, email=email, password=password, role=role
     )
     return email

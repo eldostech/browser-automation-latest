@@ -73,6 +73,7 @@ class RunRecord:
     result: dict[str, Any] | None
     error: str | None
     owner_id: str | None = None
+    owner_email: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +91,7 @@ class RunRecord:
             "result": self.result,
             "error": self.error,
             "owner_id": self.owner_id,
+            "owner_email": self.owner_email,
         }
 
 
@@ -121,6 +123,7 @@ def _run_record(row: Run) -> RunRecord:
         result=row.result,
         error=row.error,
         owner_id=row.owner_id,
+        owner_email=row.owner_email,
     )
 
 
@@ -154,6 +157,10 @@ def _execution_dict(row: Execution) -> dict[str, Any]:
         "llm_tokens": row.llm_tokens,
         "duration_ms": row.duration_ms,
         "created_at": iso(row.created_at),
+        # Who ran this record, and with what. The inputs were always stored;
+        # the actor was not, so "who ran row 700" had no answer.
+        "owner_id": row.owner_id,
+        "owner_email": row.owner_email,
     }
 
 
@@ -171,6 +178,7 @@ def _batch_dict(row: Batch) -> dict[str, Any]:
         "created_at": iso(row.created_at),
         "finished_at": iso(row.finished_at),
         "owner_id": row.owner_id,
+        "owner_email": row.owner_email,
     }
 
 
@@ -367,12 +375,14 @@ class WorkspaceStore:
         options: dict[str, Any],
         *,
         owner_id: str | None = None,
+        owner_email: str = "",
     ) -> RunRecord:
         async with self._sessions() as session:
             run = Run(
                 id=run_id,
                 workspace_id=self._ws,
                 owner_id=owner_id,
+                owner_email=owner_email,
                 task=task,
                 start_url=start_url,
                 status="pending",
@@ -868,12 +878,16 @@ class WorkspaceStore:
         batch_id: str | None = None,
         row_index: int | None = None,
         inputs: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        owner_email: str = "",
     ) -> None:
         async with self._sessions() as session:
             session.add(
                 Execution(
                     id=execution_id,
                     workspace_id=self._ws,
+                    owner_id=owner_id,
+                    owner_email=owner_email,
                     batch_id=batch_id,
                     usecase_id=usecase_id,
                     version=version,
@@ -946,6 +960,7 @@ class WorkspaceStore:
         total: int,
         credential_id: str | None = None,
         owner_id: str | None = None,
+        owner_email: str = "",
     ) -> None:
         async with self._sessions() as session:
             session.add(
@@ -953,6 +968,7 @@ class WorkspaceStore:
                     id=batch_id,
                     workspace_id=self._ws,
                     owner_id=owner_id,
+                    owner_email=owner_email,
                     usecase_id=usecase_id,
                     version=version,
                     status="pending",

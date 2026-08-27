@@ -241,6 +241,31 @@ async def get_usecase(
     }
 
 
+@router.get("/usecases/{usecase_id}/activity")
+async def usecase_activity(
+    usecase_id: str,
+    data: WorkspaceData,
+    _: Annotated[Principal, Depends(require(Permission.USECASE_READ))],
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    """Who did what to this use case, and when.
+
+    Deliberately *not* behind ``audit:read``. That permission guards the
+    workspace-wide log, which carries account changes and credential activity
+    and is properly an administrator's view. Knowing who published a use case
+    and who last ran it is ordinary operational context for anyone allowed to
+    see the use case at all -- withholding it would make the audit trail
+    something only an admin can benefit from, which defeats the point.
+    """
+    await usecase_or_404(usecase_id, data)
+    return {
+        "usecase_id": usecase_id,
+        "entries": await data.list_audit(
+            resource_type="usecase", resource_id=usecase_id, limit=limit
+        ),
+    }
+
+
 @router.put("/usecases/{usecase_id}", status_code=201)
 async def update_usecase(
     usecase_id: str,

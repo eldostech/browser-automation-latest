@@ -1070,3 +1070,19 @@ button.link.danger {
     grid-column: 1 / -1;
   }
 }
+
+/* --- activity log ---------------------------------------------------------
+   Who did what. Actions that change what the system is permitted to do get a
+   tint, so a permission grant does not read like an ordinary run. */
+
+.runs.activity td {
+  vertical-align: top;
+}
+
+.runs.activity tr.sensitive-row td:nth-child(3) {
+  color: var(--sensitive);
+}
+
+.runs.activity tr.sensitive-row {
+  background: color-mix(in srgb, var(--sensitive) 6%, transparent);
+}

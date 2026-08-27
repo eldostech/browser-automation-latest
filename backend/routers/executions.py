@@ -63,7 +63,7 @@ async def execute_usecase(
     require_missing_nothing(use_case, secrets, values)
 
     try:
-        return await replays.execute_once(
+        result = await replays.execute_once(
             ExecutionRequest(
                 usecase=use_case,
                 version=version,
@@ -73,10 +73,33 @@ async def execute_usecase(
                 browser=body.browser,
                 workspace_id=principal.workspace_id,
                 owner_id=principal.user_id,
+                owner_email=principal.email,
             )
         )
     except ExecutionBusy as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # Batches were audited from the start; a single row was not, so the most
+    # common way to run a use case left no trace of who did it. The inputs go
+    # in the entry because "what was it run with" is half the question -- and
+    # they are safe to record: a declared secret is a credential slot, never
+    # an input.
+    await data.audit(
+        "usecase.execute",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="usecase",
+        resource_id=usecase_id,
+        detail={
+            "execution_id": result.get("execution_id"),
+            "run_id": result.get("run_id"),
+            "status": result.get("status"),
+            "version": version,
+            "inputs": values,
+            "credential_id": body.credential_id,
+        },
+    )
+    return result
 
 
 @router.get("/usecases/{usecase_id}/executions")
@@ -143,6 +166,7 @@ async def start_batch(
                 browser=body.browser,
                 workspace_id=principal.workspace_id,
                 owner_id=principal.user_id,
+                owner_email=principal.email,
             )
         )
     except ExecutionBusy as exc:
@@ -239,6 +263,7 @@ async def resume_batch(
                 browser=body.browser,
                 workspace_id=principal.workspace_id,
                 owner_id=principal.user_id,
+                owner_email=principal.email,
             )
         )
     except ExecutionBusy as exc:

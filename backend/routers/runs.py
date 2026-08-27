@@ -82,6 +82,7 @@ async def create_run(
             fields=fields,
             workspace_id=principal.workspace_id,
             owner_id=principal.user_id,
+            owner_email=principal.email,
         )
     )
 

@@ -221,6 +221,9 @@ class RunRequest:
     #: process-wide singleton serving every workspace at once.
     workspace_id: str = ""
     owner_id: str | None = None
+    #: Denormalized beside owner_id so the record of who ran this survives the
+    #: account being deleted. See db/models.py.
+    owner_email: str = ""
 
 
 class RunManager:
@@ -328,7 +331,12 @@ class RunManager:
             "declared": request.fields.persistable(),
         }
         await self._data(request).create_run(
-            run_id, request.task, request.start_url, persisted, owner_id=request.owner_id
+            run_id,
+            request.task,
+            request.start_url,
+            persisted,
+            owner_id=request.owner_id,
+            owner_email=request.owner_email,
         )
 
         task = asyncio.create_task(self._execute(spec, request), name=f"run-{run_id}")
@@ -540,6 +548,9 @@ class ExecutionRequest:
     #: The tenant this execution belongs to, and who asked for it.
     workspace_id: str = ""
     owner_id: str | None = None
+    #: Denormalized beside owner_id so the record of who ran this survives the
+    #: account being deleted. See db/models.py.
+    owner_email: str = ""
 
 
 class ReplayManager:
@@ -656,6 +667,7 @@ class ReplayManager:
             total=len(indices),
             credential_id=request.credential_id,
             owner_id=request.owner_id,
+            owner_email=request.owner_email,
         )
 
         async def drive() -> None:
@@ -702,6 +714,7 @@ class ReplayManager:
                 None,
                 {"usecase_id": usecase.id, "version": request.version, "replay": True},
                 owner_id=request.owner_id,
+                owner_email=request.owner_email,
             )
             await data.create_execution(
                 execution_id,
@@ -709,6 +722,8 @@ class ReplayManager:
                 request.version,
                 run_id=run_id,
                 inputs=request.inputs,
+                owner_id=request.owner_id,
+                owner_email=request.owner_email,
             )
             redactor = Redactor(request.secrets.values())
             async with RunLifecycle(
@@ -831,6 +846,9 @@ class BatchRequest:
     #: The tenant this batch belongs to, and who started it.
     workspace_id: str = ""
     owner_id: str | None = None
+    #: Denormalized beside owner_id so the record of who ran this survives the
+    #: account being deleted. See db/models.py.
+    owner_email: str = ""
 
 
 async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequest) -> None:
@@ -857,6 +875,7 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
         {"usecase_id": usecase.id, "version": request.version, "batch_id": batch_id,
          "replay": True, "rows": len(rows)},
         owner_id=request.owner_id,
+        owner_email=request.owner_email,
     )
     await store.update_batch(batch_id, status="running")
 
@@ -904,6 +923,8 @@ async def _drive_batch(
             batch_id=batch_id,
             row_index=row_index,
             inputs=rows[position],
+            owner_id=request.owner_id,
+            owner_email=request.owner_email,
         )
 
     progress = BatchProgress(total=len(rows), pending=len(rows))

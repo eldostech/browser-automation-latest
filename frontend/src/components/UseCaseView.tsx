@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
 import type { BatchDetail, CredentialSummary, UseCase } from '../lib/events';
 import { formatDuration } from '../lib/format';
+import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
 import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
@@ -12,7 +13,7 @@ interface Props {
   onOpenRun: (runId: string) => void;
 }
 
-type Mode = 'review' | 'single' | 'batch';
+type Mode = 'review' | 'single' | 'batch' | 'activity';
 
 /**
  * Review a recorded use case, publish it, and run it.
@@ -450,7 +451,27 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         >
           Run a file
         </button>
+        <button
+          type="button"
+          className={mode === 'activity' ? 'active' : ''}
+          onClick={() => setMode('activity')}
+          title="Who published, ran, repaired or changed this use case"
+        >
+          Activity
+        </button>
       </div>
+
+      {mode === 'activity' && (
+        <div className="card">
+          <h3>Activity</h3>
+          <p className="hint">
+            Every publish, run, repair and permission change on this use case, with who
+            did it. Entries are kept after an account is deleted — the person's address
+            is stored on the entry rather than looked up.
+          </p>
+          <ActivityLog usecaseId={usecaseId} />
+        </div>
+      )}
 
       {mode === 'review' && (
         <>
@@ -733,7 +754,9 @@ function BatchProgressPanel({
             <tr>
               <th>Row</th>
               <th>Status</th>
+              <th>Inputs</th>
               <th>Outputs</th>
+              <th>Run by</th>
               <th>Failed at</th>
               <th>Time</th>
             </tr>
@@ -755,8 +778,18 @@ function BatchProgressPanel({
                     {execution.status}
                   </span>
                 </td>
+                <td style={{ fontFamily: 'var(--mono)', fontSize: 12, maxWidth: 260 }}>
+                  {/* What this row was actually given. Half of "what happened
+                      to record 700" is what it was run with. */}
+                  {Object.entries(execution.inputs ?? {})
+                    .map(([k, v]) => `${k}=${String(v)}`)
+                    .join(', ')}
+                </td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
                   {execution.outputs ? JSON.stringify(execution.outputs) : ''}
+                </td>
+                <td style={{ fontSize: 12 }}>
+                  {execution.owner_email || <span className="hint">—</span>}
                 </td>
                 <td style={{ fontSize: 12, color: 'var(--danger)' }}>
                   {execution.failed_step_id && (

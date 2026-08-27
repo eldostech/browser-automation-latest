@@ -82,6 +82,7 @@ export function RunHistory({ onOpen }: Props) {
             <tr>
               <th>Status</th>
               <th>Task</th>
+              <th>Started by</th>
               <th>Started</th>
               <th>Steps</th>
               <th>Duration</th>
@@ -102,6 +103,11 @@ export function RunHistory({ onOpen }: Props) {
                       {truncate(run.error, 160)}
                     </div>
                   )}
+                </td>
+                <td style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                  {/* Blank for runs recorded before the actor was stored --
+                      honest about it rather than guessing. */}
+                  {run.owner_email || <span className="hint">—</span>}
                 </td>
                 <td style={{ color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
                   {formatRelative(run.started_at ?? run.created_at)}

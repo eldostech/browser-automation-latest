@@ -68,6 +68,35 @@ def include_object(obj, name, type_, reflected, compare_to):  # noqa: ANN001 - a
     return True
 
 
+def strip_schema(context, revision, directives):  # noqa: ANN001 - alembic hook
+    """Remove the schema from generated operations.
+
+    Autogenerate writes ``schema='browser'`` into every op, which pins each
+    migration to whatever schema it was generated against -- so DB_SCHEMA stops
+    meaning anything, and a test that migrates a scratch schema gets "relation
+    already exists" from the real one. env.py sets ``search_path`` before
+    running, so unqualified DDL lands wherever that points.
+
+    This walks the directives rather than fixing each file by hand, because
+    doing it by hand is a step someone will forget.
+    """
+
+    def clear(ops):
+        for op in getattr(ops, "ops", []):
+            if hasattr(op, "schema"):
+                op.schema = None
+            for attribute in ("source_schema", "referent_schema"):
+                if hasattr(op, attribute):
+                    setattr(op, attribute, None)
+            table = getattr(op, "table", None) or getattr(op, "column", None)
+            if table is not None and hasattr(table, "schema"):
+                table.schema = None
+            clear(op)
+
+    for directive in directives:
+        clear(directive)
+
+
 def run_migrations_offline() -> None:
     context.configure(
         url=URL,
@@ -101,6 +130,7 @@ def run_migrations_online() -> None:
             version_table_schema=SCHEMA,
             compare_type=True,
             compare_server_default=True,
+            process_revision_directives=strip_schema,
         )
         with context.begin_transaction():
             context.run_migrations()

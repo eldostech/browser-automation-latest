@@ -571,3 +571,63 @@ async def test_a_repair_that_changes_nothing_is_not_reported_as_repaired(client:
     detail = client.get(f"/api/usecases/{usecase_id}").json()
     assert detail["definition"]["version"] == 1
     assert len(detail["versions"]) == 1
+
+
+# --- auditability -----------------------------------------------------------
+
+
+async def test_an_execution_records_who_ran_it_and_with_what(client: TestClient):
+    """"Who ran record 700, and with what" had no answer before this.
+
+    Executions stored their inputs from the start but recorded no actor at
+    all, and batches recorded an owner id with no way to render it. Both are
+    on the row now, the email denormalized so it survives the account being
+    deleted.
+    """
+    usecase_id = await seed(client, NO_LOGIN_USE_CASE)
+
+    client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"}},
+    )
+
+    executions = client.get(f"/api/usecases/{usecase_id}/executions").json()["executions"]
+    assert executions, "the execution should have been recorded"
+    row = executions[0]
+    assert row["owner_email"] == "admin@test.invalid"
+    assert row["owner_id"]
+    assert row["inputs"] == {"record_url": "https://example.com/r"}
+
+
+async def test_a_single_execution_is_written_to_the_audit_trail(client: TestClient):
+    """Batches were audited; single rows -- the common case -- were not."""
+    usecase_id = await seed(client, NO_LOGIN_USE_CASE)
+
+    client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"}},
+    )
+
+    entries = client.get(f"/api/usecases/{usecase_id}/activity").json()["entries"]
+    executed = [e for e in entries if e["action"] == "usecase.execute"]
+    assert executed, [e["action"] for e in entries]
+    assert executed[0]["actor_email"] == "admin@test.invalid"
+    assert executed[0]["detail"]["inputs"] == {"record_url": "https://example.com/r"}
+
+
+async def test_activity_is_readable_without_the_admin_audit_permission(client: TestClient):
+    """Knowing who ran a use case is operational context, not an admin secret.
+
+    The workspace-wide log stays behind audit:read; this one does not, or the
+    trail would only ever benefit administrators.
+    """
+    from conftest import TEST_ADMIN_PASSWORD, login_as, make_user
+
+    usecase_id = await seed(client, NO_LOGIN_USE_CASE)
+    await make_user(client.app, "viewer@test.invalid", "viewer")
+    token = login_as(client, "viewer@test.invalid", TEST_ADMIN_PASSWORD)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert client.get(f"/api/usecases/{usecase_id}/activity", headers=headers).status_code == 200
+    # The workspace-wide log is still refused.
+    assert client.get("/api/admin/audit", headers=headers).status_code == 403
