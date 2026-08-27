@@ -68,6 +68,28 @@ def include_object(obj, name, type_, reflected, compare_to):  # noqa: ANN001 - a
     return True
 
 
+def include_name(name, type_, parent_names):  # noqa: ANN001 - alembic hook
+    """Decide what to *reflect*, before anything is compared.
+
+    ``include_object`` below filters at comparison time, which means every
+    table in the database is read first and then discarded. This database is
+    shared -- eleven schemas, two hundred tables belonging to other systems --
+    so that is slow, fills the output with warnings about types we do not use,
+    and leaves ``include_object`` as the only thing standing between
+    autogenerate and a ``DROP TABLE`` aimed at somebody else's warehouse.
+
+    That filter has had a gap before: it once allowed ``schema=None`` through
+    and proposed dropping another application's ``alembic_version``. Refusing
+    to reflect the other schemas at all is the defence that does not depend on
+    getting a comparison rule exactly right -- there is simply nothing there to
+    drop.
+    """
+    if type_ == "schema":
+        # None is the default schema, which search_path points at ours.
+        return name in (SCHEMA, None)
+    return True
+
+
 def strip_schema(context, revision, directives):  # noqa: ANN001 - alembic hook
     """Remove the schema from generated operations.
 
@@ -104,6 +126,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         include_schemas=True,
+        include_name=include_name,
         include_object=include_object,
         version_table_schema=SCHEMA,
         compare_type=True,
@@ -126,6 +149,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             include_schemas=True,
+            include_name=include_name,
             include_object=include_object,
             version_table_schema=SCHEMA,
             compare_type=True,
