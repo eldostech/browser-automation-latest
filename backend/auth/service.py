@@ -282,10 +282,20 @@ class AuthService:
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                # The unique constraint is the authority on this, not a
-                # prior SELECT -- two simultaneous signups would both pass a
-                # check-then-insert.
-                raise AuthError(f"An account already exists for {normalized}.") from exc
+                # Only a *unique* violation means the address is taken. Mapping
+                # every IntegrityError to that message once turned a NOT NULL
+                # violation on workspace_id into "an account already exists",
+                # which sent the reader looking for a duplicate that did not
+                # exist.
+                if _is_unique_violation(exc):
+                    # The constraint is the authority here, not a prior SELECT:
+                    # two simultaneous signups would both pass check-then-insert.
+                    raise AuthError(f"An account already exists for {normalized}.") from exc
+                log.exception("could not create a user", extra={"user_email": normalized})
+                raise AuthError(
+                    "The account could not be created; the details were not accepted "
+                    "by the database."
+                ) from exc
             return _user_dict(user)
 
     async def list_users(self, workspace_id: str) -> list[dict[str, Any]]:
@@ -405,6 +415,19 @@ class AuthService:
             raise AuthError(
                 "This is the only active administrator; promote another account first."
             )
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """Distinguish "that already exists" from any other constraint failure.
+
+    SQLSTATE 23505 is unique_violation. Read from the driver's exception rather
+    than by matching on the message text, which differs between drivers and
+    changes between Postgres versions.
+    """
+    sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
+        getattr(exc.orig, "__cause__", None), "sqlstate", None
+    )
+    return sqlstate == "23505"
 
 
 def _slugify(name: str) -> str:

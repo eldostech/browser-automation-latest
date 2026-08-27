@@ -5,6 +5,29 @@
 # service to run the browser in its own container instead.
 # ---------------------------------------------------------------------------
 services:
+  # The application's own database. A named schema inside it (DB_SCHEMA) means
+  # this can just as easily be an existing Postgres shared with other systems.
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Exposed so `make db-upgrade` and psql work from the host. Drop this
+      # line in any deployment where the database should not be reachable
+      # from outside the compose network.
+      - "5432:5432"
+    healthcheck:
+      # The backend's `depends_on` waits for this, so migrations never race
+      # a database that is still starting up.
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: .
@@ -13,8 +36,12 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8000"
-      DATABASE_PATH: /app/data/runs.db
       ARTIFACTS_DIR: /app/artifacts
+      # Inside the compose network the database is reachable by service name,
+      # which overrides whatever .env says for host-side tooling.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_SCHEMA: ${DB_SCHEMA:-browser}
       CORS_ORIGINS: http://localhost:5173,http://localhost:4173
       # AWS credentials for Bedrock. These pass through from your shell when
       # set and are simply absent otherwise, so the same file works for local
@@ -25,6 +52,14 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Migrations run before the server, in the same container that will serve
+    # traffic -- so a deploy cannot start an app whose schema is behind.
+    command: >-
+      sh -c "python -m alembic upgrade head &&
+             exec uvicorn main:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
     volumes:
@@ -63,3 +98,6 @@ services:
   #   ports:
   #     - "8931:8931"
   #   shm_size: "1gb"
+
+volumes:
+  postgres-data:

@@ -46,8 +46,27 @@ browsers: ## Download the Chromium build the MCP server drives
 	cd .tools && npm install --no-audit --no-fund $(MCP_PACKAGE)
 	cd .tools && npx playwright install chromium
 
+# --- database --------------------------------------------------------------
+
+.PHONY: db-upgrade
+db-upgrade: ## Apply migrations (creates the schema on first run)
+	cd backend && ../$(VENV_BIN)/python -m alembic upgrade head
+
+.PHONY: db-revision
+db-revision: ## Autogenerate a migration from model changes: make db-revision m="what changed"
+	@test -n "$(m)" || { echo 'usage: make db-revision m="what changed"'; exit 1; }
+	cd backend && ../$(VENV_BIN)/python -m alembic revision --autogenerate -m "$(m)"
+
+.PHONY: db-check
+db-check: ## Fail if the models and the migrations disagree
+	cd backend && ../$(VENV_BIN)/python -m alembic check
+
+.PHONY: db-history
+db-history: ## Show the migration history and where this database sits
+	cd backend && ../$(VENV_BIN)/python -m alembic history --indicate-current
+
 .PHONY: backend
-backend: ## Run the FastAPI backend (http://localhost:8000)
+backend: db-upgrade ## Run the FastAPI backend (http://localhost:8000)
 	cd backend && ../$(VENV_BIN)/uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 .PHONY: frontend
@@ -59,7 +78,7 @@ mcp-server: ## Run Playwright MCP standalone over HTTP (for MCP_TRANSPORT=http)
 	npx -y @playwright/mcp@latest --port 8931 --headless --isolated
 
 .PHONY: test
-test: ## Run the backend test suite
+test: ## Run the backend test suite (needs Postgres; uses its own schema)
 	cd backend && ../$(VENV_BIN)/python -m pytest -q
 
 .PHONY: test-e2e
@@ -76,9 +95,14 @@ lock: ## Freeze the currently installed Python deps into requirements.lock.txt
 	$(VENV_BIN)/pip freeze > backend/requirements.lock.txt
 
 .PHONY: clean
-clean: ## Remove runtime data (database + screenshots)
+clean: ## Remove local runtime files (screenshots, checkpoints). Leaves Postgres alone.
 	rm -rf data artifacts
 	mkdir -p data artifacts
+
+.PHONY: db-drop
+db-drop: ## DESTRUCTIVE: drop the application schema and everything in it
+	@read -p "Drop schema '$${DB_SCHEMA:-browser}' and all its data? [y/N] " ok; 	  [ "$$ok" = "y" ] || { echo "cancelled"; exit 1; }
+	cd backend && ../$(VENV_BIN)/python -c "import sys; sys.path.insert(0,'.'); 	  from config import get_settings; from db.engine import sync_database_url; 	  from sqlalchemy import create_engine, text; s=get_settings(); 	  e=create_engine(sync_database_url(s)); c=e.connect(); 	  c.execute(text('DROP SCHEMA IF EXISTS \"'+s.db_schema+'\" CASCADE')); c.commit(); 	  print('dropped', s.db_schema)"
 
 .PHONY: up
 up: ## Start everything with Docker Compose

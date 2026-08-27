@@ -20,6 +20,7 @@ import type {
   UseCase,
   UseCaseSummary,
 } from './events';
+import { session, type CurrentUser } from './session';
 
 /** Empty by default: Vite (dev) and nginx (prod) proxy /api to the backend. */
 export const API_BASE: string = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
@@ -44,9 +45,22 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    // Spread first, then set headers, so a caller passing its own headers
+    // cannot accidentally drop the Authorization one.
+    headers: {
+      'Content-Type': 'application/json',
+      ...session.headers(),
+      ...(init?.headers ?? {}),
+    },
   });
+
+  if (response.status === 401) {
+    // The token expired, was revoked, or the password changed. Clearing it
+    // here means every caller gets the sign-in screen without each one having
+    // to handle 401 itself.
+    session.clear();
+  }
 
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
@@ -65,7 +79,42 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  user: CurrentUser;
+}
+
 export const api = {
+  // -- authentication -------------------------------------------------------
+  login: async (email: string, password: string): Promise<CurrentUser> => {
+    const body = await request<LoginResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    session.start(body.access_token, body.user);
+    return body.user;
+  },
+
+  logout: async (): Promise<void> => {
+    try {
+      await request<{ logged_out: boolean }>('/api/auth/logout', { method: 'POST' });
+    } finally {
+      // Local sign-out happens even if the revoke call fails, so a network
+      // problem cannot leave someone stuck signed in.
+      session.clear();
+    }
+  },
+
+  me: () => request<CurrentUser>('/api/auth/me'),
+
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ changed: boolean; note: string }>('/api/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+
   getConfig: () => request<ServerConfig>('/api/config'),
 
   createRun: (payload: CreateRunPayload) =>
@@ -258,5 +307,10 @@ export function streamUrl(runId: string, afterSeq: number): string {
   const url = new URL(`${base}/api/runs/${runId}/stream`);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('after_seq', String(afterSeq));
+  // The token goes in the query string because a browser cannot set an
+  // Authorization header on a WebSocket handshake. It is a short-lived,
+  // revocable session token rather than a long-lived key, which is what makes
+  // that acceptable -- see session.ts.
+  url.searchParams.set('token', session.token ?? '');
   return url.toString();
 }

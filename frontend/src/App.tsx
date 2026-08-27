@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './lib/api';
+import { session, type CurrentUser } from './lib/session';
 import { RunHistory } from './components/RunHistory';
+import { SignIn } from './components/SignIn';
 import { RunView } from './components/RunView';
 import { TaskComposer } from './components/TaskComposer';
 import { UseCaseList } from './components/UseCaseList';
@@ -38,6 +40,7 @@ function hashFor(view: View): string {
 }
 
 export default function App() {
+  const [user, setUser] = useState<CurrentUser | null>(session.user);
   const [view, setView] = useState<View>(viewFromHash);
   const [health, setHealth] = useState<{ status?: string; mcp?: { ok?: boolean | null } } | null>(
     null,
@@ -55,14 +58,28 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
+  // One subscription, so an expired token discovered by *any* request drops
+  // the whole app back to the sign-in screen rather than leaving one panel
+  // showing an error while the rest keeps retrying.
+  useEffect(() => session.subscribe(setUser), []);
+
+  // A stored token may have expired while the tab was closed. Asking the
+  // server who we are is the only way to find out, and a 401 clears it.
   useEffect(() => {
+    if (session.isSignedIn) api.me().then(setUser).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
     api
       .health()
       .then((body) => setHealth(body as { status?: string }))
       .catch(() => setHealth({ status: 'unreachable' }));
-  }, []);
+  }, [user]);
 
   const mcpOk = health?.mcp?.ok;
+
+  if (!user) return <SignIn onSignedIn={setUser} />;
 
   return (
     <div className="app">
@@ -100,10 +117,23 @@ export default function App() {
               ? 'backend unreachable'
               : `backend ${health.status} - mcp ${mcpOk === true ? 'ok' : mcpOk === false ? 'down' : 'unknown'}`}
         </span>
+        <span className="who" title={`${user.email} (${user.role})`}>
+          {user.email} <span className="role-chip">{user.role}</span>
+        </span>
+        <button type="button" className="linkish" onClick={() => api.logout()}>
+          Sign out
+        </button>
       </header>
 
       <main className={view.name === 'run' || view.name === 'usecase' ? 'page' : 'page narrow'}>
-        {view.name === 'compose' && (
+        {view.name === 'compose' && !session.can('run:create') && (
+          <div className="banner">
+            Your role ({user.role}) can view runs but not start them. Ask an administrator
+            for the operator role if you need to record a task.
+          </div>
+        )}
+
+        {view.name === 'compose' && session.can('run:create') && (
           <>
             {health?.status === 'degraded' && (
               <div className="banner error">
