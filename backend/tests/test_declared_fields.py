@@ -226,3 +226,146 @@ def test_a_declared_template_survives_the_models_renaming():
     # Where nothing was declared, the model is still free to parameterise.
     assert _prefer_declared("Nitin Asati", "{{input.name}}") == "{{input.name}}"
     assert _prefer_declared(None, "{{input.name}}") == "{{input.name}}"
+
+
+# --- nothing here is specific to any one use case ---------------------------
+#
+# The fix was found by investigating one broken recording, which is exactly the
+# circumstance in which a general mechanism quietly acquires a special case.
+# These use field names, values and shapes with nothing in common with that
+# recording, including several chosen to break a naive implementation.
+
+
+ARBITRARY_FIELDS = [
+    # Ordinary.
+    ("customer_reference", "ACME-99271"),
+    # Value containing regex metacharacters: a substitution built on re.sub
+    # with an unescaped pattern would raise or mangle this.
+    ("search_query", "price (USD) [2024] *special* +tax?"),
+    # Value that looks like a template. A second substitution pass would try to
+    # resolve it and fail.
+    ("literal_template", "{{input.not_a_real_field}}"),
+    # Backslashes and quotes, which have to survive both JSON encoding and
+    # whatever the page does with them.
+    ("windows_path", r"C:\Users\o'brien\file.txt"),
+    # Non-ASCII, including a character JavaScript treats as a line terminator.
+    ("unicode_name", "Zoë Ödegård\u2028"),
+    # A name at the length limit of what a column header can be.
+    ("a_very_long_field_name_that_is_still_a_valid_identifier", "x" * 200),
+]
+
+
+@pytest.mark.parametrize("name,value", ARBITRARY_FIELDS, ids=[n for n, _ in ARBITRARY_FIELDS])
+def test_any_field_name_and_value_round_trips(name: str, value: str):
+    """Declare -> substitute -> render, for values chosen to be awkward."""
+    from fields import parameterise, substitution_map
+    from usecase import render_code
+
+    fields = FieldSet.from_payload([{"name": name, "value": value}])
+    stored = fields.persistable()
+    mapping = substitution_map(stored)
+
+    # The recorded argument, as the browser tool received it.
+    recorded = {"fields": [{"name": "Some label", "value": value}]}
+    parameterised = parameterise(recorded, mapping)
+    assert parameterised["fields"][0]["value"] == f"{{{{input.{name}}}}}"
+
+    # And back again at replay, with a *different* value than was recorded.
+    code = f"await page.fill('#x', '{{{{input.{name}}}}}');"
+    rendered = render_code(code, inputs={name: "REPLACED"}, secrets={})
+    assert '"REPLACED"' in rendered
+    assert "{{" not in rendered
+
+
+def test_a_value_containing_a_template_is_not_re_expanded():
+    """Substitution runs once. A value that looks like a template stays data."""
+    from usecase import render_code
+
+    rendered = render_code(
+        "f('{{input.a}}')", inputs={"a": "{{input.b}}", "b": "SHOULD NOT APPEAR"}, secrets={}
+    )
+    assert "SHOULD NOT APPEAR" not in rendered
+    assert "{{input.b}}" in rendered
+
+
+def test_arbitrary_numbers_of_fields_are_all_declared():
+    """Nothing assumes four fields, or any particular count."""
+    from distill import _merge_input_specs
+
+    for count in (0, 1, 7, 40):
+        declared = {"inputs": {f"field_{i}": f"value {i}" for i in range(count)}}
+        specs = _merge_input_specs([], declared)
+        assert {s.name for s in specs} == set(declared["inputs"])
+
+
+def test_secret_slots_are_equally_generic():
+    from fields import secret_placeholder
+    from runner import _revealer
+
+    slots = {"api_token": "tok-1", "db_password": "p@ss", "otp_seed": "ABCDEF"}
+    reveal = _revealer(slots)
+    template = {k: secret_placeholder(k) for k in slots}
+
+    assert reveal(template) == slots
+
+
+def test_a_referenced_input_is_declared_whatever_it_is_called():
+    """The auto-declaration walks what the steps reference, not a fixed list."""
+    from distill import InputSpec, _merge_input_specs
+    from usecase import Step
+
+    step = Step(
+        id="s1",
+        action="script",
+        code="page.fill('#a', '{{input.zzz_unusual_name}}'); page.fill('#b', '{{input.q}}');",
+    )
+    referenced = {name for kind, name in step.references() if kind == "input"}
+    assert referenced == {"zzz_unusual_name", "q"}
+
+    specs = _merge_input_specs([], None)
+    known = {s.name for s in specs}
+    for name in sorted(referenced - known):
+        specs.append(InputSpec(name=name, required=True))
+    assert {s.name for s in specs} == referenced
+
+
+def test_a_value_is_never_expanded_as_a_template_itself():
+    """A row of batch input must not be able to read a secret.
+
+    Substitution replaces a template with a value. If the *result* is then
+    scanned again, a value whose text happens to be `{{secret.password}}` gets
+    expanded -- and a spreadsheet cell becomes a way to render any credential
+    bound to the run into a visible field.
+
+    `re.sub` does not rescan what it inserted, so one pass is safe and two are
+    not. An earlier render_code ran a pass for quoted templates and another for
+    bare ones, and leaked exactly this way.
+    """
+    from usecase import render_code, render_template
+
+    secrets = {"password": "REAL-PASSWORD"}
+
+    # Script steps.
+    rendered = render_code(
+        "f('{{input.a}}')", inputs={"a": "{{secret.password}}"}, secrets=secrets
+    )
+    assert "REAL-PASSWORD" not in rendered
+    assert "{{secret.password}}" in rendered
+
+    # Ordinary form fields, which take a different path.
+    value = render_template(
+        "{{input.a}}", inputs={"a": "{{secret.password}}"}, secrets=secrets
+    )
+    assert value == "{{secret.password}}"
+
+
+def test_both_template_spellings_are_handled_in_one_pass():
+    """Quoted and bare forms, together, without a second scan."""
+    from usecase import render_code
+
+    rendered = render_code(
+        "page.fill('#a', '{{input.x}}'); const n = {{input.y}};",
+        inputs={"x": "one", "y": "two"},
+        secrets={},
+    )
+    assert rendered == 'page.fill(\'#a\', "one"); const n = "two";'
