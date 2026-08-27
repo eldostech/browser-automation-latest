@@ -35,6 +35,7 @@ from events import (
     RunStatus,
     dump_event,
 )
+from lifecycle import RunLifecycle, Terminal
 from llm import LLMAccessError, LLMClient, build_llm
 from logging_setup import bind_run_id
 from mcp_client import MCPBrowserSession, MCPConfig, MCPConnectionError
@@ -352,17 +353,8 @@ class RunManager:
     # -- execution ----------------------------------------------------------
     async def _execute(self, spec: AgentSpec, request: RunRequest) -> None:
         run_id = spec.run_id
-        bind_run_id(run_id)
-        started = time.monotonic()
-
         data = self._data(request)
-        redactor = Redactor(request.secrets)
-        sink = _TrackingSink(
-            RunEventSink(run_id, data, self.bus, redactor=redactor), self, run_id
-        )
-        gate = RunApprovalGate(run_id, self, data)
         outcome: AgentOutcome | None = None
-        cancelled = False
         agent: BrowserAgent | None = None
 
         mcp_config = MCPConfig.from_settings(
@@ -372,124 +364,86 @@ class RunManager:
         )
 
         try:
-            await data.mark_started(run_id)
-            log.info("run starting", extra={"task": spec.task, "start_url": spec.start_url})
+            async with RunLifecycle(
+                run_id,
+                data,
+                self.bus,
+                secrets=request.secrets,
+                sink_wrapper=lambda inner: _TrackingSink(inner, self, run_id),
+            ) as run:
+                gate = RunApprovalGate(run_id, self, data)
+                try:
+                    log.info(
+                        "run starting",
+                        extra={"task": spec.task, "start_url": spec.start_url},
+                    )
+                    async with MCPBrowserSession(mcp_config) as mcp:
+                        agent = BrowserAgent(
+                            spec, mcp, self.llm, run.sink, gate,
+                            checkpointer=self.checkpointer,
+                        )
+                        outcome = await agent.run()
 
-            async with MCPBrowserSession(mcp_config) as mcp:
-                agent = BrowserAgent(
-                    spec, mcp, self.llm, sink, gate, checkpointer=self.checkpointer
-                )
-                outcome = await agent.run()
-
+                except asyncio.CancelledError:
+                    log.info("run cancelled")
+                    raise
+                except (MCPConnectionError, LLMAccessError) as exc:
+                    outcome = AgentOutcome(
+                        status="failed",
+                        steps=agent.step if agent else 0,
+                        duration_ms=run.elapsed_ms,
+                        error=str(exc),
+                    )
+                    await run.sink.emit(
+                        ErrorEvent(
+                            run_id=run_id,
+                            seq=run.sink.reserve_seq(),
+                            kind=(
+                                "llm_unavailable"
+                                if isinstance(exc, LLMAccessError)
+                                else "mcp_unavailable"
+                            ),
+                            message=str(exc),
+                            recoverable=False,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - the run fails, the process does not
+                    log.exception("run crashed", extra={"run_id": run_id})
+                    outcome = AgentOutcome(
+                        status="failed",
+                        steps=agent.step if agent else 0,
+                        duration_ms=run.elapsed_ms,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    await run.sink.emit(
+                        ErrorEvent(
+                            run_id=run_id,
+                            seq=run.sink.reserve_seq(),
+                            kind="internal_error",
+                            message=str(exc),
+                            recoverable=False,
+                        )
+                    )
+                finally:
+                    if outcome is not None:
+                        run.finish(
+                            Terminal(
+                                status=outcome.status,
+                                steps=outcome.steps,
+                                duration_ms=outcome.duration_ms,
+                                summary=outcome.summary,
+                                result=outcome.result,
+                                error=outcome.error,
+                            )
+                        )
+                    # Whatever happened, this run is no longer waiting on
+                    # anyone. Kept here rather than in the lifecycle because
+                    # approvals are the manager's bookkeeping, not the run's.
+                    self._approvals.pop(run_id, None)
+                    self._pending_events.pop(run_id, None)
         except asyncio.CancelledError:
-            cancelled = True
-            log.info("run cancelled")
-        except (MCPConnectionError, LLMAccessError) as exc:
-            outcome = AgentOutcome(
-                status="failed",
-                steps=agent.step if agent else 0,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                error=str(exc),
-            )
-            await sink.emit(
-                ErrorEvent(
-                    run_id=run_id,
-                    seq=sink.reserve_seq(),
-                    kind=(
-                        "llm_unavailable"
-                        if isinstance(exc, LLMAccessError)
-                        else "mcp_unavailable"
-                    ),
-                    message=str(exc),
-                    recoverable=False,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - a crash must still close the run
-            log.exception("run crashed")
-            outcome = AgentOutcome(
-                status="failed",
-                steps=agent.step if agent else 0,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            await sink.emit(
-                ErrorEvent(
-                    run_id=run_id,
-                    seq=sink.reserve_seq(),
-                    kind="internal_error",
-                    message=str(exc),
-                    recoverable=False,
-                )
-            )
-        finally:
-            # Shielded: even a cancelled run must persist its terminal event,
-            # otherwise the dashboard's WebSocket would wait forever.
-            await asyncio.shield(
-                self._finalise(
-                    run_id=run_id,
-                    data=data,
-                    sink=sink,
-                    outcome=outcome,
-                    cancelled=cancelled,
-                    steps=agent.step if agent else 0,
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                )
-            )
-            bind_run_id(None)
-
-        if cancelled:
-            raise asyncio.CancelledError()
-
-    async def _finalise(
-        self,
-        *,
-        run_id: str,
-        data: WorkspaceStore,
-        sink: "_TrackingSink",
-        outcome: AgentOutcome | None,
-        cancelled: bool,
-        steps: int,
-        duration_ms: int,
-    ) -> None:
-        if cancelled or outcome is None:
-            status: RunStatus = "cancelled" if cancelled else "failed"
-            error = None if cancelled else "The run ended without producing an outcome."
-            summary = None
-            result = None
-        else:
-            status = outcome.status
-            error = outcome.error
-            summary = outcome.summary
-            result = outcome.result
-            steps = outcome.steps
-            duration_ms = outcome.duration_ms
-
-        event = RunFinished(
-            run_id=run_id,
-            seq=sink.reserve_seq(),
-            status=status,
-            steps=steps,
-            duration_ms=duration_ms,
-            summary=summary,
-            result=result,
-            error=error,
-        )
-        await sink.emit(event)
-        await data.finish_run(
-            run_id,
-            status,
-            steps=steps,
-            duration_ms=duration_ms,
-            summary=summary,
-            result=result,
-            error=error,
-        )
-        self._approvals.pop(run_id, None)
-        self._pending_events.pop(run_id, None)
-        log.info(
-            "run finished",
-            extra={"status": status, "steps": steps, "duration_ms": duration_ms},
-        )
+            # The lifecycle has already persisted a "cancelled" terminal event.
+            raise
 
 
 class _TrackingSink:
@@ -702,9 +656,12 @@ class ReplayManager:
                 run_id=run_id,
                 inputs=request.inputs,
             )
-            await data.mark_started(run_id)
-
-            result = await self._drive(request, run_id)
+            redactor = Redactor(request.secrets.values())
+            async with RunLifecycle(
+                run_id, data, self.bus, redactor=redactor
+            ) as run:
+                result = await self._drive(request, run_id, run.sink, redactor)
+                run.finish(replay_terminal(result))
 
             await data.finish_execution(
                 execution_id,
@@ -713,15 +670,6 @@ class ReplayManager:
                 failed_step_id=result.failed_step_id,
                 error=result.error,
                 duration_ms=result.duration_ms,
-            )
-            await data.finish_run(
-                run_id,
-                "succeeded" if result.ok else "failed",
-                steps=len(result.steps),
-                duration_ms=result.duration_ms,
-                summary=None if result.ok else result.error,
-                result={"outputs": result.outputs, "llm_tokens": 0},
-                error=result.error,
             )
             return {
                 "execution_id": execution_id,
@@ -732,10 +680,14 @@ class ReplayManager:
         finally:
             self._release()
 
-    async def _drive(self, request: ExecutionRequest, run_id: str) -> RowResult:
-        """Open one session, run setup, run one row, tear down."""
-        redactor = Redactor(request.secrets.values())
-        sink = RunEventSink(run_id, self.data(request.workspace_id), self.bus, redactor=redactor)
+    async def _drive(
+        self, request: ExecutionRequest, run_id: str, sink: Any, redactor: Redactor
+    ) -> RowResult:
+        """Open one session, run setup, run one row, tear down.
+
+        Closing the run is the lifecycle's job, not this method's -- so the
+        shielded terminal write lives in exactly one place for every run type.
+        """
         mcp_config = MCPConfig.from_settings(
             self.settings, headless=request.headless, browser=request.browser
         )
@@ -783,25 +735,24 @@ class ReplayManager:
         except MCPConnectionError as exc:
             await emit_replay_error(sink, run_id, "mcp_unavailable", str(exc))
             result = RowResult(ok=False, error=str(exc))
-        finally:
-            # Shielded like the agent's own finaliser: a cancelled replay must
-            # still close the run, or the dashboard's socket waits forever.
-            await asyncio.shield(
-                sink.emit(
-                    RunFinished(
-                        run_id=run_id,
-                        seq=sink.reserve_seq(),
-                        status="succeeded" if result.ok else "failed",
-                        steps=len(result.steps),
-                        duration_ms=result.duration_ms,
-                        summary="replay finished" if result.ok else None,
-                        # The number this whole feature exists to produce.
-                        result={"outputs": result.outputs, "llm_calls": 0, "llm_tokens": 0},
-                        error=result.error,
-                    )
-                )
-            )
         return result
+
+
+def replay_terminal(result: RowResult) -> Terminal:
+    """How a replayed row ended, in the shape the finaliser wants.
+
+    ``llm_calls`` and ``llm_tokens`` are reported as zero rather than omitted:
+    they are the number this whole feature exists to produce, and a dashboard
+    that shows a blank cannot tell "free" from "not measured".
+    """
+    return Terminal(
+        status="succeeded" if result.ok else "failed",
+        steps=len(result.steps),
+        duration_ms=result.duration_ms,
+        summary="replay finished" if result.ok else None,
+        result={"outputs": result.outputs, "llm_calls": 0, "llm_tokens": 0},
+        error=result.error,
+    )
 
 
 def _iso_now() -> str:
@@ -840,7 +791,6 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
 
     run_id = uuid.uuid4().hex
     redactor = Redactor(request.secrets.values())
-    sink = RunEventSink(run_id, store, manager.bus, redactor=redactor)
     mcp_config = MCPConfig.from_settings(
         manager.settings, headless=request.headless, browser=request.browser
     )
@@ -851,9 +801,30 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
         None,
         {"usecase_id": usecase.id, "version": request.version, "batch_id": batch_id,
          "replay": True, "rows": len(rows)},
+        owner_id=request.owner_id,
     )
-    await store.mark_started(run_id)
     await store.update_batch(batch_id, status="running")
+
+    async with RunLifecycle(run_id, store, manager.bus, redactor=redactor) as run:
+        await _drive_batch(manager, store, run, batch_id, run_id, request, rows, indices,
+                           mcp_config, redactor)
+
+
+async def _drive_batch(
+    manager: "ReplayManager",
+    store: WorkspaceStore,
+    run: RunLifecycle,
+    batch_id: str,
+    run_id: str,
+    request: BatchRequest,
+    rows: list[dict[str, Any]],
+    indices: list[int],
+    mcp_config: MCPConfig,
+    redactor: Redactor,
+) -> None:
+    """The batch itself, inside an open lifecycle."""
+    usecase = request.usecase
+    sink = run.sink
     await sink.emit(
         RunStarted(
             run_id=run_id,
@@ -935,51 +906,50 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
         progress.stopped_reason = f"{type(exc).__name__}: {exc}"
         await emit_replay_error(sink, run_id, "internal_error", progress.stopped_reason)
     finally:
-        await asyncio.shield(
-            _finalise_batch(manager.data(request.workspace_id), batch_id, run_id, sink, progress)
-        )
+        run.finish(batch_terminal(progress))
+        # Shielded for the same reason the lifecycle shields its own write: a
+        # cancelled batch must still leave a closed batch row behind.
+        await asyncio.shield(_close_batch_row(store, batch_id, progress))
 
 
-async def _finalise_batch(
-    store: WorkspaceStore,
-    batch_id: str,
-    run_id: str,
-    sink: RunEventSink,
-    progress: BatchProgress,
-) -> None:
-    status = "succeeded" if progress.failed == 0 and not progress.stopped_reason else "failed"
-    await store.update_batch(
-        batch_id,
-        status=status,
-        succeeded=progress.succeeded,
-        failed=progress.failed,
-        error=progress.stopped_reason,
-        finished=True,
-    )
-    await store.finish_run(
-        run_id,
-        "succeeded" if status == "succeeded" else "failed",
+def batch_terminal(progress: BatchProgress) -> Terminal:
+    """How a batch ended.
+
+    A batch succeeds only if every row did *and* nothing stopped it early --
+    the circuit breaker and a failed re-login both leave rows unattempted, and
+    reporting that as success would hide exactly the case a resume exists for.
+    """
+    ok = progress.failed == 0 and not progress.stopped_reason
+    return Terminal(
+        status="succeeded" if ok else "failed",
         steps=progress.attempted,
         duration_ms=0,
         summary=batch_summary(progress),
         result={**progress.to_dict(), "llm_calls": 0, "llm_tokens": 0},
         error=progress.stopped_reason,
     )
-    await sink.emit(
-        RunFinished(
-            run_id=run_id,
-            seq=sink.reserve_seq(),
-            status="succeeded" if status == "succeeded" else "failed",
-            steps=progress.attempted,
-            duration_ms=0,
-            summary=batch_summary(progress),
-            result={**progress.to_dict(), "llm_calls": 0, "llm_tokens": 0},
-            error=progress.stopped_reason,
-        )
+
+
+async def _close_batch_row(
+    store: WorkspaceStore, batch_id: str, progress: BatchProgress
+) -> None:
+    """The part of finishing a batch that is not finishing its run.
+
+    The run's terminal event and status are the lifecycle's job; this is the
+    batch-shaped record beside it.
+    """
+    terminal = batch_terminal(progress)
+    await store.update_batch(
+        batch_id,
+        status=terminal.status,
+        succeeded=progress.succeeded,
+        failed=progress.failed,
+        error=progress.stopped_reason,
+        finished=True,
     )
     log.info(
         "batch finished",
-        extra={"batch_id": batch_id, "status": status, **progress.to_dict()},
+        extra={"batch_id": batch_id, "status": terminal.status, **progress.to_dict()},
     )
 
 
