@@ -183,19 +183,15 @@ AgentEvent = Annotated[
 
 EVENT_ADAPTER: TypeAdapter[AgentEvent] = TypeAdapter(AgentEvent)
 
-EVENT_TYPES: tuple[str, ...] = (
-    "run_started",
-    "thinking",
-    "tool_call",
-    "tool_result",
-    "screenshot",
-    "step_started",
-    "step_finished",
-    "approval_required",
-    "approval_resolved",
-    "error",
-    "run_finished",
-)
+#: ``{discriminator: model}``, derived from the union above rather than typed
+#: out again. A third hand-maintained list of event types is a third place to
+#: forget one; this one cannot disagree with ``AgentEvent`` by construction.
+EVENT_MODELS: dict[str, type] = {
+    model.model_fields["type"].default: model
+    for model in AgentEvent.__origin__.__args__  # type: ignore[attr-defined]
+}
+
+EVENT_TYPES: tuple[str, ...] = tuple(EVENT_MODELS)
 
 
 def parse_event(data: dict[str, Any]) -> AgentEvent:

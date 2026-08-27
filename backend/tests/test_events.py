@@ -77,10 +77,14 @@ def test_unknown_type_is_rejected():
         parse_event({"type": "not_a_real_event", "run_id": "r", "seq": 1})
 
 
+def _typescript_mirror() -> str:
+    path = Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "events.ts"
+    return path.read_text(encoding="utf-8")
+
+
 def test_typescript_mirror_declares_the_same_event_types():
     """`frontend/src/lib/events.ts` is hand-maintained; this catches drift."""
-    ts_path = Path(__file__).resolve().parents[2] / "frontend" / "src" / "lib" / "events.ts"
-    source = ts_path.read_text(encoding="utf-8")
+    source = _typescript_mirror()
 
     declared = set(re.findall(r"type:\s*'([a-z_]+)'", source))
     missing = set(EVENT_TYPES) - declared
@@ -89,3 +93,59 @@ def test_typescript_mirror_declares_the_same_event_types():
     listed = re.search(r"EVENT_TYPES:\s*AgentEventType\[\]\s*=\s*\[(.*?)\]", source, re.DOTALL)
     assert listed, "EVENT_TYPES array not found in events.ts"
     assert set(re.findall(r"'([a-z_]+)'", listed.group(1))) == set(EVENT_TYPES)
+
+
+def test_typescript_mirror_declares_the_same_fields():
+    """Every field the backend emits must exist in the mirrored interface.
+
+    The test above compares type *names*, which is the weaker half of the
+    guarantee: adding a field to an existing event passed it unnoticed, and the
+    frontend then reads `undefined` at runtime with TypeScript perfectly happy,
+    because the interface it was checked against never mentioned the field.
+
+    The stronger check is per-event. It is one-directional on purpose -- the
+    mirror may carry extra fields (a few are computed client-side) but may not
+    be missing any the server sends.
+
+    Generating this file from the models instead would delete it outright,
+    which is the better answer; it needs a Node type-generator invoked from the
+    Python build, and that cross-ecosystem step has to work on every developer
+    machine and in CI. Until that is worth its weight, this holds the property
+    that actually matters.
+    """
+    from events import EVENT_MODELS
+
+    source = _typescript_mirror()
+
+    def fields_of(body: str) -> set[str]:
+        """Property names, with `?` optional markers and comments ignored."""
+        return set(re.findall(r"^\s*(\w+)\??\s*:", body, re.MULTILINE))
+
+    # `export interface X extends BaseEvent { ... }` -- the extends clause is
+    # optional, and the shared fields (run_id, seq, ts) live on the parent.
+    blocks = dict(
+        re.findall(
+            r"export interface (\w+)(?:\s+extends\s+\w+)?\s*\{(.*?)\n\}", source, re.DOTALL
+        )
+    )
+    inherited = fields_of(blocks.get("BaseEvent", ""))
+    assert inherited, "BaseEvent not found in events.ts; the mirror's shape changed"
+
+    problems: list[str] = []
+    for event_type, model in sorted(EVENT_MODELS.items()):
+        body = next(
+            (b for b in blocks.values() if re.search(rf"type:\s*'{event_type}'", b)),
+            None,
+        )
+        if body is None:
+            problems.append(f"{event_type}: no interface declares it")
+            continue
+
+        declared = fields_of(body) | inherited
+        for field in sorted(set(model.model_fields) - declared):
+            problems.append(f"{event_type}.{field} is emitted but not declared in events.ts")
+
+    assert not problems, (
+        "the TypeScript event mirror has drifted from the models:\n  "
+        + "\n  ".join(problems)
+    )
