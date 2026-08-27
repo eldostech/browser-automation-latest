@@ -29,6 +29,13 @@ langgraph>=1.2,<2.0
 langchain-core>=1.6,<2.0
 langchain-aws>=1.7,<2.0
 
+# Checkpoint backends: what lets an interrupted recording resume rather than
+# be marked failed. Both are needed -- Postgres where its driver can run, a
+# SQLite file where it cannot. Imported as `langgraph.checkpoint.*`, so a
+# scan for top-level imports does not reveal them.
+langgraph-checkpoint-postgres>=3.1,<4.0
+langgraph-checkpoint-sqlite>=3.1,<4.0
+
 # botocore, for resolving and reporting AWS credentials in /healthz.
 botocore>=1.34,<2.0
 
@@ -43,8 +50,35 @@ boto3>=1.34,<2.0
 # values, not a dataframe, and pandas would pull in numpy for nothing.
 openpyxl>=3.1,<4.0
 
-# Storage
-aiosqlite>=0.20,<1.0
+# --- Storage ---------------------------------------------------------------
+# Postgres via SQLAlchemy 2.0, with Alembic owning the schema.
+sqlalchemy[asyncio]>=2.0,<3.0
+alembic>=1.13,<2.0
+
+# TWO drivers, for two jobs, and the split is not a matter of taste.
+#
+# asyncpg runs the application. On Windows, psycopg's async mode requires a
+# SelectorEventLoop while asyncio subprocesses require a ProactorEventLoop --
+# and this process must do both, because it spawns `npx @playwright/mcp` over
+# stdio and queries the database in the same loop. asyncpg works under either.
+#
+# psycopg runs Alembic, which is synchronous and so never meets that
+# constraint. It is also what LangGraph's Postgres checkpointer uses.
+# Neither is imported by name anywhere: SQLAlchemy loads them from the driver
+# in the URL, which is exactly why they are easy to leave out of this file.
+asyncpg>=0.29,<1.0
+psycopg[binary,pool]>=3.2,<4.0
+
+# --- Security --------------------------------------------------------------
+# Fernet, which encrypts stored credentials. This was missing from this file
+# entirely: nothing imports `cryptography` at module scope, so the omission
+# only surfaced the first time somebody saved a credential.
+cryptography>=42.0,<51.0
+
+# Password hashing. bcrypt directly rather than passlib, which has been
+# unmaintained since 2020 and breaks against each new bcrypt release -- a poor
+# dependency to put underneath the login path for an API two functions wide.
+bcrypt>=4.1,<6.0
 
 # HTTP client (used by the health probe and the tests)
 httpx>=0.27,<1.0
