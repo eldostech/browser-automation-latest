@@ -320,11 +320,17 @@ def test_cancelling_an_in_flight_run_marks_it_cancelled(client):
     run_id = client.post("/api/runs", json={"task": "pay"}).json()["run_id"]
 
     deadline = time.time() + 10
+    paused = False
     while time.time() < deadline:
         if client.get(f"/api/runs/{run_id}").json().get("pending_approval"):
+            paused = True
             break
         time.sleep(0.05)
 
+    # Falling out of the loop without pausing used to leave the test cancelling
+    # a run that was already finishing, which is a different scenario wearing
+    # this test's name.
+    assert paused, "the run never paused for approval, so there was nothing to cancel"
     assert client.post(f"/api/runs/{run_id}/cancel").json()["cancelled"] is True
 
     body = wait_for_status(client, run_id)

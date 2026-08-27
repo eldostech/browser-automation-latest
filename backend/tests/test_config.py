@@ -199,9 +199,9 @@ def test_every_setting_appears_in_the_env_example():
 def test_the_env_example_mentions_nothing_that_is_not_a_setting():
     """The reverse drift: a line for a setting that has since been removed.
 
-    ``VITE_API_BASE`` is the one deliberate exception -- it is read by Vite at
-    build time, not by the backend, and it belongs in the same file because it
-    is the same thing an operator has to fill in.
+    Three deliberate exceptions, all read by Vite rather than the backend, and
+    all belonging in this file because they are the same thing an operator has
+    to fill in: ``VITE_API_BASE``, ``FRONTEND_PORT`` and ``BACKEND_ORIGIN``.
     """
     import re
     from pathlib import Path
@@ -213,8 +213,43 @@ def test_the_env_example_mentions_nothing_that_is_not_a_setting():
     ).read_text(encoding="utf-8")
     documented = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]*)=", example, re.MULTILINE))
 
-    known = {name.upper() for name in Settings.model_fields} | {"VITE_API_BASE"}
+    known = {name.upper() for name in Settings.model_fields} | {
+        # Read by Vite from this same file; see vite.config.ts.
+        "VITE_API_BASE",
+        "FRONTEND_PORT",
+        "BACKEND_ORIGIN",
+    }
     stale = sorted(documented - known)
     assert not stale, (
         f"these appear in .env.example but are not settings any more: {stale}"
+    )
+
+
+def test_vite_reads_the_same_env_file_the_backend_does():
+    """`VITE_API_BASE` lives in the repository's .env, so Vite must look there.
+
+    Vite's env directory defaults to its own root -- `frontend/` -- so the
+    variable documented in this project's `.env` was read by the backend,
+    ignored by Vite, and appeared not to work. `envDir` in vite.config.ts is
+    what makes the documented location the real one.
+
+    Asserted here rather than in the frontend because this is a statement about
+    two config files agreeing, and only one test suite runs in CI on every
+    push.
+    """
+    from pathlib import Path
+
+    config = (
+        Path(__file__).resolve().parents[2] / "frontend" / "vite.config.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "envDir" in config, (
+        "vite.config.ts must set envDir to the repository root, or VITE_API_BASE "
+        "in .env is silently ignored"
+    )
+    # The proxy target should follow the backend's own PORT rather than
+    # hard-coding a second copy of it.
+    assert "env.PORT" in config, (
+        "the dev proxy should derive its target from PORT in the same .env, so "
+        "moving the backend does not leave the proxy behind"
     )

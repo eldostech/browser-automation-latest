@@ -345,17 +345,31 @@ class RunManager:
         return run_id
 
     async def cancel_run(self, run_id: str) -> bool:
-        # Resolve any pending approval first so the loop is not blocked when
-        # the cancellation lands.
+        """Stop a run. Cancel the task *before* unblocking anything it waits on.
+
+        The order is the whole point, and it used to be the other way round:
+        pending approvals were resolved first, "so the loop is not blocked when
+        the cancellation lands". But resolving an approval as *rejected* is a
+        legitimate answer -- the agent takes it, declines that one tool call,
+        and carries on. On a fast machine it could reach its final turn and
+        finish before ``task.cancel()`` arrived, so cancelling a run awaiting
+        approval reported success and then recorded it as succeeded.
+
+        Cancelling first means the ``wait_for`` on the approval raises
+        CancelledError immediately, which is the outcome asked for. The
+        futures are still resolved afterwards, as a fallback for anything
+        waiting that the cancellation did not reach.
+        """
+        task = self._tasks.get(run_id)
+        cancelled = task is not None and not task.done()
+        if cancelled:
+            task.cancel()
+
         for pending in list(self._approvals.get(run_id, {}).values()):
             if not pending.future.done():
                 pending.future.set_result(("rejected", "run cancelled"))
 
-        task = self._tasks.get(run_id)
-        if task is None or task.done():
-            return False
-        task.cancel()
-        return True
+        return cancelled
 
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
