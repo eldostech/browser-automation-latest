@@ -89,14 +89,16 @@ async def test_filtering_and_counting_runs(store):
     assert [r.id for r in await store.list_runs(status="failed")] == ["r2"]
 
 
-async def test_interrupted_runs_are_reaped_on_restart(store):
+async def test_interrupted_runs_are_reaped_on_restart(store, root_store):
     """A backend crash must not leave a run 'running' forever."""
     await store.create_run("r1", "t", None, {})
     await store.mark_started("r1")
     await store.create_run("r2", "t", None, {})
     await store.finish_run("r2", "succeeded", steps=1, duration_ms=5)
 
-    reaped = await store.reap_orphaned_runs()
+    # Reaping is deliberately unscoped -- it runs at startup, before any
+    # request has established who is calling -- so it lives on the root store.
+    reaped = await root_store.reap_orphaned_runs()
 
     assert reaped == 1
     assert (await store.get_run("r1")).status == "failed"
@@ -109,30 +111,109 @@ async def test_interrupted_runs_are_reaped_on_restart(store):
     assert events[0].status == "failed"
 
 
-# --- schema versioning -----------------------------------------------------
+# --- schema ----------------------------------------------------------------
+#
+# The old ``user_version`` scheme is gone. It was a version stamp with no
+# migrations behind it, so "the database is at v3" told you only that a build
+# which knew about v3 had opened the file -- never that its shape was right.
+# Alembic owns this now, and the two tests below assert what that stamp only
+# implied.
 
 
-async def test_a_fresh_database_is_stamped_at_the_current_version(store):
-    """SCHEMA already builds the final shape, so nothing should need migrating."""
-    from store import SCHEMA_VERSION
+async def test_every_row_belongs_to_a_workspace(root_store):
+    """Nothing is reachable without passing through a tenant check.
 
-    assert await store.schema_version() == SCHEMA_VERSION
+    Asserted structurally rather than through behaviour, because the failure
+    this guards against is a table added later without tenancy -- an omission
+    that stays invisible until one customer sees another's data.
+
+    A table qualifies one of two ways: it carries ``workspace_id`` itself, or
+    every row of it hangs off a table that does. ``events`` and
+    ``usecase_versions`` are the second kind -- they are scoped through their
+    parent run or use case, which is also why they cascade on delete. That
+    indirection is fine; having *neither* is not.
+    """
+    from db.base import Base
+
+    #: Workspaces are the tenant, and a session is reached through its user.
+    roots = {"workspaces", "user_sessions", "alembic_version"}
+    scoped = {t.name for t in Base.metadata.sorted_tables if "workspace_id" in t.columns}
+
+    def reaches_a_workspace(table) -> bool:
+        return any(
+            key.column.table.name in scoped | roots for key in table.foreign_keys
+        )
+
+    orphans = [
+        table.name
+        for table in Base.metadata.sorted_tables
+        if table.name not in roots
+        and table.name not in scoped
+        and not reaches_a_workspace(table)
+    ]
+    assert not orphans, (
+        f"these tables have no workspace_id and no path to one, so their rows "
+        f"belong to nobody: {orphans}"
+    )
 
 
-async def test_migrate_is_idempotent(store):
-    from store import SCHEMA_VERSION
+async def test_the_migrations_reproduce_the_models(db_settings):
+    """Applying every migration to an empty schema yields exactly the models.
 
-    assert await store.migrate() == SCHEMA_VERSION
-    assert await store.migrate() == SCHEMA_VERSION
+    Two failures at once: a model changed without a migration, and a migration
+    that does not actually build what the models describe. Both are otherwise
+    discovered in production as a missing column.
 
+    Run against a scratch schema, migrated from nothing, because the test
+    schema is built by ``create_all`` and has no Alembic history to check.
+    """
+    import os
+    import subprocess
+    import sys
+    import uuid
+    from pathlib import Path
 
-async def test_an_unversioned_database_is_brought_forward(store):
-    """A database written before user_version existed must still migrate."""
-    from store import SCHEMA_VERSION
+    import asyncpg
 
-    await store.db.execute("PRAGMA user_version = 0")
-    await store.db.commit()
-    assert await store.schema_version() == 0
+    scratch = f"alembic_check_{uuid.uuid4().hex[:8]}"
+    backend = Path(__file__).resolve().parent.parent
+    env = {
+        **os.environ,
+        "DB_SCHEMA": scratch,
+        "DB_HOST": db_settings.db_host,
+        "DB_PORT": str(db_settings.db_port),
+        "DB_NAME": db_settings.db_name,
+        "DB_USER": db_settings.db_user,
+        "DB_PASSWORD": db_settings.db_password,
+    }
 
-    assert await store.migrate() == SCHEMA_VERSION
-    assert await store.schema_version() == SCHEMA_VERSION
+    def alembic(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            cwd=backend,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    try:
+        upgrade = alembic("upgrade", "head")
+        assert upgrade.returncode == 0, f"alembic upgrade failed:\n{upgrade.stderr}"
+
+        check = alembic("check")
+        assert check.returncode == 0, (
+            "alembic check failed -- the models and the migrations disagree:\n"
+            f"{check.stdout}\n{check.stderr}"
+        )
+    finally:
+        conn = await asyncpg.connect(
+            host=db_settings.db_host,
+            port=db_settings.db_port,
+            user=db_settings.db_user,
+            password=db_settings.db_password,
+            database=db_settings.db_name,
+        )
+        try:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{scratch}" CASCADE')
+        finally:
+            await conn.close()

@@ -1,203 +1,199 @@
-# TODO — Repeatable use cases (record once, replay without an LLM)
+# TODO — from single-operator tool to multi-user platform
 
-**Status: all six phases implemented.** 459 tests passing, 3 skipped. The
-frontend type-checks and builds. See the commit history for what each phase
-delivered, and [`docs/design/repeatable-usecases.md`](docs/design/repeatable-usecases.md)
-for why it is shaped this way.
+Derived from [`docs/review/architecture-review.md`](docs/review/architecture-review.md)
+(24 Aug 2026). That document carries the evidence and the reasoning; this file is
+the actionable list.
 
-Read the design first; this file is the task breakdown, not the rationale. Items still
-unticked are genuinely not done — see **What is not built** at the bottom.
+Phases are ordered by **dependency, not preference**. Two orderings matter and are
+easy to get wrong:
 
----
-
-## Phase 0 · Secret hygiene and foundations
-
-Ships first because it fixes a live leak and because everything downstream depends on the
-snapshot parser.
-
-- [ ] **Rotate the exposed `ANTHROPIC_API_KEY`.** It is in `.env` and has been printed to a
-      terminal in this repo. *(Only you can do this one.)*
-- [x] **Purge plaintext credentials from `data/runs.db`.** `backend/scripts/purge_secrets.py`:
-      `--scan` finds candidates, `--dry-run` reports, `--verify-only` greps the raw files.
-      Applied — 50 event rows and 9 run rows across 9 runs, verified clean on disk.
-      **The `.bak` beside the database still holds the plaintext; delete it when satisfied.**
-- [x] **Redaction pass** in `RunEventSink.emit`, in front of *both* the store and the
-      `EventBus` — redacting only on the way to storage would still broadcast the secret to
-      every connected browser. Uniform by construction (dump → rewrite every string →
-      re-validate), so new event types are covered the day they are added. `backend/redaction.py`.
-- [x] `secrets: list[str]` on `POST /api/runs`, write-only, so a pasted credential can be
-      registered today rather than waiting for the vault.
-- [x] Fix `tests/test_llm_bedrock.py::test_no_api_key_is_required_for_bedrock` — isolated with
-      `_env_file=None` *and* `monkeypatch.delenv`; the `.env` file was the real source, so
-      `delenv` alone would not have fixed it.
-- [x] **Snapshot parser** (`backend/snapshot.py`): `by_ref` for distillation, `locate` for replay.
-      - [x] Handles nesting, attrs on both sides of `ref`, `[level=N]`, `[cursor=pointer]`,
-            `- /url:` and `- text:` property lines, escaped quotes, missing names, a missing
-            fence, and truncated tool results.
-      - [x] 33 tests against real server output committed as `tests/fixtures/snapshot_signin.txt`.
-      - [x] Ambiguity rule: three-tier name matching (exact → case/whitespace-folded →
-            substring), first tier that hits wins; `nth` selects among equals; structural roles
-            (`generic`, `group`, `none`, `presentation`) never shadow an interactive match.
-- [x] **Schema migrations.** `SCHEMA_VERSION` + `MIGRATIONS` + the `user_version` pragma in
-      `store.py`; a fresh database is stamped without running anything.
-
-## Phase 1 · Distillation (the one LLM call)
-
-- [x] **Pre-filter** (`backend/distill.py`), no LLM:
-  - [x] Load a run's events; join `tool_call` → `tool_result` on `call_id`.
-  - [x] Drop observation-only tools (`browser_snapshot`, `browser_take_screenshot`,
-        `browser_console_messages`, `browser_network_requests`).
-  - [x] Drop calls whose result has `ok == false`.
-  - [x] Collapse consecutive retries against the same element; keep the last success, demote the
-        rest to fallback locator candidates.
-  - [x] Resolve `ref=X` targets to role+name via the nearest preceding snapshot. Flag
-        unresolvable refs as warnings rather than keeping them.
-  - [x] Mine literals (typed values, URLs, form values) as parameter candidates.
-  - [x] Test against run `0436a2a8` (34 calls, 13 failures) and assert the output is ~8 steps
-        with no `ref=` targets remaining.
-  - [x] **Propose the setup/row split**: every step before the first one that consumes a per-row
-        input becomes a `setup_steps` candidate; the rest become `row_steps`. Deterministic, and
-        confirmed by a human in phase 3.
-- [x] **`UseCase` pydantic models** (`backend/usecase.py`) matching §6 of the design —
-      `setup_steps`, `row_steps`, `row_reset`, `session_check`, `teardown_steps`.
-  - [x] Validator: reject `{{…}}` templating inside `locators`.
-  - [x] Validator: reject `script` steps when `allow_scripts` is false.
-  - [x] Validator: `{{input.*}}` may not appear in `setup_steps` — setup runs once per batch, so
-        a per-row input there is a modelling error and should fail loudly.
-  - [x] `schema_version` constant and a stated forward-compat rule.
-- [x] **Distiller prompt** in `backend/prompts/distill.md`, loaded via `prompt_loader` like the
-      others. Supply the `UseCase` schema as a tool definition so output is schema-validated.
-- [x] **One-shot LLM call** reusing `llm.py`'s tool-use path. Assert in tests that exactly one
-      call is made.
-- [x] **Storage**: `usecases` + `usecase_versions` tables and `Store` methods.
-- [x] `POST /api/runs/{run_id}/distill` → `{ usecase_id, version, warnings[] }`. Reject runs
-      whose status is not `succeeded`.
-
-## Phase 2 · The executor (zero LLM)
-
-- [x] **`backend/replay.py` — `UseCaseExecutor`.** Constructor takes `(usecase, mcp, sink,
-      secrets)` and **no LLM client**. Add a test asserting the module never imports `llm`.
-- [x] Split the surface into `run_setup()` (once per session) and `run_row(inputs)` (once per
-      row), so the single-row UI path and the phase-4 batch runner share one code path.
-- [x] **Locator ladder**: `role` (fresh snapshot → live ref) → `css` → `text` → `nth`. Record
-      which rung matched on every step.
-- [x] **Template rendering** for `url`, `value`, `assert.value`, `fill_form` field values only.
-      Missing required input → fail before the browser opens.
-- [x] **Action dispatch** for the §6.1 vocabulary. Each action maps to exactly one MCP tool;
-      resolve tool names through `mcp.find_tool` so a renamed server tool degrades gracefully.
-- [x] **Assertions**, evaluated locally: `url_contains`, `text_present`, `element_visible`,
-      `element_count`, each with `negate` and `timeout_ms`.
-- [x] **`extract`** writes into the execution's `outputs` payload.
-- [x] **Failure handling**: `on_failure` = `abort` | `continue` | `heal`; screenshot on failure;
-      record `failed_step_id`.
-- [x] **Policy gate**: `check_navigation` on every call, using the use case's `allowed_domains`.
-- [x] **New events** `step_started` / `step_finished` in `events.py`, mirrored in
-      `frontend/src/lib/events.ts` (`test_events.py` enforces the mirror).
-- [x] **Credentials vault**: `credentials` table, Fernet encryption, `CREDENTIALS_KEY` setting.
-      With no key configured, credential storage is **disabled** — never a plaintext fallback.
-- [x] `POST /api/usecases/{id}/execute` → `{ execution_id, run_id }`, streaming over the
-      existing WebSocket.
-- [x] **Assert zero cost**: a test that executes a use case end-to-end against the static
-      fixtures in `tests/fixtures/` with a fake LLM that raises if called.
-
-## Phase 3 · UI
-
-- [x] **"Save as use case"** button in `RunView`, enabled only for `status === 'succeeded'`.
-- [x] **`UseCaseView`**: the three phases shown separately, each step with its action,
-      description, value and the full locator ladder with brittle rungs (`text`, `nth`) flagged.
-      Delete a step (saved as a new version), publish draft → ready.
-  - [ ] Inline editing of a step's value, reordering, and toggling `optional` — currently only
-        delete and publish. Editing a value means re-uploading the definition via `PUT`.
-  - [ ] Promote a literal to an input or a secret from the UI. The distiller does this; a
-        reviewer who disagrees has to edit the JSON.
-- [x] Raw source shown in full for any `script` step, beside the `allow_scripts` opt-in.
-      Scripts refuse to execute until a person enables them.
-- [x] **`UseCaseList`** nav item beside "History": name, description, status, version, updated.
-  - [ ] Success rate and a drift warning per use case. The data is recorded
-        (`locator_rung` on every `step_finished`) but nothing aggregates it yet.
-- [x] **Run one** and **Run a file**: a form generated from the `inputs` schema, a credential
-      picker, a CSV textarea plus file picker.
-- [x] **Batch progress**: live per-row table, a link from a failing step into the existing
-      timeline, Resume when a batch stopped early, and the results CSV download.
-- [x] Report `llm_tokens` after a single run.
-  - [ ] Show it as a standing figure on the use case and batch views, not only in the
-        post-run notice.
-- [ ] **Credential management UI.** The picker lists what the vault holds and the API can
-      create and delete credentials, but there is no form yet — use `POST /api/credentials`.
-- [x] Extend `frontend/src/lib/api.ts` with the new endpoints.
-
-## Phase 4 · Batch execution
-
-One shared session for the whole file; rows run sequentially. See §8 of the design.
-
-- [x] `batches` + `executions` tables and `Store` methods.
-- [x] CSV/JSON row parsing, validated against the `inputs` schema **before the browser opens**.
-- [x] **Batch runner**: open one MCP session → `run_setup()` once → loop rows → teardown →
-      close. Concurrency 1, no worker pool.
-- [x] **Single-slot lock** in `RunManager`; a second batch request returns `409` naming the batch
-      in flight. `GET /api/executions/active` reports the holder.
-- [x] **Recovery contract** (§8.2), each piece tested on its own:
-  - [x] A failed row records `failed` + `failed_step_id` + screenshot and does **not** abort the batch.
-  - [x] `row_reset` runs before every row, failed or not.
-  - [x] `session_check` between rows; on failure re-run `setup_steps` **once**, then re-check.
-  - [x] Re-login failure stops the batch leaving remaining rows `pending`, never `failed`.
-  - [x] Circuit breaker: abort after N consecutive row failures (default 5, configurable).
-- [x] **Resume**: re-runs only rows that are not `succeeded`; opens a fresh session and re-runs
-      `setup_steps` first. Covers re-login failure, circuit breaker and process restart alike.
-- [x] Persist authenticated state via `MCP_STORAGE_STATE` so a resume can skip an interactive
-      login where the site allows it.
-- [x] Configurable inter-row delay (politeness / rate limiting).
-- [x] `POST /api/usecases/{id}/batch`, `GET /api/batches/{id}`, `POST /api/batches/{id}/resume`,
-      `POST /api/batches/{id}/cancel` (stops after the current row),
-      `GET /api/batches/{id}/results.csv`.
-- [x] **CSV export**: input columns + `status` + declared `outputs` + `failed_step_id` + `error`
-      + `duration_ms` + `llm_tokens`. Stable column order so files diff cleanly. No webhooks.
-- [x] **`BatchView`**: progress, live per-row table, failed-row drill-down into the existing
-      timeline, export button, and a visible marker when the session re-authenticated mid-batch.
-
-## Phase 5 · Healing
-
-Confirmed in scope, and deliberately last — the zero-token path should be proven and measurable
-before anything is allowed to spend tokens again.
-
-- [x] `on_failure: heal` escalates **one failed step** to the agent with the current snapshot.
-- [x] Off by default per use case; hard per-batch token budget that stops healing when exhausted.
-- [x] After any heal, run `row_reset` before continuing — a repair attempt must not leave the
-      shared session in a state the next row inherits.
-- [x] A successful heal writes a new `usecase_version` with the repaired locator; the batch
-      continues on the new version.
-- [x] Healing events clearly labelled in the timeline; `llm_tokens` recorded per execution and
-      surfaced in the CSV, so the cost of healing is never invisible.
+- ownership columns (**A2**) must land *before* the Postgres migration (**B2**), so
+  Alembic carries them forward rather than bolting them on afterwards;
+- the persistent checkpointer (**B1**) must land *before* interrupt-based approvals
+  (**C3**), or the rewrite is cosmetic rather than durable.
 
 ---
 
-## Decisions — settled 2026-08-23
+## Two things to hold on to
 
-1. **Session reuse** — *one session for the whole file.* Sign in once, not once per row. This
-   forced the `setup_steps` / `row_steps` split (design §6.0) and the recovery contract (§8.2).
-2. **Healing** — *build it,* phase 5.
-3. **Outputs** — *CSV export only.* No webhooks.
-4. **Scale** — *one use case execution at a time.* Concurrency 1, single-slot lock, no worker
-   pool. SQLite stays comfortably adequate.
+**Frameworks here buy capabilities, not brevity.** Adopting LangGraph + LangChain
+measured at **+338 lines and 23 packages** (commit `f0037a0`). Evaluate every
+"adopt X to reduce code" item against that number.
 
-Judgement calls I made rather than asking, all reversible and all flagged in the design:
-circuit breaker at 5 consecutive failures, exactly one automatic re-login attempt, unattempted
-rows left `pending` rather than `failed`, and the deterministic setup/row split rule in §6.0.
+**The zero-token guarantee is structural.** `replay.py` cannot import an LLM and
+tests assert it. Nothing below may weaken that — it is the product's core claim.
 
 ---
 
-## What is not built
+## P0 · Make multi-user *possible* — identity, safety, CI
 
-Everything above that is unticked, plus:
+Nothing else on this list is safe to ship until these land. Today ~30 endpoints and
+the WebSocket are unauthenticated, and no table has an owner column.
 
-- **No end-to-end test against a real browser.** The suite fakes the MCP session throughout.
-  `tests/test_e2e_static.py` (opt-in via `RUN_E2E=1`) covers the agent path only; there is no
-  equivalent for replay, so the first real batch is the first real proof.
-- **Distillation has never been run against a live model.** The pipeline is exercised with a
-  scripted plan; the prompt in `backend/prompts/distill.md` is untested against Claude, and it
-  is the part most likely to need tuning.
-- **`browser_evaluate` is mapped to `extract`, but `extract` reads the accessibility node**
-  rather than evaluating the recorded JavaScript. A recording that extracted a value by script
-  will need its step edited.
-- **Cancelling a batch stops the task, but the in-flight row's browser call is not awaited**
-  cleanly — the session is torn down by the context manager.
+- [ ] **A1 — Authentication and authorization** *(Blocker, L)*
+      OIDC/SSO at the edge; RBAC as a router-level dependency (policy enforcement
+      point), not per-endpoint `if` checks. Roles: viewer / operator (run, approve)
+      / author (create, publish, delete). **Authenticate the WebSocket too** — it is
+      currently as open as the REST surface.
+- [ ] **A2 — Resource ownership** *(Blocker, M schema / L enforcement)*
+      Add `workspace_id`/`owner_id` to `usecases`, `credentials`, `runs`, `batches`,
+      `executions`. Scope every query by it. Change credential uniqueness from
+      global `name` (`store.py:93`) to `(workspace_id, name)` — today two users
+      cannot both have an "IXL account".
+- [ ] **A3 — Identity on approvals and an audit log** *(High, S after A1)*
+      `approved_by_human` is a boolean; nothing records *who* approved, published or
+      purged. Stamp actor identity into those events and add an append-only audit
+      log — the events-table pattern already in use is the right shape.
+- [ ] **A5 — Role-gate `allow_scripts`** *(High, S to gate / M to sandbox)*
+      A `script` step is arbitrary JavaScript against a signed-in session. With
+      tenants, user A's script must never run under user B's credentials. Make
+      enabling scripts a privileged action, record who did it, and treat sharing a
+      script-bearing use case as a distinct reviewable act.
+- [ ] **E1 — CI** *(High, S)*
+      608 tests and nothing runs them. GitHub Actions: backend pytest, frontend
+      `tsc` + build, secret scan (automate the manual `git grep` habit), and enforce
+      the lockfile (`make lock` already exists).
+- [ ] **B1 — Make resume-after-restart real** *(High, S)*
+      The checkpointer is `InMemorySaver` (`graph.py:87`), so state dies with the
+      process and the LangGraph rationale is currently latent. Swap to
+      `AsyncSqliteSaver` now, `PostgresSaver` with B2, and change
+      `reap_orphaned_runs` to **resume** rather than fail-and-discard.
+      *Cheapest high-value item on this list.*
+
+## P1 · Make multi-user *work* — shared infrastructure
+
+Everything here exists because coordination is currently in-process: a second
+worker would not see the first one's events, jobs, or browser sessions.
+
+- [ ] **B2 + D2 — Postgres via SQLAlchemy 2.0 + Alembic** *(High, L)*
+      `store.py` (953 lines) is largely INSERT/UPDATE strings and `_row_to_*`
+      mapping, and `MIGRATIONS` is a version stamp containing **no actual
+      migrations**. Move to repository-per-aggregate + unit-of-work, with A2's
+      ownership columns born in the migration. Artifacts (screenshots) to
+      S3-compatible storage with signed URLs. Do these together, not as two
+      rewrites of the same layer.
+- [ ] **B3 — Redis pub/sub behind `EventBus`, via the outbox pattern** *(High, M)*
+      The bus says it itself: "one process only". Persist first (already done),
+      publish via Redis, and rely on replay-from-`seq` (already implemented for
+      reconnects) to cover any gap.
+- [ ] **B4 — A real job queue** *(High, L)*
+      `ReplayManager._slot` and `RunManager._tasks` are in-process dicts: they
+      survive neither a restart nor a second worker. "One execution at a time" was a
+      product decision for one user; as a platform it becomes **per-workspace
+      concurrency limits**. arq or Celery for the modest version; evaluate Temporal
+      if durable long-running workflows become central — it would absorb the batch
+      recovery contract, at the cost of new infrastructure. The contract in
+      `batch.py` (rules 1–5) transplants cleanly either way.
+- [ ] **B5 — Browser session pool** *(Medium, M)*
+      Every run forks a Chromium via Playwright MCP; ten users means ten forks on
+      one box. Put a pool with per-tenant quotas and TTLs behind the existing
+      `MCPBrowserSession` seam rather than changing callers.
+- [ ] **A4 — KMS envelope encryption for credentials** *(High, M)*
+      One static Fernet key encrypts every user's site logins, with no rotation
+      story. Move to a KMS-held master key (AWS KMS, given the Bedrock commitment)
+      with per-credential data keys and a re-encryption job. Keep the write-only API
+      surface — that part is already right.
+
+## P2 · Consolidate the orchestration — the real boilerplate wins
+
+This is where "remove boilerplate" is genuinely correct, and it is worth roughly
+350 lines plus a reduction in duplicated subtlety.
+
+- [ ] **C1 — One `RunLifecycle` for the three run arcs** *(High, M)*
+      `RunManager._execute`, `ReplayManager._drive` and `_run_batch`/`_finalise_batch`
+      each hand-roll: create run → build sink/redactor → open MCP session → drive →
+      **shielded finalise** → emit `RunFinished` → persist terminal status. That
+      shielded-finally subtlety is duplicated three times, and duplicated subtlety
+      is where the next bug lives. One async context manager (template method) with
+      three small strategies. **≈200 lines, best single win.**
+- [ ] **D1 — Routers and a service layer** *(High, M)*
+      `main.py` is 1,280 lines with 21 hand-written 404 raises, 24 repetitions of
+      `Depends(get_store)`, and zero `APIRouter`s. Split into
+      `routers/{runs,usecases,credentials,batches,health}.py` with
+      `UseCaseService`/`RunService` owning logic now inlined in endpoints, and a
+      shared `get_usecase_or_404` dependency. Also the precondition for testing
+      business logic without `TestClient`. Split `runner.py` (983 lines) the same
+      way: bus / sinks / managers / batch driver.
+- [ ] **C2 — Merge `healing.py` and `repair.py` onto one kernel** *(Medium, M)*
+      274 + 450 lines implementing the same idea at two moments (mid-run vs
+      post-mortem): two prompts, two choose-element-by-index schemas, two budgets.
+      The safety invariant — *the model cannot invent a locator* — is implemented
+      twice and must be kept true twice. One `proposals` module, two thin entry
+      points (strategy over a shared kernel).
+- [ ] **C4 — Finish the message migration** *(Medium, S)*
+      `chat.py`'s bridge and `agent._history_from` exist only because distillation,
+      healing and repair still speak Anthropic-shaped dicts. Migrating those three
+      call sites to LangChain messages deletes **≈150 lines** and one of the two
+      message dialects. Already flagged in the `f0037a0` commit message.
+- [ ] **C3 — Approvals via LangGraph `interrupt()`** *(Medium, M — after B1)*
+      Two pause mechanisms coexist today: the graph, and a custom future-based
+      rendezvous (`RunApprovalGate`). With a persistent checkpointer,
+      `interrupt()` + `Command(resume=)` makes a **pending approval survive a
+      restart** — a genuinely new property. Restructures the run-task lifecycle and
+      the approve endpoint, so it needs its own change.
+- [ ] **D3 — `Settings` by injection, not a module global** *(Medium, S)*
+      `config.settings` is instantiated at import and monkeypatched in tests. The
+      ".env leaks into tests" bug has bitten **three separate times** in this
+      project (API key, default model, repair model). Construct it once in the
+      lifespan and inject via `Depends`. Small change; closes a recurring class.
+- [ ] **D6 — Deduplicate request-side logic** *(Low, S)*
+      Credential resolution and missing-slot validation repeat across the execute
+      and batch endpoints; archive/purge/rename each re-implement fetch-or-404.
+      Mostly falls out of D1 for free.
+
+## P3 · Polish, prove, observe
+
+- [ ] **D4 — Generate `events.ts` instead of hand-mirroring it** *(Medium, S)*
+      380 TypeScript lines maintained by hand, with a sync test that checks type
+      *names* but not field shapes. Generate from the pydantic models
+      (`pydantic-to-typescript`), or drive the whole client from OpenAPI. Deletes
+      the mirror **and** strengthens the guarantee.
+- [ ] **D5 — Break up `UseCaseView` (771 lines)** *(Medium, M)*
+      One component owns review, publish, rename, credentials, run-one, batch,
+      repair and delete — with bespoke `setInterval` polling sitting beside an
+      already-built WebSocket. Split by mode into components + hooks, adopt
+      TanStack Query for the fetch/cache/poll lifecycle, and stream batch progress
+      over the event channel instead of polling.
+- [ ] **E2 — OpenTelemetry and metrics** *(Medium, M)*
+      Structured logs with `run_id` binding exist and are good, but there are no
+      counters, no latencies, and no trace linking HTTP request → run → LLM call.
+      **Token spend per role and locator-drift rate are already recorded per step
+      and nothing aggregates them** — and "zero tokens" is the product's central
+      claim, so the dashboard should prove it continuously.
+- [ ] **E3 — One end-to-end test against a real browser** *(Medium, M)*
+      Every test fakes the MCP session, so the first real batch is the first real
+      proof. Add an opt-in nightly run (the existing `RUN_E2E=1` pattern):
+      record → distil → replay against a local static site.
+- [ ] **E4 — Container and runtime hardening** *(Low, S)*
+      Non-root images, split health/readiness probes, resource limits on browser
+      processes, and CI enforcement of the lockfile.
+
+---
+
+## Do NOT do these
+
+Anti-recommendations, kept in the list because they are the tempting wrong turns.
+
+- **No microservices.** A modular monolith on queue + Postgres + Redis scales to
+  many users long before service boundaries pay for themselves.
+- **Do not rebuild `replay.py` on the graph, or "unify" it with the agent.** Its
+  inability to reach a model is the product's core guarantee, held structurally.
+- **Do not adopt more framework to shrink code.** Measured here: the framework move
+  was +338 lines, and framework file-reading tools lost to two lines of stdlib.
+  Adopt for capability, never for brevity.
+- **No CQRS or full event-sourcing.** The events table is a timeline, not the
+  system of record, and that division is serving the project well.
+
+---
+
+## Housekeeping
+
+- [ ] **Delete `ANTHROPIC_API_KEY` from `.env`.** Nothing reads it since
+      `29ded6e` made the project Bedrock-only. It was exposed earlier in this
+      project's history, so treat it as compromised rather than merely unused.
+- [ ] **Delete `data/runs.db.*.bak`** once you are satisfied with the secret purge
+      — the backup still contains the plaintext credential.
+
+*The previous `TODO.md` tracked the record-and-replay feature through phases 0–5,
+all shipped. Its content is in git history and the rationale lives in
+[`docs/design/repeatable-usecases.md`](docs/design/repeatable-usecases.md).*

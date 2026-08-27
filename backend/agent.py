@@ -184,12 +184,17 @@ class BrowserAgent:
         llm: LLMClient,
         sink: EventSink,
         approvals: ApprovalGate,
+        checkpointer: Any | None = None,
     ) -> None:
         self.spec = spec
         self.mcp = mcp
         self.llm = llm
         self.sink = sink
         self.approvals = approvals
+        #: Where the graph persists its state between supersteps. None means
+        #: LangGraph's in-memory saver, which is right for tests and wrong for
+        #: production -- see checkpoints.py.
+        self.checkpointer = checkpointer
 
         self.messages: list[dict[str, Any]] = []
         self.step = 0
@@ -252,6 +257,7 @@ class BrowserAgent:
             think=self._think,
             act=self._act,
             should_continue=self._should_continue,
+            checkpointer=self.checkpointer,
         )
         # recursion_limit bounds supersteps; the step budget below is the real
         # ceiling, and this only stops a pathological graph spinning forever.

@@ -148,10 +148,54 @@ class Settings(BaseSettings):
     replay_heal_max_attempts: int = 3
     replay_heal_max_tokens: int = 20_000
 
+    # --- Database ----------------------------------------------------------
+    #: Postgres, in parts rather than as one DSN string. A password containing
+    #: '@', ':' or '/' cannot be safely interpolated into a URL, and this
+    #: project's own password does; db/engine.py escapes each part with
+    #: URL.create(). See docs/operations/database.md.
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "postgres"
+    db_user: str = "postgres"
+    db_password: str = ""
+    #: A named schema rather than 'public', so this application can share a
+    #: database without colliding, and so its tables can be dropped as a unit.
+    db_schema: str = "browser"
+
+    #: Pool sizing. The defaults suit a single web process; a deployment with
+    #: several workers should keep (pool_size + max_overflow) * workers below
+    #: Postgres max_connections.
+    db_pool_size: int = 10
+    db_max_overflow: int = 5
+    db_pool_timeout: float = 30.0
+    #: LangGraph's checkpointer, which is what lets a run in flight survive a
+    #: restart. Off in tests, where an in-memory saver is correct and a second
+    #: connection is waste. See checkpoints.py for why the backend differs by
+    #: platform.
+    checkpoint_enabled: bool = True
+    checkpoint_path: str = "./data/checkpoints.sqlite"
+    #: Recycle below any proxy/firewall idle timeout, which is what turns a
+    #: pooled connection into a mystery 500 hours after it was opened.
+    db_pool_recycle: int = 1800
+    db_echo: bool = False
+
+    # --- Authentication ----------------------------------------------------
+    #: Bearer sessions are opaque tokens hashed in the database, so there is no
+    #: signing secret to configure or rotate.
+    auth_session_ttl_hours: int = 12
+    #: bcrypt work factor. 12 is roughly 250ms on current hardware -- slow
+    #: enough to matter for offline cracking, fast enough for a login.
+    auth_bcrypt_rounds: int = 12
+    #: Bootstrap: created on first startup if no user exists at all, so a fresh
+    #: deployment is reachable. Leave the password blank and one is generated
+    #: and printed once to the log.
+    bootstrap_admin_email: str = "admin@localhost"
+    bootstrap_admin_password: str = ""
+    bootstrap_workspace_name: str = "Default"
+
     # --- Server ------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8000
-    database_path: str = "./data/runs.db"
     artifacts_dir: str = "./artifacts"
     log_level: str = "INFO"
     #: Same NoDecode reasoning as agent_allowed_domains above.
@@ -170,13 +214,6 @@ class Settings(BaseSettings):
         return value or None
 
     # --- Derived helpers ---------------------------------------------------
-    @property
-    def db_path(self) -> Path:
-        path = Path(self.database_path)
-        if not path.is_absolute():
-            path = REPO_ROOT / path
-        return path
-
     @property
     def artifacts_path(self) -> Path:
         path = Path(self.artifacts_dir)
@@ -213,10 +250,19 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """The process's settings, built once.
+
+    There is deliberately no module-level ``settings`` object. One used to
+    exist, and because it was constructed at *import* time, tests that meant to
+    supply their own configuration silently picked up the developer's ``.env``
+    instead -- a bug this project shipped three separate times (an API key, the
+    default model, then the repair model). A function that must be called can
+    be overridden; an object that already exists by the time your test runs
+    cannot.
+
+    FastAPI handlers should depend on ``deps.get_config`` rather than calling
+    this, so a test can override the dependency for one app instance.
+    """
     settings = Settings()
-    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     settings.artifacts_path.mkdir(parents=True, exist_ok=True)
     return settings
-
-
-settings = get_settings()

@@ -16,6 +16,7 @@ PASSWORD = "s3cret-Example-Pw!"
 
 
 async def test_secrets_are_redacted_in_the_database(store):
+    await store.create_run("r1", "t", None, {})
     bus = EventBus()
     sink = RunEventSink("r1", store, bus, redactor=Redactor([PASSWORD]))
 
@@ -35,6 +36,7 @@ async def test_secrets_are_redacted_in_the_database(store):
 
 
 async def test_secrets_are_redacted_on_the_websocket_broadcast(store):
+    await store.create_run("r1", "t", None, {})
     bus = EventBus()
     queue = bus.subscribe("r1")
     sink = RunEventSink("r1", store, bus, redactor=Redactor([PASSWORD]))
@@ -57,8 +59,15 @@ async def test_secrets_are_redacted_on_the_websocket_broadcast(store):
     bus.unsubscribe("r1", queue)
 
 
-async def test_the_raw_bytes_on_disk_never_contain_the_secret(store, tmp_path):
-    """Defence in depth: grep the database file itself, not the parsed events."""
+async def test_the_stored_payload_never_contains_the_secret(store, tmp_path):
+    """Defence in depth: grep what was actually written, not the parsed events.
+
+    This used to read the SQLite file off disk. The equivalent against a server
+    is to read the stored column back as raw text -- which tests the same
+    thing, that redaction happened before the write rather than on the way
+    out.
+    """
+    await store.create_run("r1", "t", None, {})
     sink = RunEventSink("r1", store, EventBus(), redactor=Redactor([PASSWORD]))
     await sink.emit(
         ToolCall(
@@ -70,15 +79,20 @@ async def test_the_raw_bytes_on_disk_never_contain_the_secret(store, tmp_path):
             arguments={"text": PASSWORD},
         )
     )
-    # Checkpoint the WAL so everything is in the main database file.
-    await store.db.execute("PRAGMA wal_checkpoint(FULL)")
-    await store.db.commit()
+    from sqlalchemy import cast, select
+    from sqlalchemy.types import Text
 
-    blob = store.db_path.read_bytes()
-    assert PASSWORD.encode() not in blob
+    from db.models import Event
+
+    async with store._sessions() as session:  # noqa: SLF001 - inspecting storage
+        rows = (await session.scalars(select(cast(Event.payload, Text)))).all()
+
+    assert rows, "the event should have been persisted"
+    assert not any(PASSWORD in row for row in rows)
 
 
 async def test_a_sink_without_secrets_stores_events_verbatim(store):
+    await store.create_run("r1", "t", None, {})
     sink = RunEventSink("r1", store, EventBus())
     await sink.emit(
         ToolCall(

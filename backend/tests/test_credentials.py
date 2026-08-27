@@ -117,9 +117,18 @@ async def test_only_ciphertext_reaches_the_database(store, vault: Vault):
         new_credential_id(), "IXL account", Vault.slots_of(BUNDLE), ciphertext
     )
 
-    await store.db.execute("PRAGMA wal_checkpoint(FULL)")
-    await store.db.commit()
-    assert b"s3cret-Example-Pw!" not in store.db_path.read_bytes()
+    # Read the stored column back as raw bytes. The claim is not that open()
+    # round-trips -- it is that the plaintext appears nowhere in what was
+    # written.
+    from sqlalchemy import select
+
+    from db.models import Credential
+
+    async with store._sessions() as session:  # noqa: SLF001 - inspecting storage
+        raw = await session.scalar(
+            select(Credential.ciphertext).where(Credential.id == credential_id)
+        )
+    assert b"s3cret-Example-Pw!" not in raw
 
     stored = await store.get_credential_ciphertext(credential_id)
     assert vault.open(stored) == BUNDLE

@@ -24,6 +24,7 @@ from typing import Any, Literal
 from agent import AgentOutcome, AgentSpec, BrowserAgent, RunOptions
 from batch import BatchProgress, BatchRunner, new_batch_id
 from batch import summarise as batch_summarise
+from bus import EventBus
 from config import Settings
 from events import (
     AgentEvent,
@@ -39,7 +40,7 @@ from logging_setup import bind_run_id
 from mcp_client import MCPBrowserSession, MCPConfig, MCPConnectionError
 from redaction import NULL_REDACTOR, Redactor
 from replay import RowResult, UseCaseExecutor, emit_replay_error
-from store import Store
+from store import Store, WorkspaceStore
 from usecase import UseCase
 
 log = logging.getLogger(__name__)
@@ -52,37 +53,9 @@ ApprovalDecision = Literal["approved", "rejected", "timeout"]
 # ---------------------------------------------------------------------------
 
 
-class EventBus:
-    """In-memory fan-out. One process only; move to Redis to scale out."""
-
-    def __init__(self, queue_size: int = 1000) -> None:
-        self._subscribers: dict[str, set[asyncio.Queue]] = {}
-        self._queue_size = queue_size
-
-    def subscribe(self, run_id: str) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_size)
-        self._subscribers.setdefault(run_id, set()).add(queue)
-        return queue
-
-    def unsubscribe(self, run_id: str, queue: asyncio.Queue) -> None:
-        subscribers = self._subscribers.get(run_id)
-        if not subscribers:
-            return
-        subscribers.discard(queue)
-        if not subscribers:
-            self._subscribers.pop(run_id, None)
-
-    def publish(self, run_id: str, event: AgentEvent) -> None:
-        for queue in list(self._subscribers.get(run_id, ())):
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                # A stalled client must not slow the agent down. It will
-                # reconnect and replay from its last seq.
-                log.warning("dropping event for slow subscriber", extra={"run_id": run_id})
-
-    def subscriber_count(self, run_id: str) -> int:
-        return len(self._subscribers.get(run_id, ()))
+# EventBus lives in bus.py so that the in-memory and cross-process versions
+# are interchangeable; it is re-exported here because this module has always
+# been where callers import it from.
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +74,7 @@ class RunEventSink:
     def __init__(
         self,
         run_id: str,
-        store: Store,
+        store: "WorkspaceStore",
         bus: EventBus,
         api_base: str = "",
         redactor: Redactor | None = None,
@@ -157,9 +130,15 @@ class PendingApproval:
 class RunApprovalGate:
     """The rendezvous between a paused agent loop and ``POST /approve``."""
 
-    def __init__(self, run_id: str, manager: "RunManager") -> None:
+    def __init__(
+        self, run_id: str, manager: "RunManager", data: "WorkspaceStore | None" = None
+    ) -> None:
         self.run_id = run_id
         self.manager = manager
+        #: Scoped store for the status flips below. The manager holds an
+        #: unscoped Store serving every tenant, so the gate is handed the view
+        #: belonging to this run rather than reaching through the manager.
+        self.data = data
 
     async def request(
         self, approval_id: str, timeout: float
@@ -179,10 +158,12 @@ class RunApprovalGate:
             self.manager.clear_approval(self.run_id, approval_id)
 
     async def on_pause(self) -> None:
-        await self.manager.store.set_status(self.run_id, "awaiting_approval")
+        if self.data is not None:
+            await self.data.set_status(self.run_id, "awaiting_approval")
 
     async def on_resume(self) -> None:
-        await self.manager.store.set_status(self.run_id, "running")
+        if self.data is not None:
+            await self.data.set_status(self.run_id, "running")
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +181,11 @@ class RunRequest:
     #: Values to keep out of the event log, the database and the logs. Anything
     #: here is replaced with a placeholder on its way to any of the three.
     secrets: list[str] = field(default_factory=list)
+    #: Which tenant this run belongs to, and who asked for it. Carried on the
+    #: request rather than held on the manager because the manager is a
+    #: process-wide singleton serving every workspace at once.
+    workspace_id: str = ""
+    owner_id: str | None = None
 
 
 class RunManager:
@@ -209,10 +195,14 @@ class RunManager:
         settings: Settings,
         bus: EventBus | None = None,
         llm: LLMClient | None = None,
+        checkpointer: Any | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.bus = bus or EventBus()
+        #: Passed to every agent graph, so an interrupted run has state to
+        #: resume from. See checkpoints.py.
+        self.checkpointer = checkpointer
         #: An explicit override, when one is supplied. It serves EVERY role,
         #: so a test that scripts one client still covers all three.
         self._llm = llm
@@ -271,6 +261,15 @@ class RunManager:
             max_history_messages=s.agent_max_history_messages,
         )
 
+    def _data(self, request: RunRequest) -> WorkspaceStore:
+        """The store, confined to the workspace this run belongs to.
+
+        Built per request rather than held on the manager: one manager serves
+        every tenant, so a scoped store on ``self`` would be the wrong one for
+        all but the first caller.
+        """
+        return self.store.workspace(request.workspace_id)
+
     # -- lifecycle ----------------------------------------------------------
     async def start_run(self, request: RunRequest) -> str:
         run_id = uuid.uuid4().hex
@@ -284,7 +283,9 @@ class RunManager:
             "headless": self.settings.mcp_headless if request.headless is None else request.headless,
             "browser": request.browser or self.settings.mcp_browser,
         }
-        await self.store.create_run(run_id, request.task, request.start_url, persisted)
+        await self._data(request).create_run(
+            run_id, request.task, request.start_url, persisted, owner_id=request.owner_id
+        )
 
         task = asyncio.create_task(self._execute(spec, request), name=f"run-{run_id}")
         self._tasks[run_id] = task
@@ -354,11 +355,12 @@ class RunManager:
         bind_run_id(run_id)
         started = time.monotonic()
 
+        data = self._data(request)
         redactor = Redactor(request.secrets)
         sink = _TrackingSink(
-            RunEventSink(run_id, self.store, self.bus, redactor=redactor), self, run_id
+            RunEventSink(run_id, data, self.bus, redactor=redactor), self, run_id
         )
-        gate = RunApprovalGate(run_id, self)
+        gate = RunApprovalGate(run_id, self, data)
         outcome: AgentOutcome | None = None
         cancelled = False
         agent: BrowserAgent | None = None
@@ -370,11 +372,13 @@ class RunManager:
         )
 
         try:
-            await self.store.mark_started(run_id)
+            await data.mark_started(run_id)
             log.info("run starting", extra={"task": spec.task, "start_url": spec.start_url})
 
             async with MCPBrowserSession(mcp_config) as mcp:
-                agent = BrowserAgent(spec, mcp, self.llm, sink, gate)
+                agent = BrowserAgent(
+                    spec, mcp, self.llm, sink, gate, checkpointer=self.checkpointer
+                )
                 outcome = await agent.run()
 
         except asyncio.CancelledError:
@@ -423,6 +427,7 @@ class RunManager:
             await asyncio.shield(
                 self._finalise(
                     run_id=run_id,
+                    data=data,
                     sink=sink,
                     outcome=outcome,
                     cancelled=cancelled,
@@ -439,6 +444,7 @@ class RunManager:
         self,
         *,
         run_id: str,
+        data: WorkspaceStore,
         sink: "_TrackingSink",
         outcome: AgentOutcome | None,
         cancelled: bool,
@@ -469,7 +475,7 @@ class RunManager:
             error=error,
         )
         await sink.emit(event)
-        await self.store.finish_run(
+        await data.finish_run(
             run_id,
             status,
             steps=steps,
@@ -533,6 +539,9 @@ class ExecutionRequest:
     secrets: dict[str, str] = field(default_factory=dict)
     headless: bool | None = None
     browser: str | None = None
+    #: The tenant this execution belongs to, and who asked for it.
+    workspace_id: str = ""
+    owner_id: str | None = None
 
 
 class ReplayManager:
@@ -559,6 +568,14 @@ class ReplayManager:
         self.llm_factory = llm_factory
         self._slot: dict[str, Any] | None = None
         self._task: asyncio.Task | None = None
+
+    def data(self, workspace_id: str) -> WorkspaceStore:
+        """The store, confined to one workspace.
+
+        One manager serves every tenant, so the scope comes from the request
+        rather than from the manager.
+        """
+        return self.store.workspace(workspace_id)
 
     def make_healer(self) -> Any:
         """A healer, or None when healing is off.
@@ -624,12 +641,13 @@ class ReplayManager:
             usecase_id=usecase.id,
             rows=len(indices),
         )
-        await self.store.create_batch(
+        await self.data(request.workspace_id).create_batch(
             batch_id,
             usecase.id,
             request.version,
             total=len(indices),
             credential_id=request.credential_id,
+            owner_id=request.owner_id,
         )
 
         async def drive() -> None:
@@ -641,13 +659,13 @@ class ReplayManager:
         self._task = asyncio.create_task(drive(), name=f"batch-{batch_id}")
         return batch_id
 
-    async def pending_row_indices(self, batch_id: str) -> list[int]:
+    async def pending_row_indices(self, batch_id: str, workspace_id: str) -> list[int]:
         """Row indices that are not ``succeeded``.
 
         This is what makes resume cover all three early exits identically:
         re-login failure, the circuit breaker, and a process restart.
         """
-        executions = await self.store.list_executions(batch_id=batch_id)
+        executions = await self.data(workspace_id).list_executions(batch_id=batch_id)
         return [
             int(row["row_index"])
             for row in executions
@@ -665,28 +683,30 @@ class ReplayManager:
         run_id = uuid.uuid4().hex
         execution_id = uuid.uuid4().hex
 
+        data = self.data(request.workspace_id)
         self._claim(
             f"{usecase.name} (single row)", run_id=run_id, usecase_id=usecase.id, rows=1
         )
         try:
-            await self.store.create_run(
+            await data.create_run(
                 run_id,
                 f"Replay: {usecase.name}",
                 None,
                 {"usecase_id": usecase.id, "version": request.version, "replay": True},
+                owner_id=request.owner_id,
             )
-            await self.store.create_execution(
+            await data.create_execution(
                 execution_id,
                 usecase.id,
                 request.version,
                 run_id=run_id,
                 inputs=request.inputs,
             )
-            await self.store.mark_started(run_id)
+            await data.mark_started(run_id)
 
             result = await self._drive(request, run_id)
 
-            await self.store.finish_execution(
+            await data.finish_execution(
                 execution_id,
                 "succeeded" if result.ok else "failed",
                 outputs=result.outputs,
@@ -694,7 +714,7 @@ class ReplayManager:
                 error=result.error,
                 duration_ms=result.duration_ms,
             )
-            await self.store.finish_run(
+            await data.finish_run(
                 run_id,
                 "succeeded" if result.ok else "failed",
                 steps=len(result.steps),
@@ -715,7 +735,7 @@ class ReplayManager:
     async def _drive(self, request: ExecutionRequest, run_id: str) -> RowResult:
         """Open one session, run setup, run one row, tear down."""
         redactor = Redactor(request.secrets.values())
-        sink = RunEventSink(run_id, self.store, self.bus, redactor=redactor)
+        sink = RunEventSink(run_id, self.data(request.workspace_id), self.bus, redactor=redactor)
         mcp_config = MCPConfig.from_settings(
             self.settings, headless=request.headless, browser=request.browser
         )
@@ -802,11 +822,14 @@ class BatchRequest:
     #: Row indices to run. ``None`` means all of them; a resume passes the
     #: indices that are not yet ``succeeded``.
     only_rows: list[int] | None = None
+    #: The tenant this batch belongs to, and who started it.
+    workspace_id: str = ""
+    owner_id: str | None = None
 
 
 async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequest) -> None:
     """Drive one batch to completion on a single shared browser session."""
-    store = manager.store
+    store = manager.data(request.workspace_id)
     usecase = request.usecase
     indices = (
         list(request.only_rows)
@@ -899,7 +922,7 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
             progress = await runner.run()
 
             if executor.healed:
-                await _persist_repairs(manager, usecase.id, executor.healed)
+                await _persist_repairs(store, usecase.id, executor.healed)
 
     except asyncio.CancelledError:
         progress.stopped_reason = "cancelled"
@@ -913,19 +936,19 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
         await emit_replay_error(sink, run_id, "internal_error", progress.stopped_reason)
     finally:
         await asyncio.shield(
-            _finalise_batch(manager, batch_id, run_id, sink, progress)
+            _finalise_batch(manager.data(request.workspace_id), batch_id, run_id, sink, progress)
         )
 
 
 async def _finalise_batch(
-    manager: "ReplayManager",
+    store: WorkspaceStore,
     batch_id: str,
     run_id: str,
     sink: RunEventSink,
     progress: BatchProgress,
 ) -> None:
     status = "succeeded" if progress.failed == 0 and not progress.stopped_reason else "failed"
-    await manager.store.update_batch(
+    await store.update_batch(
         batch_id,
         status=status,
         succeeded=progress.succeeded,
@@ -933,7 +956,7 @@ async def _finalise_batch(
         error=progress.stopped_reason,
         finished=True,
     )
-    await manager.store.finish_run(
+    await store.finish_run(
         run_id,
         "succeeded" if status == "succeeded" else "failed",
         steps=progress.attempted,
@@ -964,7 +987,7 @@ def batch_summary(progress: BatchProgress) -> str:
     return batch_summarise(progress)
 
 
-async def _persist_repairs(manager: "ReplayManager", usecase_id: str, repairs: list) -> None:
+async def _persist_repairs(store: WorkspaceStore, usecase_id: str, repairs: list) -> None:
     """Write healed locators back as a new use case version.
 
     The whole point of healing is that the repair is paid for once. Leaving it
@@ -972,11 +995,11 @@ async def _persist_repairs(manager: "ReplayManager", usecase_id: str, repairs: l
     """
     from healing import apply_repairs
 
-    definition = await manager.store.get_usecase(usecase_id)
+    definition = await store.get_usecase(usecase_id)
     if definition is None:
         return
     patched = apply_repairs(definition, repairs)
-    _, version = await manager.store.save_usecase(patched, created_by="healing")
+    _, version = await store.save_usecase(patched, created_by="healing")
     log.info(
         "wrote healed locators back",
         extra={"usecase_id": usecase_id, "version": version, "repairs": len(repairs)},

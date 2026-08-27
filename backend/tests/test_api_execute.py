@@ -81,31 +81,27 @@ USE_CASE = {
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    import main
-    import runner as runner_module
+def client(db_settings, db_engine, tmp_path, monkeypatch):
+    from conftest import authenticate, build_app
 
-    monkeypatch.setattr(main.settings, "database_path", str(tmp_path / "api.db"))
-    monkeypatch.setattr(main.settings, "artifacts_dir", str(tmp_path / "artifacts"))
-    # Bedrock is the only provider, so /healthz is made deterministic with
-    # fake AWS credentials rather than by pinning a different one.
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTONLY")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-not-used")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-    monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.setattr(main.settings, "credentials_key", generate_key())
-    monkeypatch.setattr(main, "probe", _fake_probe)
-    monkeypatch.setattr(runner_module, "MCPBrowserSession", FakeReplaySession)
-
-    with TestClient(main.app) as test_client:
+    app = build_app(
+        db_settings,
+        tmp_path,
+        monkeypatch,
+        session_cls=FakeReplaySession,
+        credentials_key=generate_key(),
+    )
+    with TestClient(app) as test_client:
         test_client.app.state.manager._llm = ExplodingLLM()  # noqa: SLF001 - test seam
-        yield test_client
+        yield authenticate(test_client)
 
 
 async def seed(client: TestClient, definition: dict | None = None) -> str:
+    from conftest import app_workspace
+
     definition = {**USE_CASE, "id": "uc-1", **(definition or {})}
-    usecase_id, _ = await client.app.state.store.save_usecase(definition)
+    data = await app_workspace(client.app)
+    usecase_id, _ = await data.save_usecase(definition)
     return usecase_id
 
 
@@ -394,7 +390,9 @@ BROKEN = {
 
 
 async def test_a_failed_run_can_be_repaired_without_re_recording(client: TestClient):
-    store = client.app.state.store
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
     usecase_id, _ = await store.save_usecase(BROKEN)
 
     failure = client.post(
@@ -441,7 +439,9 @@ async def test_a_failed_run_can_be_repaired_without_re_recording(client: TestCli
 
 
 async def test_a_repair_the_model_declines_reports_why_and_changes_nothing(client: TestClient):
-    store = client.app.state.store
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
     usecase_id, _ = await store.save_usecase({**BROKEN, "id": "uc-unfixable"})
 
     failure = client.post(
@@ -483,7 +483,9 @@ async def test_a_repair_that_changes_nothing_is_not_reported_as_repaired(client:
     """Regression: pressing Fix twice saved two identical versions and said
     'repaired' both times, which looks exactly like a change that did not
     persist."""
-    store = client.app.state.store
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
     usecase_id, _ = await store.save_usecase({**BROKEN, "id": "uc-noop"})
 
     failure = client.post(

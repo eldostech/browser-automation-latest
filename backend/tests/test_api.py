@@ -33,14 +33,17 @@ async def _fake_probe(config: Any, timeout: float = 20.0) -> dict[str, Any]:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def app_under_test(db_settings, db_engine, tmp_path, monkeypatch):
+    """A freshly built app on the test database, with no browser and no model.
+
+    Built through ``create_app`` rather than importing the module-level ``app``,
+    so its configuration comes from the fixture instead of the developer's
+    ``.env`` -- the leak this project shipped three times.
+    """
     import main
     import runner as runner_module
+    from conftest import api_settings
 
-    monkeypatch.setattr(main.settings, "database_path", str(tmp_path / "api.db"))
-    monkeypatch.setattr(main.settings, "artifacts_dir", str(tmp_path / "artifacts"))
-    # Pin the API tests to the key-based provider so /healthz is deterministic
-    # and never reads the developer's real AWS environment.
     # Bedrock is the only provider, so /healthz is made deterministic with
     # fake AWS credentials rather than by pinning a different one.
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTONLY")
@@ -48,20 +51,50 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.setattr(main.settings, "agent_allowed_domains", ["example.com"])
-    monkeypatch.setattr(main.settings, "agent_screenshot_every_step", False)
-    monkeypatch.setattr(main.settings, "agent_max_steps", 6)
-    monkeypatch.setattr(main, "probe", _fake_probe)
+    monkeypatch.setattr("routers.health.probe", _fake_probe)
     monkeypatch.setattr(runner_module, "MCPBrowserSession", FakeMCPBrowserSession)
+    monkeypatch.setattr(main, "probe", _fake_probe)
 
-    with TestClient(main.app) as test_client:
+    return main.create_app(api_settings(db_settings, tmp_path))
+
+
+@pytest.fixture
+def anonymous(app_under_test):
+    """A client with no credentials, for testing that endpoints refuse it."""
+    with TestClient(app_under_test) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def client(app_under_test):
+    """An administrator's client.
+
+    Signed in as the bootstrap admin, so tests that predate authentication
+    still exercise what they were written to exercise. Role-specific behaviour
+    is tested explicitly in ``test_api_auth.py``.
+    """
+    from conftest import authenticate
+
+    with TestClient(app_under_test) as test_client:
+        yield authenticate(test_client)
 
 
 def use_llm(client: TestClient, *turns) -> ScriptedLLM:
     llm = ScriptedLLM(list(turns), repeat_last=False)
     client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
     return llm
+
+
+def ws_url(client: TestClient, path: str) -> str:
+    """Append the client's bearer token as a query parameter.
+
+    A browser cannot set an Authorization header on a WebSocket handshake, so
+    the server accepts the session token in the query string instead. Tests go
+    the same route the frontend does.
+    """
+    token = client.headers["Authorization"].removeprefix("Bearer ")
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}token={token}"
 
 
 def wait_for_status(client: TestClient, run_id: str, timeout: float = 10.0) -> dict[str, Any]:
@@ -155,7 +188,7 @@ def test_websocket_replays_a_finished_run_then_closes(client):
     wait_for_status(client, run_id)
 
     received = []
-    with client.websocket_connect(f"/api/runs/{run_id}/stream?after_seq=0") as socket:
+    with client.websocket_connect(ws_url(client, f"/api/runs/{run_id}/stream?after_seq=0")) as socket:
         while True:
             try:
                 message = socket.receive_json()
@@ -177,13 +210,13 @@ def test_websocket_resume_skips_already_seen_events(client):
     run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
     wait_for_status(client, run_id)
 
-    with client.websocket_connect(f"/api/runs/{run_id}/stream?after_seq=2") as socket:
+    with client.websocket_connect(ws_url(client, f"/api/runs/{run_id}/stream?after_seq=2")) as socket:
         first = socket.receive_json()
     assert first["seq"] == 3
 
 
 def test_websocket_rejects_an_unknown_run(client):
-    with client.websocket_connect("/api/runs/nope/stream") as socket:
+    with client.websocket_connect(ws_url(client, "/api/runs/nope/stream")) as socket:
         with pytest.raises(Exception):
             socket.receive_json()
 

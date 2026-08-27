@@ -26,31 +26,27 @@ CSV = (
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    import main
-    import runner as runner_module
+def client(db_settings, db_engine, tmp_path, monkeypatch):
+    from conftest import authenticate, build_app
 
-    monkeypatch.setattr(main.settings, "database_path", str(tmp_path / "api.db"))
-    monkeypatch.setattr(main.settings, "artifacts_dir", str(tmp_path / "artifacts"))
-    # Bedrock is the only provider, so /healthz is made deterministic with
-    # fake AWS credentials rather than by pinning a different one.
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIATESTONLY")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-not-used")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
-    monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.setattr(main.settings, "credentials_key", generate_key())
-    monkeypatch.setattr(main.settings, "replay_row_delay_seconds", 0.0)
-    monkeypatch.setattr(main, "probe", _fake_probe)
-    monkeypatch.setattr(runner_module, "MCPBrowserSession", FakeReplaySession)
-
-    with TestClient(main.app) as test_client:
+    app = build_app(
+        db_settings,
+        tmp_path,
+        monkeypatch,
+        session_cls=FakeReplaySession,
+        credentials_key=generate_key(),
+        replay_row_delay_seconds=0.0,
+    )
+    with TestClient(app) as test_client:
         test_client.app.state.manager._llm = ExplodingLLM()  # noqa: SLF001 - test seam
-        yield test_client
+        yield authenticate(test_client)
 
 
 async def seed(client: TestClient) -> str:
-    usecase_id, _ = await client.app.state.store.save_usecase({**USE_CASE, "id": "uc-1"})
+    from conftest import app_workspace
+
+    data = await app_workspace(client.app)
+    usecase_id, _ = await data.save_usecase({**USE_CASE, "id": "uc-1"})
     return usecase_id
 
 
@@ -174,7 +170,9 @@ async def test_unusable_files_are_refused(client: TestClient, payload: dict):
 
 
 async def test_a_draft_use_case_cannot_be_batched(client: TestClient):
-    store = client.app.state.store
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
     await store.save_usecase({**USE_CASE, "id": "uc-draft", "status": "draft"})
     response = client.post(
         "/api/usecases/uc-draft/batch", json={"csv": CSV, "credential_id": credential(client)}
@@ -248,7 +246,9 @@ async def test_resuming_a_fully_succeeded_batch_is_refused(client: TestClient):
 
 async def test_resume_reruns_only_the_rows_that_did_not_succeed(client: TestClient):
     usecase_id = await seed(client)
-    store = client.app.state.store
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
     started = client.post(
         f"/api/usecases/{usecase_id}/batch",
         json={"csv": CSV, "credential_id": credential(client)},

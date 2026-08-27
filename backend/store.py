@@ -1,166 +1,59 @@
-"""SQLite persistence for runs, events and artifacts.
+"""Persistence for runs, events, use cases, credentials and executions.
 
-Why SQLite: a single-node control plane with modest write volume, and history
-that must survive a restart. It needs no extra service, which keeps
-clone-to-first-run short. Swap in Postgres when you want several backend
-replicas sharing one history -- the ``Store`` surface below is intentionally
-small enough that a Postgres implementation is a drop-in.
+Postgres via SQLAlchemy 2.0. History has to survive a restart and be visible to
+every worker at once, which is what ruled out the SQLite file this used to be:
+a second process could not see the first one's rows, and a job queue needs
+``SELECT ... FOR UPDATE SKIP LOCKED``, which SQLite has no answer for.
 
-Screenshots are written to the filesystem and only referenced from the
-database; binary blobs in SQLite would bloat the file and slow down the event
-queries that the WebSocket replay depends on.
+Screenshots stay on the filesystem with only a reference in the database.
+Binary blobs would bloat the tables the WebSocket replay reads from.
+
+**How tenancy is enforced.** Scoped operations do not live on :class:`Store`.
+They live on :class:`WorkspaceStore`, which you obtain with
+``store.workspace(workspace_id)``, and which puts ``workspace_id`` into the
+WHERE clause of every statement it issues. The point is that forgetting the
+filter is not possible: there is no method on the scoped object that can reach
+another tenant's row, so a missing check cannot leak data -- it can only fail
+to compile. The handful of genuinely cross-tenant operations (startup reaping,
+health probes, workspace creation) stay on the unscoped :class:`Store` where
+they are easy to enumerate and review.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-import aiosqlite
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from config import Settings
+from db.base import iso, utcnow
+from db.engine import create_engine, create_session_factory, ensure_schema
+from db.models import (
+    Artifact,
+    AuditLogEntry,
+    Batch,
+    Credential,
+    Event,
+    Execution,
+    Run,
+    UseCase,
+    UseCaseVersion,
+    Workspace,
+)
 from events import AgentEvent, RunFinished, RunStatus, dump_event, parse_event
 
 log = logging.getLogger(__name__)
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS runs (
-    id            TEXT PRIMARY KEY,
-    task          TEXT NOT NULL,
-    start_url     TEXT,
-    status        TEXT NOT NULL,
-    options       TEXT NOT NULL DEFAULT '{}',
-    created_at    TEXT NOT NULL,
-    started_at    TEXT,
-    finished_at   TEXT,
-    steps         INTEGER NOT NULL DEFAULT 0,
-    duration_ms   INTEGER,
-    summary       TEXT,
-    result        TEXT,
-    error         TEXT
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    run_id  TEXT NOT NULL,
-    seq     INTEGER NOT NULL,
-    ts      TEXT NOT NULL,
-    type    TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    PRIMARY KEY (run_id, seq)
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-    id         TEXT PRIMARY KEY,
-    run_id     TEXT NOT NULL,
-    seq        INTEGER,
-    kind       TEXT NOT NULL,
-    mime       TEXT NOT NULL,
-    path       TEXT NOT NULL,
-    bytes      INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS usecases (
-    id              TEXT PRIMARY KEY,
-    name            TEXT NOT NULL,
-    description     TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'draft',
-    current_version INTEGER NOT NULL DEFAULT 1,
-    source_run_id   TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
-);
-
--- Versions are immutable: an edit appends a row rather than rewriting one, so
--- a batch already running cannot have its definition changed underneath it.
-CREATE TABLE IF NOT EXISTS usecase_versions (
-    usecase_id TEXT NOT NULL,
-    version    INTEGER NOT NULL,
-    definition TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    created_by TEXT,
-    PRIMARY KEY (usecase_id, version)
-);
-
--- Values are Fernet ciphertext; there is no code path that returns them over
--- HTTP. See credentials.py.
-CREATE TABLE IF NOT EXISTS credentials (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    slots        TEXT NOT NULL DEFAULT '[]',
-    ciphertext   BLOB NOT NULL,
-    created_at   TEXT NOT NULL,
-    last_used_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS batches (
-    id            TEXT PRIMARY KEY,
-    usecase_id    TEXT NOT NULL,
-    version       INTEGER NOT NULL,
-    status        TEXT NOT NULL,
-    total         INTEGER NOT NULL DEFAULT 0,
-    succeeded     INTEGER NOT NULL DEFAULT 0,
-    failed        INTEGER NOT NULL DEFAULT 0,
-    credential_id TEXT,
-    error         TEXT,
-    created_at    TEXT NOT NULL,
-    finished_at   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS executions (
-    id             TEXT PRIMARY KEY,
-    batch_id       TEXT,
-    usecase_id     TEXT NOT NULL,
-    version        INTEGER NOT NULL,
-    run_id         TEXT,
-    row_index      INTEGER,
-    inputs         TEXT NOT NULL DEFAULT '{}',
-    outputs        TEXT,
-    status         TEXT NOT NULL,
-    failed_step_id TEXT,
-    error          TEXT,
-    llm_calls      INTEGER NOT NULL DEFAULT 0,
-    llm_tokens     INTEGER NOT NULL DEFAULT 0,
-    duration_ms    INTEGER,
-    created_at     TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_run_seq ON events (run_id, seq);
-CREATE INDEX IF NOT EXISTS idx_runs_status    ON runs (status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_artifacts_run  ON artifacts (run_id, seq);
-CREATE INDEX IF NOT EXISTS idx_usecases_status ON usecases (status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_executions_batch ON executions (batch_id, row_index);
-CREATE INDEX IF NOT EXISTS idx_executions_usecase ON executions (usecase_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_batches_usecase ON batches (usecase_id, created_at DESC);
-"""
-
-#: Schema revision this build expects. ``CREATE TABLE IF NOT EXISTS`` above
-#: handles *adding* tables to an existing database, but it silently does
-#: nothing when a table exists with an older shape -- so an ``ALTER`` or a
-#: backfill needs somewhere to hang. :data:`MIGRATIONS` is that place, and
-#: ``user_version`` records how far a given file has been brought forward.
-SCHEMA_VERSION = 3
-
-#: ``{target_version: (sql_statement, ...)}``, applied in ascending order to
-#: any database whose ``user_version`` is below the target. Statements must be
-#: idempotent where SQLite allows it, and must never drop user data.
-MIGRATIONS: dict[int, tuple[str, ...]] = {
-    # v1 is the original runs/events/artifacts schema.
-    1: (),
-    # v2 adds usecases + usecase_versions. ``CREATE TABLE IF NOT EXISTS`` in
-    # SCHEMA already creates them on connect, so there is nothing to run --
-    # the entry exists to record that this database has been seen by a build
-    # that knows about those tables.
-    2: (),
-    # v3 adds credentials, batches and executions. Same reasoning as v2.
-    3: (),
-}
-
 ORPHAN_MESSAGE = "Backend restarted while this run was in flight."
+
+#: Statuses that mean "this run believed it was still going".
+UNFINISHED_STATUSES = ("pending", "running", "awaiting_approval")
 
 
 @dataclass(slots=True)
@@ -178,6 +71,7 @@ class RunRecord:
     summary: str | None
     result: dict[str, Any] | None
     error: str | None
+    owner_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +88,7 @@ class RunRecord:
             "summary": self.summary,
             "result": self.result,
             "error": self.error,
+            "owner_id": self.owner_id,
         }
 
 
@@ -209,122 +104,268 @@ class ArtifactRecord:
     created_at: str
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _run_record(row: Run) -> RunRecord:
+    return RunRecord(
+        id=row.id,
+        task=row.task,
+        start_url=row.start_url,
+        status=row.status,  # type: ignore[arg-type]
+        options=row.options or {},
+        created_at=iso(row.created_at) or "",
+        started_at=iso(row.started_at),
+        finished_at=iso(row.finished_at),
+        steps=row.steps or 0,
+        duration_ms=row.duration_ms,
+        summary=row.summary,
+        result=row.result,
+        error=row.error,
+        owner_id=row.owner_id,
+    )
 
 
-def _loads(value: str | None, default: Any = None) -> Any:
-    if not value:
-        return default
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return default
+def _artifact_record(row: Artifact) -> ArtifactRecord:
+    return ArtifactRecord(
+        id=row.id,
+        run_id=row.run_id,
+        seq=row.seq,
+        kind=row.kind,
+        mime=row.mime,
+        path=row.path,
+        bytes=row.bytes,
+        created_at=iso(row.created_at) or "",
+    )
+
+
+def _execution_dict(row: Execution) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "batch_id": row.batch_id,
+        "usecase_id": row.usecase_id,
+        "version": row.version,
+        "run_id": row.run_id,
+        "row_index": row.row_index,
+        "inputs": row.inputs or {},
+        "outputs": row.outputs,
+        "status": row.status,
+        "failed_step_id": row.failed_step_id,
+        "error": row.error,
+        "llm_calls": row.llm_calls,
+        "llm_tokens": row.llm_tokens,
+        "duration_ms": row.duration_ms,
+        "created_at": iso(row.created_at),
+    }
+
+
+def _batch_dict(row: Batch) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "usecase_id": row.usecase_id,
+        "version": row.version,
+        "status": row.status,
+        "total": row.total,
+        "succeeded": row.succeeded,
+        "failed": row.failed,
+        "credential_id": row.credential_id,
+        "error": row.error,
+        "created_at": iso(row.created_at),
+        "finished_at": iso(row.finished_at),
+        "owner_id": row.owner_id,
+    }
 
 
 class Store:
-    def __init__(self, db_path: Path, artifacts_dir: Path) -> None:
-        self.db_path = db_path
-        self.artifacts_dir = artifacts_dir
-        self._db: aiosqlite.Connection | None = None
+    """Connection lifecycle, and the few operations that cross tenants."""
+
+    def __init__(self, settings: Settings, artifacts_dir: Path | None = None) -> None:
+        self._settings = settings
+        self.artifacts_dir = artifacts_dir or settings.artifacts_path
+        self._engine: AsyncEngine | None = None
+        self._sessions: async_sessionmaker[AsyncSession] | None = None
 
     # -- lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.db_path)
-        self._db.row_factory = aiosqlite.Row
-        # WAL lets the WebSocket replay read while the agent loop writes.
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.executescript(SCHEMA)
-        await self._db.commit()
-        await self.migrate()
-        log.info("store connected", extra={"db_path": str(self.db_path)})
-
-    async def schema_version(self) -> int:
-        async with self.db.execute("PRAGMA user_version") as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
-
-    async def migrate(self) -> int:
-        """Bring the database up to :data:`SCHEMA_VERSION`. Returns the version reached.
-
-        A fresh file is stamped at the current version without running anything
-        -- ``SCHEMA`` already created it in its final shape. An existing file
-        runs only the migrations above its recorded version.
-        """
-        current = await self.schema_version()
-        if current >= SCHEMA_VERSION:
-            return current
-
-        for target in sorted(MIGRATIONS):
-            if target <= current:
-                continue
-            for statement in MIGRATIONS[target]:
-                await self.db.execute(statement)
-            # PRAGMA does not accept a bound parameter.
-            await self.db.execute(f"PRAGMA user_version = {int(target)}")
-            await self.db.commit()
-            log.info("applied schema migration", extra={"from": current, "to": target})
-            current = target
-
-        return current
+        self._engine = create_engine(self._settings)
+        self._sessions = create_session_factory(self._engine)
+        await ensure_schema(self._engine, self._settings.db_schema)
+        log.info(
+            "store connected",
+            extra={
+                "db_host": self._settings.db_host,
+                "db_name": self._settings.db_name,
+                "db_schema": self._settings.db_schema,
+            },
+        )
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
+            self._sessions = None
 
     @property
-    def db(self) -> aiosqlite.Connection:
-        if self._db is None:
+    def engine(self) -> AsyncEngine:
+        if self._engine is None:
             raise RuntimeError("Store.connect() has not been awaited")
-        return self._db
+        return self._engine
+
+    @property
+    def sessions(self) -> async_sessionmaker[AsyncSession]:
+        if self._sessions is None:
+            raise RuntimeError("Store.connect() has not been awaited")
+        return self._sessions
+
+    def workspace(self, workspace_id: str) -> "WorkspaceStore":
+        """A view of this store confined to one tenant.
+
+        Cheap -- it holds a session factory and a string -- so callers make one
+        per request or per operation rather than caching it.
+        """
+        return WorkspaceStore(self.sessions, self.artifacts_dir, workspace_id)
 
     async def ping(self) -> bool:
         try:
-            await self.db.execute("SELECT 1")
+            async with self.sessions() as session:
+                await session.execute(select(1))
             return True
         except Exception:  # noqa: BLE001 - a health probe must never raise
             return False
 
+    # -- workspaces ---------------------------------------------------------
+    async def ensure_workspace(self, name: str, slug: str) -> str:
+        async with self.sessions() as session:
+            existing = await session.scalar(select(Workspace).where(Workspace.slug == slug))
+            if existing is not None:
+                return existing.id
+            workspace = Workspace(name=name, slug=slug)
+            session.add(workspace)
+            await session.commit()
+            return workspace.id
+
+    async def default_workspace_id(self) -> str | None:
+        async with self.sessions() as session:
+            return await session.scalar(
+                select(Workspace.id).order_by(Workspace.created_at).limit(1)
+            )
+
+    async def list_workspaces(self) -> list[dict[str, Any]]:
+        async with self.sessions() as session:
+            rows = (await session.scalars(select(Workspace).order_by(Workspace.created_at))).all()
+            return [
+                {"id": w.id, "name": w.name, "slug": w.slug, "created_at": iso(w.created_at)}
+                for w in rows
+            ]
+
+    # -- startup recovery ---------------------------------------------------
+    async def reap_orphaned_runs(self) -> int:
+        """Fail runs left mid-flight by a crash or restart, across all tenants.
+
+        Deliberately unscoped: it runs at startup, before any request has
+        established who is calling, and a tenant filter here would leave other
+        workspaces' runs spinning forever in the UI.
+
+        Note that this *fails* orphans rather than resuming them. Resumption is
+        the job of the queue, which re-leases work whose lease expired; this
+        covers runs that were never queue-managed.
+        """
+        async with self.sessions() as session:
+            orphans = (
+                await session.scalars(
+                    select(Run.id).where(Run.status.in_(UNFINISHED_STATUSES))
+                )
+            ).all()
+            if not orphans:
+                return 0
+
+            for run_id in orphans:
+                next_seq = (
+                    await session.scalar(
+                        select(func.coalesce(func.max(Event.seq), 0)).where(
+                            Event.run_id == run_id
+                        )
+                    )
+                ) + 1
+                event = RunFinished(
+                    run_id=run_id,
+                    seq=next_seq,
+                    status="failed",
+                    steps=0,
+                    duration_ms=0,
+                    error=ORPHAN_MESSAGE,
+                )
+                payload = dump_event(event)
+                session.add(
+                    Event(
+                        run_id=run_id,
+                        seq=next_seq,
+                        type=payload["type"],
+                        payload=payload,
+                    )
+                )
+
+            await session.execute(
+                update(Run)
+                .where(Run.status.in_(UNFINISHED_STATUSES))
+                .values(status="failed", finished_at=utcnow(), error=ORPHAN_MESSAGE)
+            )
+            await session.commit()
+
+        log.warning("reaped orphaned runs", extra={"count": len(orphans)})
+        return len(orphans)
+
+
+class WorkspaceStore:
+    """Every operation, confined to one workspace.
+
+    Read the WHERE clauses as a set: each one carries
+    ``workspace_id == self._ws``. That repetition is the security property, not
+    boilerplate to factor away -- the moment it becomes implicit is the moment a
+    new method can forget it.
+    """
+
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        artifacts_dir: Path,
+        workspace_id: str,
+    ) -> None:
+        self._sessions = sessions
+        self.artifacts_dir = artifacts_dir
+        self._ws = workspace_id
+
+    @property
+    def workspace_id(self) -> str:
+        return self._ws
+
     # -- runs ---------------------------------------------------------------
     async def create_run(
-        self, run_id: str, task: str, start_url: str | None, options: dict[str, Any]
+        self,
+        run_id: str,
+        task: str,
+        start_url: str | None,
+        options: dict[str, Any],
+        *,
+        owner_id: str | None = None,
     ) -> RunRecord:
-        created = _now()
-        await self.db.execute(
-            "INSERT INTO runs (id, task, start_url, status, options, created_at)"
-            " VALUES (?, ?, ?, 'pending', ?, ?)",
-            (run_id, task, start_url, json.dumps(options), created),
-        )
-        await self.db.commit()
-        return RunRecord(
-            id=run_id,
-            task=task,
-            start_url=start_url,
-            status="pending",
-            options=options,
-            created_at=created,
-            started_at=None,
-            finished_at=None,
-            steps=0,
-            duration_ms=None,
-            summary=None,
-            result=None,
-            error=None,
-        )
+        async with self._sessions() as session:
+            run = Run(
+                id=run_id,
+                workspace_id=self._ws,
+                owner_id=owner_id,
+                task=task,
+                start_url=start_url,
+                status="pending",
+                options=options or {},
+            )
+            session.add(run)
+            await session.commit()
+            return _run_record(run)
 
     async def mark_started(self, run_id: str) -> None:
-        await self.db.execute(
-            "UPDATE runs SET status='running', started_at=? WHERE id=?", (_now(), run_id)
-        )
-        await self.db.commit()
+        await self._update_run(run_id, status="running", started_at=utcnow())
 
     async def set_status(self, run_id: str, status: RunStatus) -> None:
-        await self.db.execute("UPDATE runs SET status=? WHERE id=?", (status, run_id))
-        await self.db.commit()
+        await self._update_run(run_id, status=status)
 
     async def finish_run(
         self,
@@ -337,103 +378,49 @@ class Store:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
-        await self.db.execute(
-            "UPDATE runs SET status=?, finished_at=?, steps=?, duration_ms=?,"
-            " summary=?, result=?, error=? WHERE id=?",
-            (
-                status,
-                _now(),
-                steps,
-                duration_ms,
-                summary,
-                json.dumps(result) if result is not None else None,
-                error,
-                run_id,
-            ),
+        await self._update_run(
+            run_id,
+            status=status,
+            finished_at=utcnow(),
+            steps=steps,
+            duration_ms=duration_ms,
+            summary=summary,
+            result=result,
+            error=error,
         )
-        await self.db.commit()
+
+    async def _update_run(self, run_id: str, **values: Any) -> None:
+        async with self._sessions() as session:
+            await session.execute(
+                update(Run)
+                .where(Run.id == run_id, Run.workspace_id == self._ws)
+                .values(**values)
+            )
+            await session.commit()
 
     async def get_run(self, run_id: str) -> RunRecord | None:
-        async with self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_run(row) if row else None
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Run).where(Run.id == run_id, Run.workspace_id == self._ws)
+            )
+            return _run_record(row) if row else None
 
     async def list_runs(
         self, *, status: str | None = None, limit: int = 50, offset: int = 0
     ) -> list[RunRecord]:
-        sql = "SELECT * FROM runs"
-        params: list[Any] = []
-        if status:
-            sql += " WHERE status=?"
-            params.append(status)
-        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        async with self.db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-        return [self._row_to_run(row) for row in rows]
+        async with self._sessions() as session:
+            stmt = select(Run).where(Run.workspace_id == self._ws)
+            if status:
+                stmt = stmt.where(Run.status == status)
+            stmt = stmt.order_by(Run.created_at.desc()).limit(limit).offset(offset)
+            return [_run_record(r) for r in (await session.scalars(stmt)).all()]
 
     async def count_runs(self, status: str | None = None) -> int:
-        sql = "SELECT COUNT(*) AS n FROM runs"
-        params: list[Any] = []
-        if status:
-            sql += " WHERE status=?"
-            params.append(status)
-        async with self.db.execute(sql, params) as cursor:
-            row = await cursor.fetchone()
-        return int(row["n"])
-
-    async def reap_orphaned_runs(self) -> int:
-        """Fail runs left mid-flight by a backend crash or restart.
-
-        Nothing is resuming them, so leaving them 'running' would make the
-        history list lie and the live run view spin forever.
-        """
-        async with self.db.execute(
-            "SELECT id FROM runs WHERE status IN ('pending','running','awaiting_approval')"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        orphans = [row["id"] for row in rows]
-        if not orphans:
-            return 0
-
-        for run_id in orphans:
-            next_seq = await self.next_seq(run_id)
-            await self.append_event(
-                RunFinished(
-                    run_id=run_id,
-                    seq=next_seq,
-                    status="failed",
-                    steps=0,
-                    duration_ms=0,
-                    error=ORPHAN_MESSAGE,
-                )
-            )
-        await self.db.execute(
-            "UPDATE runs SET status='failed', finished_at=?, error=?"
-            " WHERE status IN ('pending','running','awaiting_approval')",
-            (_now(), ORPHAN_MESSAGE),
-        )
-        await self.db.commit()
-        log.warning("reaped orphaned runs", extra={"count": len(orphans)})
-        return len(orphans)
-
-    @staticmethod
-    def _row_to_run(row: aiosqlite.Row) -> RunRecord:
-        return RunRecord(
-            id=row["id"],
-            task=row["task"],
-            start_url=row["start_url"],
-            status=row["status"],
-            options=_loads(row["options"], {}),
-            created_at=row["created_at"],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
-            steps=row["steps"] or 0,
-            duration_ms=row["duration_ms"],
-            summary=row["summary"],
-            result=_loads(row["result"]),
-            error=row["error"],
-        )
+        async with self._sessions() as session:
+            stmt = select(func.count()).select_from(Run).where(Run.workspace_id == self._ws)
+            if status:
+                stmt = stmt.where(Run.status == status)
+            return int(await session.scalar(stmt) or 0)
 
     # -- events -------------------------------------------------------------
     async def append_event(self, event: AgentEvent) -> None:
@@ -444,33 +431,56 @@ class Store:
         so replay after a reconnect yields the final text exactly once.
         """
         payload = dump_event(event)
-        await self.db.execute(
-            "INSERT INTO events (run_id, seq, ts, type, payload) VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(run_id, seq) DO UPDATE SET ts=excluded.ts, payload=excluded.payload",
-            (event.run_id, event.seq, event.ts, payload["type"], json.dumps(payload)),
+        stmt = pg_insert(Event).values(
+            run_id=event.run_id,
+            seq=event.seq,
+            ts=utcnow(),
+            type=payload["type"],
+            payload=payload,
         )
-        await self.db.commit()
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Event.run_id, Event.seq],
+            set_={"ts": stmt.excluded.ts, "payload": stmt.excluded.payload},
+        )
+        async with self._sessions() as session:
+            await session.execute(stmt)
+            await session.commit()
 
     async def get_events(
         self, run_id: str, after_seq: int = 0, limit: int = 5000
     ) -> list[AgentEvent]:
-        async with self.db.execute(
-            "SELECT payload FROM events WHERE run_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
-            (run_id, after_seq, limit),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [parse_event(json.loads(row["payload"])) for row in rows]
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(Event)
+                    .join(Run, Run.id == Event.run_id)
+                    .where(
+                        Event.run_id == run_id,
+                        Event.seq > after_seq,
+                        Run.workspace_id == self._ws,
+                    )
+                    .order_by(Event.seq.asc())
+                    .limit(limit)
+                )
+            ).all()
+            return [parse_event(row.payload) for row in rows]
 
     async def next_seq(self, run_id: str) -> int:
-        async with self.db.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM events WHERE run_id=?", (run_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["max_seq"]) + 1
-
+        async with self._sessions() as session:
+            highest = await session.scalar(
+                select(func.coalesce(func.max(Event.seq), 0)).where(Event.run_id == run_id)
+            )
+            return int(highest or 0) + 1
 
     # -- use cases ----------------------------------------------------------
-    async def save_usecase(self, definition: dict[str, Any], *, created_by: str | None = None) -> tuple[str, int]:
+    async def save_usecase(
+        self,
+        definition: dict[str, Any],
+        *,
+        created_by: str | None = None,
+        created_by_id: str | None = None,
+        owner_id: str | None = None,
+    ) -> tuple[str, int]:
         """Insert a use case, or append a new version of an existing one.
 
         Returns ``(usecase_id, version)``. Versions are append-only: an edit
@@ -480,85 +490,134 @@ class Store:
         name = str(definition.get("name") or "Untitled")
         description = str(definition.get("description") or "")
         status = str(definition.get("status") or "draft")
-        now = _now()
+        now = utcnow()
 
-        async with self.db.execute(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM usecase_versions WHERE usecase_id=?",
-            (usecase_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        version = int(row["v"]) + 1
+        async with self._sessions() as session:
+            # Scoped: appending a version to another tenant's use case would
+            # otherwise be possible by supplying its id.
+            owner_ws = await session.scalar(
+                select(UseCase.workspace_id).where(UseCase.id == usecase_id)
+            )
+            if owner_ws is not None and owner_ws != self._ws:
+                raise PermissionError("That use case belongs to another workspace.")
 
-        stored = {**definition, "version": version, "updated_at": now}
-        await self.db.execute(
-            "INSERT INTO usecase_versions (usecase_id, version, definition, created_at, created_by)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (usecase_id, version, json.dumps(stored), now, created_by),
-        )
-        await self.db.execute(
-            "INSERT INTO usecases (id, name, description, status, current_version, source_run_id,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description,"
-            " status=excluded.status, current_version=excluded.current_version,"
-            " updated_at=excluded.updated_at",
-            (
-                usecase_id,
-                name,
-                description,
-                status,
-                version,
-                definition.get("source_run_id"),
-                now,
-                now,
-            ),
-        )
-        await self.db.commit()
-        return usecase_id, version
+            latest = await session.scalar(
+                select(func.coalesce(func.max(UseCaseVersion.version), 0)).where(
+                    UseCaseVersion.usecase_id == usecase_id
+                )
+            )
+            version = int(latest or 0) + 1
+            stored = {**definition, "version": version, "updated_at": iso(now)}
 
-    async def get_usecase(self, usecase_id: str, version: int | None = None) -> dict[str, Any] | None:
+            upsert = pg_insert(UseCase).values(
+                id=usecase_id,
+                workspace_id=self._ws,
+                owner_id=owner_id,
+                name=name,
+                description=description,
+                status=status,
+                current_version=version,
+                source_run_id=definition.get("source_run_id"),
+                created_at=now,
+                updated_at=now,
+            )
+            await session.execute(
+                upsert.on_conflict_do_update(
+                    index_elements=[UseCase.id],
+                    set_={
+                        "name": upsert.excluded.name,
+                        "description": upsert.excluded.description,
+                        "status": upsert.excluded.status,
+                        "current_version": upsert.excluded.current_version,
+                        "updated_at": upsert.excluded.updated_at,
+                    },
+                )
+            )
+            session.add(
+                UseCaseVersion(
+                    usecase_id=usecase_id,
+                    version=version,
+                    definition=stored,
+                    created_at=now,
+                    created_by=created_by,
+                    created_by_id=created_by_id,
+                )
+            )
+            await session.commit()
+            return usecase_id, version
+
+    async def get_usecase(
+        self, usecase_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
         """One stored definition. ``version=None`` means the current one."""
-        if version is None:
-            async with self.db.execute(
-                "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row is None:
-                return None
-            version = int(row["v"])
+        async with self._sessions() as session:
+            if version is None:
+                version = await session.scalar(
+                    select(UseCase.current_version).where(
+                        UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                    )
+                )
+                if version is None:
+                    return None
+            else:
+                # A caller naming an explicit version still may not read
+                # across the tenant boundary.
+                exists = await session.scalar(
+                    select(UseCase.id).where(
+                        UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                    )
+                )
+                if exists is None:
+                    return None
 
-        async with self.db.execute(
-            "SELECT definition FROM usecase_versions WHERE usecase_id=? AND version=?",
-            (usecase_id, version),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return _loads(row["definition"]) if row else None
+            return await session.scalar(
+                select(UseCaseVersion.definition).where(
+                    UseCaseVersion.usecase_id == usecase_id,
+                    UseCaseVersion.version == version,
+                )
+            )
+
+    async def get_usecase_row(self, usecase_id: str) -> dict[str, Any] | None:
+        """The summary row, including the script-permission fields."""
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(UseCase).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
+            )
+            return _usecase_dict(row) if row else None
 
     async def list_usecases(
         self, *, status: str | None = None, limit: int = 50, offset: int = 0
     ) -> list[dict[str, Any]]:
         """Summary rows for the list view -- not the full definitions."""
-        sql = (
-            "SELECT id, name, description, status, current_version, source_run_id,"
-            " created_at, updated_at FROM usecases"
-        )
-        params: list[Any] = []
-        if status:
-            sql += " WHERE status=?"
-            params.append(status)
-        sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        async with self.db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        async with self._sessions() as session:
+            stmt = select(UseCase).where(UseCase.workspace_id == self._ws)
+            if status:
+                stmt = stmt.where(UseCase.status == status)
+            stmt = stmt.order_by(UseCase.updated_at.desc()).limit(limit).offset(offset)
+            return [_usecase_dict(row) for row in (await session.scalars(stmt)).all()]
 
     async def list_usecase_versions(self, usecase_id: str) -> list[dict[str, Any]]:
-        async with self.db.execute(
-            "SELECT version, created_at, created_by FROM usecase_versions"
-            " WHERE usecase_id=? ORDER BY version DESC",
-            (usecase_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        UseCaseVersion.version,
+                        UseCaseVersion.created_at,
+                        UseCaseVersion.created_by,
+                    )
+                    .join(UseCase, UseCase.id == UseCaseVersion.usecase_id)
+                    .where(
+                        UseCaseVersion.usecase_id == usecase_id,
+                        UseCase.workspace_id == self._ws,
+                    )
+                    .order_by(UseCaseVersion.version.desc())
+                )
+            ).all()
+            return [
+                {"version": v, "created_at": iso(c), "created_by": by} for v, c, by in rows
+            ]
 
     async def set_usecase_status(self, usecase_id: str, status: str) -> bool:
         """Move a use case between draft / ready / archived.
@@ -566,26 +625,30 @@ class Store:
         Also rewrites the status inside the current stored definition, so a
         definition read back on its own still reports the truth.
         """
-        definition = await self.get_usecase(usecase_id)
-        if definition is None:
-            return False
+        async with self._sessions() as session:
+            usecase = await session.scalar(
+                select(UseCase).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
+            )
+            if usecase is None:
+                return False
 
-        definition["status"] = status
-        async with self.db.execute(
-            "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        version = int(row["v"])
+            version_row = await session.scalar(
+                select(UseCaseVersion).where(
+                    UseCaseVersion.usecase_id == usecase_id,
+                    UseCaseVersion.version == usecase.current_version,
+                )
+            )
+            if version_row is not None:
+                # JSONB columns are only marked dirty on rebind, so replace the
+                # dict rather than mutating it in place.
+                version_row.definition = {**(version_row.definition or {}), "status": status}
 
-        await self.db.execute(
-            "UPDATE usecase_versions SET definition=? WHERE usecase_id=? AND version=?",
-            (json.dumps(definition), usecase_id, version),
-        )
-        await self.db.execute(
-            "UPDATE usecases SET status=?, updated_at=? WHERE id=?", (status, _now(), usecase_id)
-        )
-        await self.db.commit()
-        return True
+            usecase.status = status
+            usecase.updated_at = utcnow()
+            await session.commit()
+            return True
 
     async def rename_usecase(
         self, usecase_id: str, name: str, description: str | None = None
@@ -597,29 +660,56 @@ class Store:
         differently because of it -- so renaming appends no version and the
         history stays a record of behaviour rather than of typos.
         """
-        definition = await self.get_usecase(usecase_id)
-        if definition is None:
-            return False
+        async with self._sessions() as session:
+            usecase = await session.scalar(
+                select(UseCase).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
+            )
+            if usecase is None:
+                return False
 
-        definition["name"] = name
-        if description is not None:
-            definition["description"] = description
+            version_row = await session.scalar(
+                select(UseCaseVersion).where(
+                    UseCaseVersion.usecase_id == usecase_id,
+                    UseCaseVersion.version == usecase.current_version,
+                )
+            )
+            if version_row is not None:
+                definition = {**(version_row.definition or {}), "name": name}
+                if description is not None:
+                    definition["description"] = description
+                version_row.definition = definition
+                usecase.description = definition.get("description", "")
 
-        async with self.db.execute(
-            "SELECT current_version AS v FROM usecases WHERE id=?", (usecase_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+            usecase.name = name
+            usecase.updated_at = utcnow()
+            await session.commit()
+            return True
 
-        await self.db.execute(
-            "UPDATE usecase_versions SET definition=? WHERE usecase_id=? AND version=?",
-            (json.dumps(definition), usecase_id, int(row["v"])),
-        )
-        await self.db.execute(
-            "UPDATE usecases SET name=?, description=?, updated_at=? WHERE id=?",
-            (name, definition.get("description", ""), _now(), usecase_id),
-        )
-        await self.db.commit()
-        return True
+    async def set_scripts_enabled(
+        self, usecase_id: str, enabled: bool, *, actor_id: str | None
+    ) -> bool:
+        """Permit (or withdraw permission for) script steps on a use case.
+
+        Recorded on the resource with who and when, because this is the one
+        setting that lets a use case run arbitrary JavaScript inside a session
+        holding somebody else's credentials.
+        """
+        async with self._sessions() as session:
+            usecase = await session.scalar(
+                select(UseCase).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
+            )
+            if usecase is None:
+                return False
+            usecase.scripts_enabled = enabled
+            usecase.scripts_enabled_by = actor_id if enabled else None
+            usecase.scripts_enabled_at = utcnow() if enabled else None
+            usecase.updated_at = utcnow()
+            await session.commit()
+            return True
 
     async def delete_usecase(self, usecase_id: str) -> bool:
         """Archive: hide it from the active list but keep every reference intact."""
@@ -630,82 +720,121 @@ class Store:
 
         The runs and events those executions produced are deliberately left
         alone: they are the timeline of things that actually happened to a
-        browser, and they stay meaningful — and auditable — after the recipe
+        browser, and they stay meaningful -- and auditable -- after the recipe
         that caused them is gone.
 
         Returns the row counts removed, or ``None`` if there was no such use
-        case.
+        case in this workspace.
         """
-        if await self.get_usecase(usecase_id) is None:
-            return None
-
-        removed: dict[str, int] = {}
-        for table in ("executions", "batches", "usecase_versions", "usecases"):
-            column = "id" if table == "usecases" else "usecase_id"
-            cursor = await self.db.execute(
-                f"DELETE FROM {table} WHERE {column}=?", (usecase_id,)
+        async with self._sessions() as session:
+            exists = await session.scalar(
+                select(UseCase.id).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
             )
-            removed[table] = cursor.rowcount
-        await self.db.commit()
+            if exists is None:
+                return None
+
+            removed: dict[str, int] = {}
+            for table, model, column in (
+                ("executions", Execution, Execution.usecase_id),
+                ("batches", Batch, Batch.usecase_id),
+                ("usecase_versions", UseCaseVersion, UseCaseVersion.usecase_id),
+            ):
+                result = await session.execute(delete(model).where(column == usecase_id))
+                removed[table] = int(result.rowcount or 0)
+            result = await session.execute(
+                delete(UseCase).where(
+                    UseCase.id == usecase_id, UseCase.workspace_id == self._ws
+                )
+            )
+            removed["usecases"] = int(result.rowcount or 0)
+            await session.commit()
+
         log.info("purged a use case", extra={"usecase_id": usecase_id, **removed})
         return removed
 
-
     # -- credentials --------------------------------------------------------
     async def save_credential(
-        self, credential_id: str, name: str, slots: list[str], ciphertext: bytes
+        self,
+        credential_id: str,
+        name: str,
+        slots: list[str],
+        ciphertext: bytes,
+        *,
+        owner_id: str | None = None,
     ) -> str:
         """Store an encrypted credential bundle. Re-saving a name replaces it.
 
         Only ciphertext lands here; see ``credentials.py`` for why there is no
         method to read a value back out over HTTP.
         """
-        await self.db.execute(
-            "INSERT INTO credentials (id, name, slots, ciphertext, created_at)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(name) DO UPDATE SET slots=excluded.slots,"
-            " ciphertext=excluded.ciphertext",
-            (credential_id, name, json.dumps(slots), ciphertext, _now()),
-        )
-        await self.db.commit()
-        async with self.db.execute("SELECT id FROM credentials WHERE name=?", (name,)) as cursor:
-            row = await cursor.fetchone()
-        return row["id"]
+        async with self._sessions() as session:
+            stmt = pg_insert(Credential).values(
+                id=credential_id,
+                workspace_id=self._ws,
+                owner_id=owner_id,
+                name=name,
+                slots=slots,
+                ciphertext=ciphertext,
+                created_at=utcnow(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                # Per workspace, so two tenants may both have "IXL account".
+                index_elements=[Credential.workspace_id, Credential.name],
+                set_={"slots": stmt.excluded.slots, "ciphertext": stmt.excluded.ciphertext},
+            ).returning(Credential.id)
+            stored_id = await session.scalar(stmt)
+            await session.commit()
+            return stored_id or credential_id
 
     async def get_credential_ciphertext(self, credential_id: str) -> bytes | None:
-        async with self.db.execute(
-            "SELECT ciphertext FROM credentials WHERE id=?", (credential_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        return row["ciphertext"] if row else None
+        async with self._sessions() as session:
+            return await session.scalar(
+                select(Credential.ciphertext).where(
+                    Credential.id == credential_id, Credential.workspace_id == self._ws
+                )
+            )
 
     async def list_credentials(self) -> list[dict[str, Any]]:
         """Names and slot lists only -- never a value."""
-        async with self.db.execute(
-            "SELECT id, name, slots, created_at, last_used_at FROM credentials ORDER BY name"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [
-            {
-                "id": row["id"],
-                "name": row["name"],
-                "slots": _loads(row["slots"], []),
-                "created_at": row["created_at"],
-                "last_used_at": row["last_used_at"],
-            }
-            for row in rows
-        ]
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(Credential)
+                    .where(Credential.workspace_id == self._ws)
+                    .order_by(Credential.name)
+                )
+            ).all()
+            return [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "slots": row.slots or [],
+                    "created_at": iso(row.created_at),
+                    "last_used_at": iso(row.last_used_at),
+                }
+                for row in rows
+            ]
 
     async def touch_credential(self, credential_id: str) -> None:
-        await self.db.execute(
-            "UPDATE credentials SET last_used_at=? WHERE id=?", (_now(), credential_id)
-        )
-        await self.db.commit()
+        async with self._sessions() as session:
+            await session.execute(
+                update(Credential)
+                .where(Credential.id == credential_id, Credential.workspace_id == self._ws)
+                .values(last_used_at=utcnow())
+            )
+            await session.commit()
 
     async def delete_credential(self, credential_id: str) -> bool:
-        cursor = await self.db.execute("DELETE FROM credentials WHERE id=?", (credential_id,))
-        await self.db.commit()
-        return cursor.rowcount > 0
+        async with self._sessions() as session:
+            result = await session.execute(
+                delete(Credential).where(
+                    Credential.id == credential_id, Credential.workspace_id == self._ws
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     # -- executions ---------------------------------------------------------
     async def create_execution(
@@ -719,21 +848,21 @@ class Store:
         row_index: int | None = None,
         inputs: dict[str, Any] | None = None,
     ) -> None:
-        await self.db.execute(
-            "INSERT INTO executions (id, batch_id, usecase_id, version, run_id, row_index,"
-            " inputs, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (
-                execution_id,
-                batch_id,
-                usecase_id,
-                version,
-                run_id,
-                row_index,
-                json.dumps(inputs or {}),
-                _now(),
-            ),
-        )
-        await self.db.commit()
+        async with self._sessions() as session:
+            session.add(
+                Execution(
+                    id=execution_id,
+                    workspace_id=self._ws,
+                    batch_id=batch_id,
+                    usecase_id=usecase_id,
+                    version=version,
+                    run_id=run_id,
+                    row_index=row_index,
+                    inputs=inputs or {},
+                    status="pending",
+                )
+            )
+            await session.commit()
 
     async def finish_execution(
         self,
@@ -747,69 +876,44 @@ class Store:
         llm_calls: int = 0,
         llm_tokens: int = 0,
     ) -> None:
-        await self.db.execute(
-            "UPDATE executions SET status=?, outputs=?, failed_step_id=?, error=?,"
-            " duration_ms=?, llm_calls=?, llm_tokens=? WHERE id=?",
-            (
-                status,
-                json.dumps(outputs) if outputs is not None else None,
-                failed_step_id,
-                error,
-                duration_ms,
-                llm_calls,
-                llm_tokens,
-                execution_id,
-            ),
-        )
-        await self.db.commit()
+        async with self._sessions() as session:
+            await session.execute(
+                update(Execution)
+                .where(Execution.id == execution_id, Execution.workspace_id == self._ws)
+                .values(
+                    status=status,
+                    outputs=outputs,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    duration_ms=duration_ms,
+                    llm_calls=llm_calls,
+                    llm_tokens=llm_tokens,
+                )
+            )
+            await session.commit()
 
     async def get_execution(self, execution_id: str) -> dict[str, Any] | None:
-        async with self.db.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_execution(row) if row else None
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Execution).where(
+                    Execution.id == execution_id, Execution.workspace_id == self._ws
+                )
+            )
+            return _execution_dict(row) if row else None
 
     async def list_executions(
         self, *, batch_id: str | None = None, usecase_id: str | None = None, limit: int = 500
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM executions"
-        clauses: list[str] = []
-        params: list[Any] = []
-        if batch_id:
-            clauses.append("batch_id=?")
-            params.append(batch_id)
-        if usecase_id:
-            clauses.append("usecase_id=?")
-            params.append(usecase_id)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY COALESCE(row_index, 0) ASC, created_at ASC LIMIT ?"
-        params.append(limit)
-        async with self.db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-        return [self._row_to_execution(row) for row in rows]
-
-    @staticmethod
-    def _row_to_execution(row: aiosqlite.Row) -> dict[str, Any]:
-        return {
-            "id": row["id"],
-            "batch_id": row["batch_id"],
-            "usecase_id": row["usecase_id"],
-            "version": row["version"],
-            "run_id": row["run_id"],
-            "row_index": row["row_index"],
-            "inputs": _loads(row["inputs"], {}),
-            "outputs": _loads(row["outputs"]),
-            "status": row["status"],
-            "failed_step_id": row["failed_step_id"],
-            "error": row["error"],
-            "llm_calls": row["llm_calls"],
-            "llm_tokens": row["llm_tokens"],
-            "duration_ms": row["duration_ms"],
-            "created_at": row["created_at"],
-        }
-
+        async with self._sessions() as session:
+            stmt = select(Execution).where(Execution.workspace_id == self._ws)
+            if batch_id:
+                stmt = stmt.where(Execution.batch_id == batch_id)
+            if usecase_id:
+                stmt = stmt.where(Execution.usecase_id == usecase_id)
+            stmt = stmt.order_by(
+                func.coalesce(Execution.row_index, 0).asc(), Execution.created_at.asc()
+            ).limit(limit)
+            return [_execution_dict(row) for row in (await session.scalars(stmt)).all()]
 
     # -- batches ------------------------------------------------------------
     async def create_batch(
@@ -820,13 +924,22 @@ class Store:
         *,
         total: int,
         credential_id: str | None = None,
+        owner_id: str | None = None,
     ) -> None:
-        await self.db.execute(
-            "INSERT INTO batches (id, usecase_id, version, status, total, credential_id,"
-            " created_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
-            (batch_id, usecase_id, version, total, credential_id, _now()),
-        )
-        await self.db.commit()
+        async with self._sessions() as session:
+            session.add(
+                Batch(
+                    id=batch_id,
+                    workspace_id=self._ws,
+                    owner_id=owner_id,
+                    usecase_id=usecase_id,
+                    version=version,
+                    status="pending",
+                    total=total,
+                    credential_id=credential_id,
+                )
+            )
+            await session.commit()
 
     async def update_batch(
         self,
@@ -838,46 +951,45 @@ class Store:
         error: str | None = None,
         finished: bool = False,
     ) -> None:
-        assignments: list[str] = []
-        params: list[Any] = []
-        for column, value in (
-            ("status", status),
-            ("succeeded", succeeded),
-            ("failed", failed),
-            ("error", error),
-        ):
-            if value is not None:
-                assignments.append(f"{column}=?")
-                params.append(value)
+        values: dict[str, Any] = {
+            column: value
+            for column, value in (
+                ("status", status),
+                ("succeeded", succeeded),
+                ("failed", failed),
+                ("error", error),
+            )
+            if value is not None
+        }
         if finished:
-            assignments.append("finished_at=?")
-            params.append(_now())
-        if not assignments:
+            values["finished_at"] = utcnow()
+        if not values:
             return
-        params.append(batch_id)
-        await self.db.execute(
-            f"UPDATE batches SET {', '.join(assignments)} WHERE id=?", params
-        )
-        await self.db.commit()
+
+        async with self._sessions() as session:
+            await session.execute(
+                update(Batch)
+                .where(Batch.id == batch_id, Batch.workspace_id == self._ws)
+                .values(**values)
+            )
+            await session.commit()
 
     async def get_batch(self, batch_id: str) -> dict[str, Any] | None:
-        async with self.db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)) as cursor:
-            row = await cursor.fetchone()
-        return dict(row) if row else None
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Batch).where(Batch.id == batch_id, Batch.workspace_id == self._ws)
+            )
+            return _batch_dict(row) if row else None
 
     async def list_batches(
         self, *, usecase_id: str | None = None, limit: int = 50
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM batches"
-        params: list[Any] = []
-        if usecase_id:
-            sql += " WHERE usecase_id=?"
-            params.append(usecase_id)
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-        async with self.db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        async with self._sessions() as session:
+            stmt = select(Batch).where(Batch.workspace_id == self._ws)
+            if usecase_id:
+                stmt = stmt.where(Batch.usecase_id == usecase_id)
+            stmt = stmt.order_by(Batch.created_at.desc()).limit(limit)
+            return [_batch_dict(row) for row in (await session.scalars(stmt)).all()]
 
     # -- artifacts ----------------------------------------------------------
     async def save_artifact(
@@ -896,58 +1008,128 @@ class Store:
         path = directory / f"{artifact_id}{suffix}"
         path.write_bytes(data)
 
-        record = ArtifactRecord(
-            id=artifact_id,
-            run_id=run_id,
-            seq=seq,
-            kind=kind,
-            mime=mime,
-            path=str(path),
-            bytes=len(data),
-            created_at=_now(),
-        )
-        await self.db.execute(
-            "INSERT INTO artifacts (id, run_id, seq, kind, mime, path, bytes, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                record.id,
-                record.run_id,
-                record.seq,
-                record.kind,
-                record.mime,
-                record.path,
-                record.bytes,
-                record.created_at,
-            ),
-        )
-        await self.db.commit()
-        return record
+        async with self._sessions() as session:
+            row = Artifact(
+                id=artifact_id,
+                run_id=run_id,
+                workspace_id=self._ws,
+                seq=seq,
+                kind=kind,
+                mime=mime,
+                path=str(path),
+                bytes=len(data),
+            )
+            session.add(row)
+            await session.commit()
+            return _artifact_record(row)
 
     async def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
-        async with self.db.execute(
-            "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if not row:
-            return None
-        return self._row_to_artifact(row)
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Artifact).where(
+                    Artifact.id == artifact_id, Artifact.workspace_id == self._ws
+                )
+            )
+            return _artifact_record(row) if row else None
 
     async def list_artifacts(self, run_id: str) -> Sequence[ArtifactRecord]:
-        async with self.db.execute(
-            "SELECT * FROM artifacts WHERE run_id=? ORDER BY created_at ASC", (run_id,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [self._row_to_artifact(row) for row in rows]
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(Artifact)
+                    .where(Artifact.run_id == run_id, Artifact.workspace_id == self._ws)
+                    .order_by(Artifact.created_at.asc())
+                )
+            ).all()
+            return [_artifact_record(row) for row in rows]
 
-    @staticmethod
-    def _row_to_artifact(row: aiosqlite.Row) -> ArtifactRecord:
-        return ArtifactRecord(
-            id=row["id"],
-            run_id=row["run_id"],
-            seq=row["seq"],
-            kind=row["kind"],
-            mime=row["mime"],
-            path=row["path"],
-            bytes=row["bytes"],
-            created_at=row["created_at"],
-        )
+    # -- audit --------------------------------------------------------------
+    async def audit(
+        self,
+        action: str,
+        *,
+        actor_id: str | None,
+        actor_email: str = "",
+        resource_type: str = "",
+        resource_id: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record something a person did.
+
+        Never raises. An audit write that fails must not take down the
+        operation it was describing -- losing one line of the trail is bad, but
+        rolling back a completed publish because the log was unavailable is
+        worse, and would make the log a single point of failure for the whole
+        application.
+        """
+        try:
+            async with self._sessions() as session:
+                session.add(
+                    AuditLogEntry(
+                        workspace_id=self._ws,
+                        actor_id=actor_id,
+                        actor_email=actor_email,
+                        action=action,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        detail=detail or {},
+                    )
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001 - see docstring
+            log.exception("failed to write an audit entry", extra={"action": action})
+
+    async def list_audit(
+        self,
+        *,
+        resource_type: str | None = None,
+        resource_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        async with self._sessions() as session:
+            stmt = select(AuditLogEntry).where(AuditLogEntry.workspace_id == self._ws)
+            if resource_type:
+                stmt = stmt.where(AuditLogEntry.resource_type == resource_type)
+            if resource_id:
+                stmt = stmt.where(AuditLogEntry.resource_id == resource_id)
+            stmt = stmt.order_by(AuditLogEntry.created_at.desc()).limit(limit)
+            rows = (await session.scalars(stmt)).all()
+            return [
+                {
+                    "id": row.id,
+                    "actor_id": row.actor_id,
+                    "actor_email": row.actor_email,
+                    "action": row.action,
+                    "resource_type": row.resource_type,
+                    "resource_id": row.resource_id,
+                    "detail": row.detail or {},
+                    "created_at": iso(row.created_at),
+                }
+                for row in rows
+            ]
+
+
+def _usecase_dict(row: UseCase) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "description": row.description,
+        "status": row.status,
+        "current_version": row.current_version,
+        "source_run_id": row.source_run_id,
+        "scripts_enabled": row.scripts_enabled,
+        "scripts_enabled_by": row.scripts_enabled_by,
+        "scripts_enabled_at": iso(row.scripts_enabled_at),
+        "owner_id": row.owner_id,
+        "created_at": iso(row.created_at),
+        "updated_at": iso(row.updated_at),
+    }
+
+
+__all__ = [
+    "ArtifactRecord",
+    "ORPHAN_MESSAGE",
+    "RunRecord",
+    "Store",
+    "WorkspaceStore",
+]

@@ -1,0 +1,149 @@
+# Continuous integration.
+#
+# The project had 608 tests and nothing that ran them, which meant the suite
+# only told you something when a person remembered to ask. Everything below is
+# cheap and runs on every push.
+#
+# The secret scan is the manual `git grep` habit this project has relied on,
+# automated -- it caught a real password moments before a commit once, and a
+# habit that depends on remembering is not a control.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  NODE_VERSION: "20"
+
+jobs:
+  backend:
+    name: Backend (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lower bound the project claims to support, and the version it is
+        # developed on. Anything in between is covered by implication.
+        python: ["3.11", "3.13"]
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Without this the job races the database and fails on connection
+        # refused roughly one run in three.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Check migrations match the models
+        # Autogenerate against an up-to-date database must produce nothing. A
+        # model changed without a migration is the failure this catches, and
+        # it is otherwise found in production.
+        working-directory: backend
+        env:
+          DB_HOST: localhost
+          DB_PASSWORD: postgres
+          DB_SCHEMA: browser_ci
+        run: |
+          python -m alembic upgrade head
+          python -m alembic check
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          TEST_DB_HOST: localhost
+          TEST_DB_PASSWORD: postgres
+          TEST_DB_SCHEMA: browser_test
+          DB_SCHEMA: browser_test
+        run: python -m pytest -q --maxfail=5
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        # `npm ci` fails if package-lock.json and package.json disagree, which
+        # is the point -- it is the lockfile enforcement the review asked for.
+        run: npm ci
+
+      - name: Type-check
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Scan the history a push adds, not just the tip.
+          fetch-depth: 0
+
+      - name: Look for credentials in tracked files
+        run: |
+          set -euo pipefail
+          patterns=(
+            'sk-ant-[A-Za-z0-9_-]{20,}'
+            'AKIA[0-9A-Z]{16}'
+            'gh[pousr]_[A-Za-z0-9]{20,}'
+            'AWS_BEARER_TOKEN_BEDROCK=[A-Za-z0-9]'
+            '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          )
+          found=0
+          for pattern in "${patterns[@]}"; do
+            if git grep -nEI "$pattern" -- . ':(exclude).github/workflows/ci.yml'; then
+              echo "::error::A value matching /$pattern/ is committed."
+              found=1
+            fi
+          done
+          # Files that should never be tracked at all.
+          for path in .env .venv node_modules data artifacts; do
+            if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              echo "::error::$path is tracked and must not be."
+              found=1
+            fi
+          done
+          if [ "$found" -ne 0 ]; then exit 1; fi
+          echo "No credentials found in tracked files."

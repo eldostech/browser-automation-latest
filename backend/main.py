@@ -1,148 +1,56 @@
-"""FastAPI application: the only thing the frontend talks to.
+"""FastAPI application assembly.
 
-The LLM API key never leaves this process and never appears in a URL. The
+This module wires things together and does nothing else. The endpoints live in
+``routers/``, the logic between HTTP and storage in ``services.py``, and the
+dependency graph in ``deps.py``.
+
+The LLM credentials never leave this process and never appear in a URL. The
 frontend sends a task; the backend decides what the browser does.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Literal
 
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-    Query,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from agent import RunOptions
-from batch import (
-    BatchInputError,
-    parse_csv,
-    parse_workbook,
-    results_csv,
-    rows_from_json,
-    validate_rows,
-)
-from config import Settings, settings
-from credentials import (
-    NO_KEY_MESSAGE,
-    Vault,
-    VaultError,
-    VaultUnavailable,
-    new_credential_id,
-)
-from distill import DistillationError, distill
-from events import TERMINAL_STATUSES, dump_event
-from llm import PROVIDER, llm_health
+from auth.service import AuthService
+from bus import build_bus
+from checkpoints import Checkpointer
+from config import Settings, get_settings
+from credentials import Vault
+from jobs import JobQueue
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
-from repair import (
-    RepairError,
-    UseCaseDoctor,
-    apply_fixes,
-    candidates,
-    gather_context,
-    is_unchanged,
-    validate_patched,
-)
-from runner import (
-    BatchRequest,
-    EventBus,
-    ExecutionBusy,
-    ExecutionRequest,
-    ReplayManager,
-    RunManager,
-    RunRequest,
-)
+from routers import ALL_ROUTERS
+from runner import ReplayManager, RunManager
 from store import Store
-from usecase import UseCase
 
 log = logging.getLogger(__name__)
 
-#: Non-event transport frame used to keep idle proxies from closing the socket.
-#: Clients ignore any message whose ``type`` starts with ``__``.
-HEARTBEAT = {"type": "__heartbeat__"}
-HEARTBEAT_INTERVAL = 20.0
 
-#: How long a cached MCP connectivity result is considered fresh.
-HEALTH_CACHE_TTL = 60.0
+async def _fetch_event_for_bus(app: FastAPI, run_id: str, seq: int):
+    """Read one event by ``(run_id, seq)`` for the cross-process bus.
 
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-
-class CreateRunRequest(BaseModel):
-    task: str = Field(min_length=1, max_length=8000)
-    start_url: str | None = None
-
-    # Guardrail overrides; anything omitted falls back to the server defaults.
-    max_steps: int | None = Field(default=None, ge=1, le=200)
-    timeout_seconds: float | None = Field(default=None, ge=10, le=3600)
-    allowed_domains: list[str] | None = None
-    require_approval: bool | None = None
-    screenshot_every_step: bool | None = None
-
-    # Browser overrides.
-    headless: bool | None = None
-    browser: str | None = None
-
-    #: Values to keep out of the event log, the database and the logs. Anything
-    #: listed here is replaced with a placeholder wherever it appears -- in the
-    #: task text, in a tool argument, in a tool result echoing it back, or in
-    #: the model's own prose. Write-only: never returned by any endpoint.
-    secrets: list[str] | None = None
-
-    @field_validator("start_url")
-    @classmethod
-    def _validate_url(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        value = value.strip()
-        if not value.startswith(("http://", "https://")):
-            raise ValueError("start_url must begin with http:// or https://")
-        return value
-
-    @field_validator("allowed_domains")
-    @classmethod
-    def _clean_domains(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return None
-        return [d.strip() for d in value if d and d.strip()]
-
-
-class ApprovalRequest(BaseModel):
-    decision: Literal["approve", "reject"]
-    approval_id: str | None = None
-    note: str | None = Field(default=None, max_length=1000)
-
-
-class CreateRunResponse(BaseModel):
-    run_id: str
-    status: str
-
-
-# ---------------------------------------------------------------------------
-# Application wiring
-# ---------------------------------------------------------------------------
+    The bus is handed this rather than a Store because it must not care which
+    workspace a run belongs to: it is delivering to a subscriber who has
+    already been authorised for that run.
+    """
+    store: Store = app.state.store
+    workspace_id = await store.default_workspace_id()
+    if workspace_id is None:
+        return None
+    events = await store.workspace(workspace_id).get_events(run_id, after_seq=seq - 1, limit=1)
+    return events[0] if events else None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings: Settings = getattr(app.state, "settings", None) or get_settings()
     configure_logging(settings.log_level)
     log.info(
         "starting backend",
@@ -150,19 +58,54 @@ async def lifespan(app: FastAPI):
             "models": settings.models_in_use,
             "mcp_transport": settings.mcp_transport,
             "allowed_domains": settings.agent_allowed_domains,
+            "db_schema": settings.db_schema,
         },
     )
 
-    store = Store(settings.db_path, settings.artifacts_path)
+    store = Store(settings)
     await store.connect()
-    reaped = await store.reap_orphaned_runs()
-    if reaped:
-        log.warning("marked interrupted runs as failed", extra={"count": reaped})
 
     app.state.settings = settings
     app.state.store = store
-    app.state.bus = EventBus()
-    app.state.manager = RunManager(store, settings, bus=app.state.bus)
+    app.state.auth = AuthService(store.sessions, settings)
+    app.state.queue = JobQueue(store.sessions)
+
+    # A deployment must have an administrator to be reachable at all.
+    generated = await app.state.auth.bootstrap()
+    if generated:
+        # Printed once, and only on the boot that created the account. There is
+        # no way to retrieve it afterwards -- only bcrypt output is stored.
+        log.warning(
+            "=" * 72
+            + f"\nCreated the first administrator: {settings.bootstrap_admin_email}"
+            + f"\nOne-time password: {generated}"
+            + "\nSign in and change it. This will not be shown again.\n"
+            + "=" * 72
+        )
+
+    reaped = await store.reap_orphaned_runs()
+    if reaped:
+        log.warning("marked interrupted runs as failed", extra={"count": reaped})
+    reclaimed = await app.state.queue.reclaim_expired()
+    if reclaimed:
+        log.warning("requeued jobs from a stopped worker", extra={"count": reclaimed})
+
+    app.state.bus = build_bus(
+        settings,
+        lambda run_id, seq: _fetch_event_for_bus(app, run_id, seq),
+    )
+    await app.state.bus.start()
+
+    # Opened before the manager, which hands the saver to every graph it
+    # compiles. Held for the life of the process.
+    checkpointer = Checkpointer(settings)
+    await checkpointer.__aenter__()
+    app.state.checkpointer = checkpointer
+    log.info("agent checkpointing", extra={"backend": checkpointer.backend})
+
+    app.state.manager = RunManager(
+        store, settings, bus=app.state.bus, checkpointer=checkpointer.saver
+    )
     app.state.vault = Vault(settings.credentials_key or None)
     # The healer is the only route from a replay to a model, and it is handed
     # over lazily and only when healing is switched on.
@@ -178,18 +121,20 @@ async def lifespan(app: FastAPI):
 
     # Probe MCP once at startup so the tool list is visible in the logs and
     # /healthz can answer without spawning a browser on every request.
-    app.state.startup_probe = asyncio.create_task(_startup_probe(app))
+    app.state.startup_probe = asyncio.create_task(_startup_probe(app, settings))
 
     try:
         yield
     finally:
         app.state.startup_probe.cancel()
         await app.state.manager.shutdown()
+        await app.state.bus.stop()
+        await checkpointer.__aexit__(None, None, None)
         await store.close()
         log.info("backend stopped")
 
 
-async def _startup_probe(app: FastAPI) -> None:
+async def _startup_probe(app: FastAPI, settings: Settings) -> None:
     try:
         result = await probe(MCPConfig.from_settings(settings), timeout=90.0)
     except asyncio.CancelledError:
@@ -204,1077 +149,49 @@ async def _startup_probe(app: FastAPI) -> None:
         log.error("MCP server unreachable at startup", extra={"error": result.get("error")})
 
 
-app = FastAPI(
-    title="Browser Agent",
-    version="0.1.0",
-    description="An LLM agent that drives a real browser through the Playwright MCP server.",
-    lifespan=lifespan,
-)
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build the application.
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# -- dependencies -----------------------------------------------------------
-
-
-def get_store(request: Request) -> Store:
-    return request.app.state.store
-
-
-def get_manager(request: Request) -> RunManager:
-    return request.app.state.manager
-
-
-def get_settings_dep(request: Request) -> Settings:
-    return request.app.state.settings
-
-
-def get_vault(request: Request) -> Vault:
-    return request.app.state.vault
-
-
-def get_replays(request: Request) -> ReplayManager:
-    return request.app.state.replays
-
-
-# ---------------------------------------------------------------------------
-# Health & config
-# ---------------------------------------------------------------------------
-
-
-@app.get("/healthz")
-async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONResponse:
-    """Liveness plus MCP connectivity.
-
-    The shallow check (default) reports the last known MCP state, refreshed at
-    startup and after every deep probe. ``?deep=1`` forces a live connect,
-    which spawns a real browser -- fine for a manual check, too heavy for a
-    container healthcheck loop.
+    A factory rather than a module-level singleton, so a test can construct an
+    app against its own database and its own configuration without touching
+    the process environment. This is the same reason ``config`` no longer
+    exposes a module-level ``settings`` object.
     """
-    app_state = request.app.state
-    store: Store = app_state.store
-    cache = app_state.health
-
-    fresh = (time.time() - cache["checked_at"]) < HEALTH_CACHE_TTL
-    if deep or cache["result"] is None:
-        result = await probe(MCPConfig.from_settings(app_state.settings), timeout=60.0)
-        app_state.health = {"checked_at": time.time(), "result": result}
-        cache = app_state.health
-        fresh = True
-
-    mcp_result = cache["result"] or {"ok": None, "error": "not probed yet"}
-    db_ok = await store.ping()
-    llm = llm_health(app_state.settings)
-
-    # A deep probe checks the models can actually be called. A model the
-    # account lacks otherwise only shows up one step into a run, as a 403.
-    if deep:
-        manager: RunManager = app_state.manager
-        roles = {
-            "driver": manager.llm,
-            "distiller": manager.distill_llm,
-            "repair": manager.repair_llm,
-        }
-        checks = await asyncio.gather(*(client.check_access() for client in roles.values()))
-        llm = {**llm, "access": dict(zip(roles, checks))}
-        if any(not check["ok"] for check in checks):
-            llm = {**llm, "configured": False}
-
-    healthy = db_ok and llm["configured"] and mcp_result.get("ok") is not False
-    body = {
-        "status": "ok" if healthy else "degraded",
-        "database": {"ok": db_ok, "path": str(app_state.settings.db_path)},
-        "llm": llm,
-        "mcp": {
-            **mcp_result,
-            "checked_at": cache["checked_at"],
-            "stale": not fresh,
-            "command": MCPConfig.from_settings(app_state.settings).command_line()
-            if app_state.settings.mcp_transport == "stdio"
-            else app_state.settings.mcp_server_url,
-        },
-        "active_runs": sum(1 for _ in app_state.manager._tasks),  # noqa: SLF001
-    }
-    return JSONResponse(body, status_code=200 if healthy else 503)
-
-
-@app.get("/api/config")
-async def get_config(settings_dep: Settings = Depends(get_settings_dep)) -> dict[str, Any]:
-    """Defaults the task composer pre-fills. Contains no secrets."""
-    return {
-        "defaults": {
-            "max_steps": settings_dep.agent_max_steps,
-            "timeout_seconds": settings_dep.agent_timeout_seconds,
-            "allowed_domains": settings_dep.agent_allowed_domains,
-            "require_approval": settings_dep.agent_require_approval,
-            "screenshot_every_step": settings_dep.agent_screenshot_every_step,
-            "headless": settings_dep.mcp_headless,
-            "browser": settings_dep.mcp_browser,
-        },
-        "model": settings_dep.llm_model,
-        "models": settings_dep.models_in_use,
-        "provider": PROVIDER,
-        "transport": settings_dep.mcp_transport,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Runs
-# ---------------------------------------------------------------------------
-
-
-@app.post("/api/runs", response_model=CreateRunResponse, status_code=201)
-async def create_run(
-    body: CreateRunRequest,
-    manager: RunManager = Depends(get_manager),
-) -> CreateRunResponse:
-    options: RunOptions = manager.default_options()
-    if body.max_steps is not None:
-        options.max_steps = body.max_steps
-    if body.timeout_seconds is not None:
-        options.timeout_seconds = body.timeout_seconds
-    if body.allowed_domains is not None:
-        options.allowed_domains = body.allowed_domains
-    if body.require_approval is not None:
-        options.require_approval = body.require_approval
-    if body.screenshot_every_step is not None:
-        options.screenshot_every_step = body.screenshot_every_step
-
-    run_id = await manager.start_run(
-        RunRequest(
-            task=body.task,
-            start_url=body.start_url,
-            options=options,
-            headless=body.headless,
-            browser=body.browser,
-            secrets=list(body.secrets or []),
-        )
-    )
-    return CreateRunResponse(run_id=run_id, status="pending")
-
-
-@app.get("/api/runs")
-async def list_runs(
-    status: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    runs = await store.list_runs(status=status, limit=limit, offset=offset)
-    return {
-        "runs": [run.to_dict() for run in runs],
-        "total": await store.count_runs(status),
-        "limit": limit,
-        "offset": offset,
-    }
-
-
-@app.get("/api/runs/{run_id}")
-async def get_run(
-    run_id: str,
-    store: Store = Depends(get_store),
-    manager: RunManager = Depends(get_manager),
-) -> dict[str, Any]:
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {
-        **run.to_dict(),
-        "active": manager.is_active(run_id),
-        "pending_approval": manager.pending_approval(run_id),
-        "artifacts": [
-            {"id": a.id, "kind": a.kind, "mime": a.mime, "url": f"/api/artifacts/{a.id}"}
-            for a in await store.list_artifacts(run_id)
-        ],
-    }
-
-
-@app.get("/api/runs/{run_id}/events")
-async def get_run_events(
-    run_id: str,
-    after_seq: int = Query(default=0, ge=0),
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    """Full event history. Used to replay a finished run without a WebSocket."""
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    events = await store.get_events(run_id, after_seq=after_seq)
-    return {"run_id": run_id, "events": [dump_event(e) for e in events]}
-
-
-@app.post("/api/runs/{run_id}/cancel")
-async def cancel_run(
-    run_id: str,
-    store: Store = Depends(get_store),
-    manager: RunManager = Depends(get_manager),
-) -> dict[str, Any]:
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    if run.status in TERMINAL_STATUSES:
-        return {"run_id": run_id, "cancelled": False, "reason": f"run already {run.status}"}
-
-    cancelled = await manager.cancel_run(run_id)
-    if not cancelled:
-        raise HTTPException(status_code=409, detail="run is not active on this backend")
-    return {"run_id": run_id, "cancelled": True}
-
-
-@app.post("/api/runs/{run_id}/approve")
-async def approve_action(
-    run_id: str,
-    body: ApprovalRequest,
-    store: Store = Depends(get_store),
-    manager: RunManager = Depends(get_manager),
-) -> dict[str, Any]:
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run not found")
-
-    decision = "approved" if body.decision == "approve" else "rejected"
-    resolved = manager.resolve_approval(run_id, body.approval_id, decision, body.note)
-    if not resolved:
-        raise HTTPException(
-            status_code=409,
-            detail="no approval is pending for this run (it may have timed out or been resolved)",
-        )
-    return {"run_id": run_id, "decision": decision}
-
-
-# ---------------------------------------------------------------------------
-# Artifacts
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Use cases
-# ---------------------------------------------------------------------------
-
-
-@app.post("/api/runs/{run_id}/distill", status_code=201)
-async def distill_run(
-    run_id: str,
-    store: Store = Depends(get_store),
-    manager: RunManager = Depends(get_manager),
-) -> dict[str, Any]:
-    """Promote a successful run into a reusable use case.
-
-    This is the one LLM call in the whole replay feature. Everything the use
-    case is later executed with costs nothing.
-    """
-    run = await store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    if run.status != "succeeded":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"only a succeeded run can be recorded as a use case; this one is {run.status!r}. "
-                "A failed run has no reliable sequence of working steps to learn from."
-            ),
-        )
-
-    events = await store.get_events(run_id)
-    try:
-        use_case = await distill(
-            events, task=run.task, llm=manager.distill_llm, source_run_id=run_id
-        )
-    except DistillationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ValidationError as exc:
-        # A recording the schema cannot express is the user's problem to see,
-        # not a server fault. Name the step rather than returning a 500.
-        raise HTTPException(
-            status_code=422,
-            detail=f"this run could not be turned into a use case: {exc}",
-        ) from exc
-
-    definition = use_case.model_dump(mode="json", by_alias=True)
-    usecase_id, version = await store.save_usecase(definition)
-
-    log.info(
-        "distilled a run into a use case",
-        extra={"run_id": run_id, "usecase_id": usecase_id, "version": version},
-    )
-    return {
-        "usecase_id": usecase_id,
-        "version": version,
-        # A suggestion. The caller is expected to confirm or replace it via
-        # PATCH before moving on.
-        "name": use_case.name,
-        "suggested_name": use_case.name,
-        "status": use_case.status,
-        "warnings": use_case.warnings,
-        "setup_steps": len(use_case.setup_steps),
-        "row_steps": len(use_case.row_steps),
-        "inputs": [spec.name for spec in use_case.inputs],
-        "secrets": [spec.name for spec in use_case.secrets],
-        "blocked_scripts": use_case.blocked_scripts,
-    }
-
-
-@app.get("/api/usecases")
-async def list_usecases(
-    status: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    rows = await store.list_usecases(status=status, limit=limit, offset=offset)
-    return {"usecases": rows, "limit": limit, "offset": offset}
-
-
-@app.get("/api/usecases/{usecase_id}")
-async def get_usecase(
-    usecase_id: str,
-    version: int | None = Query(default=None),
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    definition = await store.get_usecase(usecase_id, version)
-    if definition is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-    return {
-        "definition": definition,
-        "versions": await store.list_usecase_versions(usecase_id),
-    }
-
-
-@app.put("/api/usecases/{usecase_id}", status_code=201)
-async def update_usecase(
-    usecase_id: str,
-    body: dict[str, Any],
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    """Save reviewer edits as a new version.
-
-    Never rewrites the version in place: a batch already running is reading
-    from a specific version and must not have it changed underneath it.
-    """
-    if await store.get_usecase(usecase_id) is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-
-    body = {**body, "id": usecase_id}
-    try:
-        use_case = UseCase.model_validate(body)
-    except Exception as exc:  # noqa: BLE001 - surfaced to the editing UI verbatim
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    _, version = await store.save_usecase(use_case.model_dump(mode="json", by_alias=True))
-    return {"usecase_id": usecase_id, "version": version, "status": use_case.status}
-
-
-class RenameRequest(BaseModel):
-    """A label change. Deliberately not the definition."""
-
-    name: str = Field(min_length=1, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
-
-    @field_validator("name")
-    @classmethod
-    def _not_only_whitespace(cls, value: str) -> str:
-        # min_length counts characters, so "   " passes it and then strips to
-        # nothing -- leaving a use case with no name at all in the list.
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("a name cannot be blank")
-        return stripped
-
-
-@app.patch("/api/usecases/{usecase_id}")
-async def rename_usecase(
-    usecase_id: str,
-    body: RenameRequest,
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    """Rename a use case in place.
-
-    No new version: a name is a label, not part of what executes, so renaming
-    must not appear in a history that exists to record behaviour. Use PUT to
-    change the steps.
-    """
-    if not await store.rename_usecase(usecase_id, body.name.strip(), body.description):
-        raise HTTPException(status_code=404, detail="use case not found")
-    return {"usecase_id": usecase_id, "name": body.name.strip()}
-
-
-@app.post("/api/usecases/{usecase_id}/publish")
-async def publish_usecase(
-    usecase_id: str,
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    """Move a reviewed draft to ``ready`` so it can be executed.
-
-    Re-validates at ``ready``, which is where the stricter rules bite -- most
-    notably that a use case carrying raw JavaScript cannot be published until
-    someone has read the code and turned ``allow_scripts`` on.
-    """
-    definition = await store.get_usecase(usecase_id)
-    if definition is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-
-    try:
-        UseCase.model_validate({**definition, "status": "ready"})
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    await store.set_usecase_status(usecase_id, "ready")
-    return {"usecase_id": usecase_id, "status": "ready"}
-
-
-@app.delete("/api/usecases/{usecase_id}")
-async def archive_usecase(
-    usecase_id: str,
-    purge: bool = Query(default=False),
-    store: Store = Depends(get_store),
-    replays: ReplayManager = Depends(get_replays),
-) -> dict[str, Any]:
-    """Archive a use case, or delete it outright with ``?purge=true``.
-
-    Archiving is the default because it is reversible and keeps every
-    reference intact. Purging removes the use case, its versions and its
-    execution records permanently; the runs and events they produced are kept,
-    since those record what actually happened to a browser.
-    """
-    active = replays.active
-    if active and active.get("usecase_id") == usecase_id:
-        raise HTTPException(
-            status_code=409,
-            detail="that use case is running right now; wait for it to finish or cancel it first",
-        )
-
-    if purge:
-        removed = await store.purge_usecase(usecase_id)
-        if removed is None:
-            raise HTTPException(status_code=404, detail="use case not found")
-        return {"usecase_id": usecase_id, "deleted": True, "removed": removed}
-
-    if not await store.delete_usecase(usecase_id):
-        raise HTTPException(status_code=404, detail="use case not found")
-    return {"usecase_id": usecase_id, "status": "archived"}
-
-
-# ---------------------------------------------------------------------------
-# Credentials (write-only)
-# ---------------------------------------------------------------------------
-
-
-class CredentialRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    #: ``{slot: value}`` matching the use case's declared secrets. Write-only:
-    #: no endpoint returns these, and nothing in the dashboard needs them back.
-    values: dict[str, str] = Field(min_length=1)
-
-
-@app.post("/api/credentials", status_code=201)
-async def create_credential(
-    body: CredentialRequest,
-    store: Store = Depends(get_store),
-    vault: Vault = Depends(get_vault),
-) -> dict[str, Any]:
-    if not vault.available:
-        raise HTTPException(status_code=503, detail=NO_KEY_MESSAGE)
-    try:
-        ciphertext = vault.seal(body.values)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    credential_id = await store.save_credential(
-        new_credential_id(), body.name, Vault.slots_of(body.values), ciphertext
-    )
-    log.info("stored a credential", extra={"credential_id": credential_id, "slots": len(body.values)})
-    return {"id": credential_id, "name": body.name, "slots": Vault.slots_of(body.values)}
-
-
-@app.get("/api/credentials")
-async def list_credentials(
-    store: Store = Depends(get_store), vault: Vault = Depends(get_vault)
-) -> dict[str, Any]:
-    """Names and slot lists. Never a value."""
-    return {"credentials": await store.list_credentials(), "vault_available": vault.available}
-
-
-@app.delete("/api/credentials/{credential_id}")
-async def delete_credential(
-    credential_id: str, store: Store = Depends(get_store)
-) -> dict[str, Any]:
-    if not await store.delete_credential(credential_id):
-        raise HTTPException(status_code=404, detail="credential not found")
-    return {"id": credential_id, "deleted": True}
-
-
-# ---------------------------------------------------------------------------
-# Executing a use case (zero LLM calls)
-# ---------------------------------------------------------------------------
-
-
-class ExecuteRequest(BaseModel):
-    inputs: dict[str, Any] = Field(default_factory=dict)
-    #: Bind stored credentials by id, or pass values inline for a one-off.
-    credential_id: str | None = None
-    secrets: dict[str, str] | None = None
-    version: int | None = None
-    headless: bool | None = None
-    browser: str | None = None
-
-
-async def _resolve_secrets(
-    body: ExecuteRequest, store: Store, vault: Vault
-) -> dict[str, str]:
-    """Decrypt the bound credential, or take inline values for a one-off.
-
-    Whatever comes back is registered with the run's redactor before anything
-    is emitted, so a value cannot reach the event log even if a tool echoes it.
-    """
-    if body.credential_id:
-        ciphertext = await store.get_credential_ciphertext(body.credential_id)
-        if ciphertext is None:
-            raise HTTPException(status_code=404, detail="credential not found")
-        try:
-            values = vault.open(ciphertext)
-        except VaultUnavailable as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except VaultError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await store.touch_credential(body.credential_id)
-        return {**values, **(body.secrets or {})}
-    return dict(body.secrets or {})
-
-
-@app.get("/api/executions/active")
-async def active_execution(replays: ReplayManager = Depends(get_replays)) -> dict[str, Any]:
-    """What holds the single execution slot, if anything."""
-    return {"active": replays.active}
-
-
-@app.post("/api/usecases/{usecase_id}/execute", status_code=201)
-async def execute_usecase(
-    usecase_id: str,
-    body: ExecuteRequest,
-    store: Store = Depends(get_store),
-    vault: Vault = Depends(get_vault),
-    replays: ReplayManager = Depends(get_replays),
-) -> dict[str, Any]:
-    """Run one input row against a stored use case. **No LLM call is made.**"""
-    definition = await store.get_usecase(usecase_id, body.version)
-    if definition is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-
-    try:
-        use_case = UseCase.model_validate(definition)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
-
-    if use_case.status != "ready":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"this use case is {use_case.status!r}. Review it and publish it before "
-                "running it -- a distilled recording is a best guess until a person has "
-                "checked it."
-            ),
-        )
-
-    secrets = await _resolve_secrets(body, store, vault)
-
-    missing_secrets = use_case.missing_secrets(secrets)
-    if missing_secrets:
-        raise HTTPException(
-            status_code=422,
-            detail=f"missing required credential slot(s): {', '.join(missing_secrets)}",
-        )
-
-    values = use_case.with_defaults(body.inputs)
-    missing_inputs = use_case.missing_inputs(values)
-    if missing_inputs:
-        raise HTTPException(
-            status_code=422,
-            detail=f"missing required input(s): {', '.join(missing_inputs)}",
-        )
-
-    try:
-        return await replays.execute_once(
-            ExecutionRequest(
-                usecase=use_case,
-                version=int(definition.get("version") or 1),
-                inputs=values,
-                secrets=secrets,
-                headless=body.headless,
-                browser=body.browser,
-            )
-        )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/usecases/{usecase_id}/executions")
-async def list_usecase_executions(
-    usecase_id: str,
-    limit: int = Query(default=100, ge=1, le=500),
-    store: Store = Depends(get_store),
-) -> dict[str, Any]:
-    return {"executions": await store.list_executions(usecase_id=usecase_id, limit=limit)}
-
-
-# ---------------------------------------------------------------------------
-# Batches: one use case over many rows, one shared session
-# ---------------------------------------------------------------------------
-
-
-class BatchRequestBody(BaseModel):
-    """Rows arrive as CSV text, a base64 .xlsx workbook, or JSON objects."""
-
-    csv: str | None = None
-    #: A base64-encoded .xlsx. Spreadsheets are how people actually keep lists
-    #: of records, and re-saving one as CSV silently mangles leading zeros,
-    #: dates, and anything containing a comma.
-    xlsx_base64: str | None = None
-    sheet: str | None = None
-    rows: list[dict[str, Any]] | None = None
-    credential_id: str | None = None
-    secrets: dict[str, str] | None = None
-    version: int | None = None
-    headless: bool | None = None
-    browser: str | None = None
-
-
-async def _load_usecase_for_execution(
-    usecase_id: str, version: int | None, store: Store
-) -> tuple[UseCase, int]:
-    definition = await store.get_usecase(usecase_id, version)
-    if definition is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-    try:
-        use_case = UseCase.model_validate(definition)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
-    if use_case.status != "ready":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"this use case is {use_case.status!r}. Review it and publish it before "
-                "running it against a file."
-            ),
-        )
-    return use_case, int(definition.get("version") or 1)
-
-
-@app.post("/api/usecases/{usecase_id}/batch", status_code=202)
-async def start_batch(
-    usecase_id: str,
-    body: BatchRequestBody,
-    store: Store = Depends(get_store),
-    vault: Vault = Depends(get_vault),
-    replays: ReplayManager = Depends(get_replays),
-) -> dict[str, Any]:
-    """Run a use case over a file of input rows. **No LLM call is made.**
-
-    Every row is validated against the input schema before a browser opens, so
-    a bad column fails in a millisecond rather than on record 700.
-    """
-    use_case, version = await _load_usecase_for_execution(usecase_id, body.version, store)
-
-    try:
-        parsed = _rows_from_body(body)
-    except BatchInputError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    problems = validate_rows(use_case, parsed)
-    if problems:
-        raise HTTPException(
-            status_code=422,
-            detail={"message": "the input file does not match this use case", "problems": problems},
-        )
-
-    secrets = await _resolve_secrets(
-        ExecuteRequest(credential_id=body.credential_id, secrets=body.secrets), store, vault
-    )
-    missing = use_case.missing_secrets(secrets)
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"missing required credential slot(s): {', '.join(missing)}",
-        )
-
-    try:
-        batch_id = await replays.start_batch(
-            BatchRequest(
-                usecase=use_case,
-                version=version,
-                rows=parsed.rows,
-                secrets=secrets,
-                credential_id=body.credential_id,
-                headless=body.headless,
-                browser=body.browser,
-            )
-        )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    return {
-        "batch_id": batch_id,
-        "total": len(parsed),
-        "columns": parsed.columns,
-        "warnings": parsed.warnings,
-    }
-
-
-def _rows_from_body(body: BatchRequestBody):
-    """Whichever way the rows arrived, one shape comes out."""
-    if body.xlsx_base64 is not None:
-        try:
-            data = base64.b64decode(body.xlsx_base64, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise BatchInputError(f"the workbook was not valid base64: {exc}") from exc
-        return parse_workbook(data, body.sheet)
-    if body.csv is not None:
-        return parse_csv(body.csv)
-    return rows_from_json(body.rows)
-
-
-@app.get("/api/batches/{batch_id}")
-async def get_batch(
-    batch_id: str,
-    store: Store = Depends(get_store),
-    replays: ReplayManager = Depends(get_replays),
-) -> dict[str, Any]:
-    batch = await store.get_batch(batch_id)
-    if batch is None:
-        raise HTTPException(status_code=404, detail="batch not found")
-
-    executions = await store.list_executions(batch_id=batch_id)
-    active = replays.active
-    return {
-        "batch": batch,
-        "executions": executions,
-        "running": bool(active and active.get("batch_id") == batch_id),
-        "pending": sum(1 for row in executions if row["status"] == "pending"),
-    }
-
-
-@app.post("/api/batches/{batch_id}/resume", status_code=202)
-async def resume_batch(
-    batch_id: str,
-    body: BatchRequestBody,
-    store: Store = Depends(get_store),
-    vault: Vault = Depends(get_vault),
-    replays: ReplayManager = Depends(get_replays),
-) -> dict[str, Any]:
-    """Re-run only the rows that are not ``succeeded``.
-
-    Covers all three ways a batch ends early -- re-login failure, the circuit
-    breaker, and a process restart -- identically.
-    """
-    batch = await store.get_batch(batch_id)
-    if batch is None:
-        raise HTTPException(status_code=404, detail="batch not found")
-
-    outstanding = await replays.pending_row_indices(batch_id)
-    if not outstanding:
-        raise HTTPException(status_code=409, detail="every row in this batch already succeeded")
-
-    use_case, version = await _load_usecase_for_execution(
-        batch["usecase_id"], batch["version"], store
-    )
-
-    executions = await store.list_executions(batch_id=batch_id)
-    by_index = {int(row["row_index"]): row["inputs"] for row in executions if row["row_index"] is not None}
-    highest = max(by_index) if by_index else -1
-    rows = [by_index.get(index, {}) for index in range(highest + 1)]
-
-    secrets = await _resolve_secrets(
-        ExecuteRequest(
-            credential_id=body.credential_id or batch.get("credential_id"),
-            secrets=body.secrets,
+    settings = settings or get_settings()
+
+    application = FastAPI(
+        title="Browser Agent",
+        version="1.0.0",
+        description=(
+            "An LLM agent that drives a real browser through the Playwright MCP "
+            "server, and replays what it learned without further LLM calls."
         ),
-        store,
-        vault,
+        lifespan=lifespan,
     )
-    missing = use_case.missing_secrets(secrets)
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"missing required credential slot(s): {', '.join(missing)}",
-        )
+    application.state.settings = settings
 
-    try:
-        new_id = await replays.start_batch(
-            BatchRequest(
-                usecase=use_case,
-                version=version,
-                rows=rows,
-                secrets=secrets,
-                credential_id=body.credential_id or batch.get("credential_id"),
-                only_rows=outstanding,
-                headless=body.headless,
-                browser=body.browser,
-            )
-        )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    return {"batch_id": new_id, "resumed_from": batch_id, "rows": len(outstanding)}
-
-
-@app.post("/api/batches/{batch_id}/cancel")
-async def cancel_batch(
-    batch_id: str, replays: ReplayManager = Depends(get_replays)
-) -> dict[str, Any]:
-    """Stop after the row in flight finishes."""
-    active = replays.active
-    if not active or active.get("batch_id") != batch_id:
-        raise HTTPException(status_code=409, detail="that batch is not running")
-    return {"batch_id": batch_id, "cancelled": await replays.cancel_active()}
-
-
-@app.get("/api/batches/{batch_id}/results.csv")
-async def batch_results_csv(
-    batch_id: str, store: Store = Depends(get_store)
-) -> PlainTextResponse:
-    """One row out per row in, in a stable column order so files diff cleanly."""
-    batch = await store.get_batch(batch_id)
-    if batch is None:
-        raise HTTPException(status_code=404, detail="batch not found")
-
-    definition = await store.get_usecase(batch["usecase_id"], batch["version"])
-    if definition is None:
-        raise HTTPException(status_code=404, detail="the use case this batch ran is gone")
-
-    body = results_csv(
-        UseCase.model_validate(definition), await store.list_executions(batch_id=batch_id)
-    )
-    return PlainTextResponse(
-        body,
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="batch-{batch_id[:8]}.csv"'},
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        # Bearer tokens, not cookies: nothing is sent automatically by the
+        # browser, so CSRF has no purchase here and credentials stay off.
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
+    for router in ALL_ROUTERS:
+        application.include_router(router)
 
-@app.get("/api/usecases/{usecase_id}/batches")
-async def list_usecase_batches(
-    usecase_id: str, store: Store = Depends(get_store)
-) -> dict[str, Any]:
-    return {"batches": await store.list_batches(usecase_id=usecase_id)}
+    return application
 
 
-class RepairRequest(BaseModel):
-    """Which failure to mend. Either is enough to find the rest."""
-
-    execution_id: str | None = None
-    run_id: str | None = None
-
-
-@app.post("/api/usecases/{usecase_id}/repair", status_code=201)
-async def repair_usecase(
-    usecase_id: str,
-    body: RepairRequest,
-    store: Store = Depends(get_store),
-    manager: RunManager = Depends(get_manager),
-) -> dict[str, Any]:
-    """Mend a use case that failed, using the page as it was when it broke.
-
-    One LLM call. The result is saved as a new **draft** version -- existing
-    versions are untouched and a person publishes it, which is the same gate a
-    freshly distilled use case passes through.
-    """
-    definition = await store.get_usecase(usecase_id)
-    if definition is None:
-        raise HTTPException(status_code=404, detail="use case not found")
-
-    execution = await _find_failed_execution(usecase_id, body, store)
-    events = await store.get_events(execution["run_id"]) if execution.get("run_id") else []
-
-    try:
-        use_case = UseCase.model_validate({**definition, "status": "draft"})
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=f"stored use case is invalid: {exc}") from exc
-
-    context = gather_context(use_case, execution, events)
-    doctor = UseCaseDoctor(manager.repair_llm)
-    try:
-        proposal = await doctor.diagnose(context)
-    except RepairError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if not proposal.actionable:
-        return {
-            "usecase_id": usecase_id,
-            "repaired": False,
-            "diagnosis": proposal.diagnosis,
-            "unfixable_reason": proposal.unfixable_reason
-            or "the model had no edit to suggest for this failure",
-            "confidence": proposal.confidence,
-            "llm_tokens": proposal.tokens,
-        }
-
-    patched, applied = apply_fixes(definition, proposal, candidates(context.snapshot))
-
-    # A repair that changes nothing must not be reported as one, and must not
-    # leave a version behind. Otherwise pressing the button appears to work
-    # while the use case stays exactly as broken as it was.
-    if is_unchanged(definition, patched):
-        skipped = [line for line in applied if line.startswith("SKIPPED")]
-        log.info(
-            "repair proposed nothing that could be applied",
-            extra={"usecase_id": usecase_id, "fixes": len(proposal.fixes), "skipped": len(skipped)},
-        )
-        return {
-            "usecase_id": usecase_id,
-            "repaired": False,
-            "diagnosis": proposal.diagnosis,
-            "confidence": proposal.confidence,
-            "applied": applied,
-            "unfixable_reason": (
-                "none of the proposed edits could be applied, so nothing was saved: "
-                + "; ".join(skipped)
-                if skipped
-                else "the proposed edits would leave the use case exactly as it is, so "
-                "nothing was saved. It may already carry this repair."
-            ),
-            "llm_tokens": proposal.tokens,
-        }
-
-    try:
-        validate_patched(patched)
-    except ValidationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "the proposed repair does not produce a valid use case, so nothing was "
-                f"saved: {exc}"
-            ),
-        ) from exc
-
-    patched["status"] = "draft"
-    _, version = await store.save_usecase(patched, created_by="repair")
-    await store.set_usecase_status(usecase_id, "draft")
-
-    log.info(
-        "repaired a use case",
-        extra={"usecase_id": usecase_id, "version": version, "fixes": len(applied)},
-    )
-    return {
-        "usecase_id": usecase_id,
-        "repaired": True,
-        "version": version,
-        "diagnosis": proposal.diagnosis,
-        "confidence": proposal.confidence,
-        "applied": applied,
-        "llm_tokens": proposal.tokens,
-    }
-
-
-async def _find_failed_execution(
-    usecase_id: str, body: RepairRequest, store: Store
-) -> dict[str, Any]:
-    """The failure to repair: the one named, or the most recent."""
-    executions = await store.list_executions(usecase_id=usecase_id, limit=200)
-    if body.execution_id:
-        match = next((e for e in executions if e["id"] == body.execution_id), None)
-    elif body.run_id:
-        match = next((e for e in executions if e["run_id"] == body.run_id), None)
-    else:
-        match = next(
-            (e for e in sorted(executions, key=lambda e: e["created_at"], reverse=True)
-             if e["status"] == "failed"),
-            None,
-        )
-
-    if match is None:
-        raise HTTPException(
-            status_code=404,
-            detail="no failed run found for this use case; run it once so there is a failure to look at",
-        )
-    if match["status"] != "failed":
-        raise HTTPException(status_code=409, detail="that run did not fail, so there is nothing to repair")
-    return match
-
-
-@app.get("/api/artifacts/{artifact_id}")
-async def get_artifact(artifact_id: str, store: Store = Depends(get_store)) -> FileResponse:
-    record = await store.get_artifact(artifact_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
-    return FileResponse(
-        record.path,
-        media_type=record.mime,
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Live stream
-# ---------------------------------------------------------------------------
-
-
-@app.websocket("/api/runs/{run_id}/stream")
-async def stream_run(websocket: WebSocket, run_id: str, after_seq: int = Query(default=0)) -> None:
-    """Replay everything after ``after_seq``, then stream live events.
-
-    The client reconnects with the highest ``seq`` it has seen, which makes
-    reconnection lossless without any server-side session state.
-    """
-    store: Store = websocket.app.state.store
-    bus: EventBus = websocket.app.state.bus
-
-    await websocket.accept()
-    run = await store.get_run(run_id)
-    if run is None:
-        await websocket.close(code=4404, reason="run not found")
-        return
-
-    # Subscribe before reading history so nothing produced during the replay is
-    # missed; duplicates are filtered by seq below.
-    queue = bus.subscribe(run_id)
-    last_seq = after_seq
-    finished = False
-
-    try:
-        for event in await store.get_events(run_id, after_seq=after_seq):
-            await websocket.send_json(dump_event(event))
-            last_seq = max(last_seq, event.seq)
-            if event.type == "run_finished":
-                finished = True
-
-        if finished:
-            await websocket.close(code=1000, reason="run already finished")
-            return
-
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL)
-            except asyncio.TimeoutError:
-                await websocket.send_json(HEARTBEAT)
-                continue
-
-            if event.seq <= last_seq:
-                continue
-            await websocket.send_json(dump_event(event))
-            last_seq = event.seq
-            if event.type == "run_finished":
-                await websocket.close(code=1000, reason="run finished")
-                return
-
-    except WebSocketDisconnect:
-        log.debug("websocket client disconnected", extra={"run_id": run_id})
-    except Exception as exc:  # noqa: BLE001 - never leave the socket half-open
-        log.warning("websocket stream error", extra={"run_id": run_id, "error": str(exc)})
-        try:
-            await websocket.close(code=1011, reason="stream error")
-        except Exception:  # noqa: BLE001 - socket may already be gone
-            pass
-    finally:
-        bus.unsubscribe(run_id, queue)
+app = create_app()
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience entry point
     import uvicorn
 
-    configure_logging(settings.log_level)
-    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=False)
+    _settings = get_settings()
+    configure_logging(_settings.log_level)
+    uvicorn.run("main:app", host=_settings.host, port=_settings.port, reload=False)
