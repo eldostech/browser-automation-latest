@@ -188,14 +188,34 @@ def test_roles_histogram_reports_what_was_on_the_page(real: Snapshot):
 # --- ref helpers -----------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["ref=e15", "[ref=e15]", " ref=f1e42 "])
-def test_is_ref_recognises_both_spellings(value: str):
+@pytest.mark.parametrize(
+    "value", ["ref=e15", "[ref=e15]", " ref=f1e42 ", "e15", " e407 "]
+)
+def test_is_ref_recognises_every_spelling(value: str):
     assert is_ref(value) is True
-    assert extract_ref(value) in {"e15", "f1e42"}
+    assert extract_ref(value) in {"e15", "f1e42", "e407"}
+
+
+def test_a_bare_ref_is_a_ref_not_a_selector():
+    """This assertion used to say the opposite, and that was the bug.
+
+    A bare ``e15`` was classed as a real selector, so it never reached the
+    snapshot lookup -- it fell through to the text fallback and became
+    ``text=e15``, a locator that cannot match anything. A recorded sign-in
+    produced one of those for every step and failed on replay at the first
+    field, which looked like the credentials were being lost.
+
+    Playwright MCP's own tools take the ref bare, in a ``ref`` argument, so the
+    model writes it that way into ``target`` too. All three spellings are the
+    same thing and are now treated as such; whether it resolves is then decided
+    by the snapshot, not by how it was written.
+    """
+    assert is_ref("e49") is True
+    assert extract_ref("e49") == "e49"
 
 
 @pytest.mark.parametrize(
-    "value", ["button:has-text('Sign in')", "input[type='password']", "#name", "", "e15"]
+    "value", ["button:has-text('Sign in')", "input[type='password']", "#name", "", "e2e", "email"]
 )
 def test_is_ref_rejects_real_selectors(value: str):
     assert is_ref(value) is False

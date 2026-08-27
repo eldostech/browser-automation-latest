@@ -235,16 +235,35 @@ def parse(text: str) -> Snapshot:
     return snapshot
 
 
+#: A ref with no ``ref=`` prefix, which is the spelling Playwright MCP's own
+#: tools use for their ``ref`` argument -- and which the model therefore copies
+#: into ``target`` as well.
+BARE_REF_RE = re.compile(r"e\d+")
+
+
 def is_ref(target: str) -> bool:
     """True when a recorded target is an ephemeral ref rather than a selector.
 
-    Both spellings the model produces are recognised: ``ref=e15`` and ``[ref=e15]``.
+    Three spellings, because the model produces all three: ``ref=e15``,
+    ``[ref=e15]``, and a bare ``e15``.
+
+    The bare form was missing, and the consequence was not a missed
+    optimisation. An unrecognised ref fell through to the text fallback and
+    became ``text=e15`` -- a locator that cannot match anything, on every step
+    of the recording, discovered only when the use case was replayed. The
+    caller resolves against the snapshot before trusting this, so a genuine
+    piece of text that happens to look like ``e15`` is still handled correctly.
     """
     value = (target or "").strip()
-    return bool(re.fullmatch(r"\[?ref=[A-Za-z0-9]+\]?", value))
+    return bool(
+        re.fullmatch(r"\[?ref=[A-Za-z0-9]+\]?", value) or BARE_REF_RE.fullmatch(value)
+    )
 
 
 def extract_ref(target: str) -> str | None:
-    """Pull the ref id out of ``ref=e15`` / ``[ref=e15]``. ``None`` if absent."""
-    match = re.search(r"ref=([A-Za-z0-9]+)", target or "")
-    return match.group(1) if match else None
+    """Pull the ref id out of ``ref=e15``, ``[ref=e15]`` or a bare ``e15``."""
+    value = (target or "").strip()
+    match = re.search(r"ref=([A-Za-z0-9]+)", value)
+    if match:
+        return match.group(1)
+    return value if BARE_REF_RE.fullmatch(value) else None

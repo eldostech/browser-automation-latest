@@ -302,9 +302,17 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
 
     # Snapshots indexed by the seq at which they were captured, so a step can
     # find the most recent view of the page that preceded it.
+    #
+    # Collected from *any* result that carries one, not just browser_snapshot
+    # and browser_navigate. Playwright MCP returns a fresh page snapshot after
+    # every action, and that is where the model reads the refs it uses next --
+    # so restricting the source to two tool names left every ref discovered
+    # after a click unresolvable, and those steps ended up with no locator at
+    # all. ``parse_snapshot`` yields nothing for a result without one, and the
+    # length check below already discards that.
     snapshots: list[tuple[int, Snapshot]] = []
     for event in events:
-        if event.type == "tool_result" and event.name in {"browser_snapshot", "browser_navigate"}:
+        if event.type == "tool_result":
             parsed = parse_snapshot(event.text or "")
             if len(parsed):
                 snapshots.append((event.seq, parsed))

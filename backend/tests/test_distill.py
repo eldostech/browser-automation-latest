@@ -22,7 +22,7 @@ from distill import (
     pre_filter,
     summarise,
 )
-from events import Screenshot, ToolCall, ToolResult
+from events import RunFinished, RunStarted, Screenshot, ToolCall, ToolResult
 from llm import LLMTurn, ToolCallRequest
 
 SNAPSHOT = """### Page
@@ -805,3 +805,85 @@ def test_nothing_dropped_means_an_empty_list():
     )
     assert recording.dropped == []
     assert build_usecase({"name": "x", "row_step_ids": ["s1"]}, recording).dropped == []
+
+
+# --- refs that the model wrote bare ----------------------------------------
+
+
+def test_a_bare_ref_target_resolves_instead_of_becoming_a_text_locator():
+    """The shape of a real sign-in recording that failed on replay.
+
+    Playwright MCP takes its ref bare, so the model writes `"target": "e49"` as
+    often as `"target": "ref=e49"`. The bare form was not recognised as a ref,
+    so it fell through to the text fallback and produced `text=e49` -- which
+    matches nothing, on every step. The failure surfaced only at replay, at the
+    first field of the login form, and read as though the credentials were
+    being lost.
+    """
+    events = [
+        RunStarted(run_id="r", seq=1, task="sign in"),
+        ToolCall(run_id="r", seq=2, step=1, call_id="c0", name="browser_snapshot", arguments={}),
+        ToolResult(
+            run_id="r", seq=3, step=1, call_id="c0", name="browser_snapshot", ok=True,
+            duration_ms=1,
+            text='- Page URL: https://example.com/login\n'
+                 '- Page Snapshot:\n```yaml\n'
+                 '- textbox "Email" [ref=e49]\n'
+                 '- button "Sign In" [ref=e55]\n```',
+        ),
+        # Bare, exactly as recorded in the run this test comes from.
+        ToolCall(run_id="r", seq=4, step=2, call_id="c1", name="browser_type",
+                 arguments={"target": "e49", "element": "Email textbox", "text": "someone"}),
+        ToolResult(run_id="r", seq=5, step=2, call_id="c1", name="browser_type", ok=True,
+                   duration_ms=5, text="typed"),
+        ToolCall(run_id="r", seq=6, step=3, call_id="c2", name="browser_click",
+                 arguments={"target": "e55", "element": "Sign In button"}),
+        ToolResult(run_id="r", seq=7, step=3, call_id="c2", name="browser_click", ok=True,
+                   duration_ms=5, text="clicked"),
+        RunFinished(run_id="r", seq=8, status="succeeded", steps=3, duration_ms=50),
+    ]
+
+    pre = pre_filter(events)
+    ladders = [step.locators for step in pre.steps if step.locators]
+
+    assert ladders, "every step lost its locator"
+    for ladder in ladders:
+        assert ladder[0].strategy == "role", (
+            f"expected a durable role locator, got {ladder[0].strategy}={ladder[0].text!r}"
+        )
+    assert {locator.name for ladder in ladders for locator in ladder} == {"Email", "Sign In"}
+
+
+def test_a_snapshot_returned_by_an_action_is_used_for_later_refs():
+    """Refs discovered after a click have to resolve too.
+
+    Playwright MCP returns a fresh snapshot in the result of *every* action, and
+    that is where the model reads the refs it uses next. Snapshots were only
+    collected from browser_snapshot and browser_navigate, so every ref first
+    seen after a click was unresolvable and its step ended up with no locator.
+    """
+    after_click = (
+        '- Page URL: https://example.com/home\n'
+        '- Page Snapshot:\n```yaml\n- button "Sign out" [ref=e407]\n```'
+    )
+    events = [
+        RunStarted(run_id="r", seq=1, task="sign in then out"),
+        ToolCall(run_id="r", seq=2, step=1, call_id="c0", name="browser_click",
+                 arguments={"target": "ref=e1", "element": "Sign In"}),
+        # The snapshot arrives on the *click* result, not a browser_snapshot.
+        ToolResult(run_id="r", seq=3, step=1, call_id="c0", name="browser_click", ok=True,
+                   duration_ms=5, text=after_click),
+        ToolCall(run_id="r", seq=4, step=2, call_id="c1", name="browser_click",
+                 arguments={"target": "e407", "element": "Sign out button"}),
+        ToolResult(run_id="r", seq=5, step=2, call_id="c1", name="browser_click", ok=True,
+                   duration_ms=5, text="clicked"),
+        RunFinished(run_id="r", seq=6, status="succeeded", steps=2, duration_ms=50),
+    ]
+
+    pre = pre_filter(events)
+    signout = [s for s in pre.steps if s.locators and s.locators[0].name == "Sign out"]
+    assert signout, [
+        (s.action, s.unresolved_ref, [locator.strategy for locator in s.locators])
+        for s in pre.steps
+    ]
+    assert signout[0].locators[0].strategy == "role"
