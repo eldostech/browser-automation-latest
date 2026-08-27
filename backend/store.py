@@ -47,6 +47,7 @@ from db.models import (
     Workspace,
 )
 from events import AgentEvent, RunFinished, RunStatus, dump_event, parse_event
+from storage import ArtifactStorage, LocalStorage, artifact_key, storage_for
 
 log = logging.getLogger(__name__)
 
@@ -176,9 +177,17 @@ def _batch_dict(row: Batch) -> dict[str, Any]:
 class Store:
     """Connection lifecycle, and the few operations that cross tenants."""
 
-    def __init__(self, settings: Settings, artifacts_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        artifacts_dir: Path | None = None,
+        storage: ArtifactStorage | None = None,
+    ) -> None:
         self._settings = settings
         self.artifacts_dir = artifacts_dir or settings.artifacts_path
+        #: Built here when not supplied, so a Store constructed in a test or a
+        #: script gets working artifact storage without extra wiring.
+        self.storage = storage or LocalStorage(self.artifacts_dir)
         self._engine: AsyncEngine | None = None
         self._sessions: async_sessionmaker[AsyncSession] | None = None
 
@@ -221,7 +230,13 @@ class Store:
         Cheap -- it holds a session factory and a string -- so callers make one
         per request or per operation rather than caching it.
         """
-        return WorkspaceStore(self.sessions, self.artifacts_dir, workspace_id)
+        return WorkspaceStore(
+            self.sessions,
+            self.artifacts_dir,
+            workspace_id,
+            storage=self.storage,
+            settings=self._settings,
+        )
 
     async def ping(self) -> bool:
         try:
@@ -328,10 +343,16 @@ class WorkspaceStore:
         sessions: async_sessionmaker[AsyncSession],
         artifacts_dir: Path,
         workspace_id: str,
+        storage: ArtifactStorage | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._sessions = sessions
         self.artifacts_dir = artifacts_dir
         self._ws = workspace_id
+        self._settings = settings
+        #: Defaults to the local filesystem, so a WorkspaceStore built without
+        #: one behaves exactly as it did before storage was pluggable.
+        self._storage = storage or LocalStorage(artifacts_dir)
 
     @property
     def workspace_id(self) -> str:
@@ -1002,11 +1023,17 @@ class WorkspaceStore:
         seq: int | None = None,
         suffix: str = ".png",
     ) -> ArtifactRecord:
+        """Write the bytes, then record where they went.
+
+        The ``path`` column now holds a *locator* -- a filesystem path or an
+        ``s3://`` URL -- so a row says which backend wrote it. Reading follows
+        the row rather than the current setting, which is what lets a
+        deployment switch backends without orphaning what it already has.
+        """
         artifact_id = uuid.uuid4().hex
-        directory = self.artifacts_dir / run_id
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{artifact_id}{suffix}"
-        path.write_bytes(data)
+        stored = await self._storage.put(
+            artifact_key(run_id, artifact_id, suffix), data, content_type=mime
+        )
 
         async with self._sessions() as session:
             row = Artifact(
@@ -1016,12 +1043,22 @@ class WorkspaceStore:
                 seq=seq,
                 kind=kind,
                 mime=mime,
-                path=str(path),
-                bytes=len(data),
+                path=stored.locator,
+                bytes=stored.bytes,
             )
             session.add(row)
             await session.commit()
             return _artifact_record(row)
+
+    async def read_artifact(self, record: ArtifactRecord) -> bytes:
+        """The bytes behind a record, from whichever backend holds them."""
+        backend = storage_for(record.path, self._storage, self._settings)
+        return await backend.get(record.path)
+
+    def artifact_url(self, record: ArtifactRecord) -> str | None:
+        """A URL the browser can fetch directly, when the backend offers one."""
+        backend = storage_for(record.path, self._storage, self._settings)
+        return backend.presigned_url(record.path)
 
     async def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
         async with self._sessions() as session:

@@ -28,6 +28,7 @@ from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
 from routers import ALL_ROUTERS
 from stash import SecretStash
+from storage import build_storage
 from runner import ReplayManager, RunManager
 from store import Store
 
@@ -52,7 +53,13 @@ async def _fetch_event_for_bus(app: FastAPI, run_id: str, seq: int):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        log_dir=settings.log_path if settings.log_to_file else None,
+        file_name=settings.log_file_name,
+        max_bytes=settings.log_max_bytes,
+        backup_count=settings.log_backup_count,
+    )
     log.info(
         "starting backend",
         extra={
@@ -74,6 +81,15 @@ async def lifespan(app: FastAPI):
     # to keep them. In memory, with a TTL, and never written down -- see
     # stash.py for what that costs and why it is the right trade.
     app.state.stash = SecretStash()
+    app.state.storage = build_storage(settings)
+    log.info(
+        "artifact storage ready",
+        extra={
+            "backend": app.state.storage.name,
+            "location": settings.s3_bucket if settings.storage_backend == "s3"
+            else str(settings.artifacts_path),
+        },
+    )
 
     # A deployment must have an administrator to be reachable at all.
     generated = await app.state.auth.bootstrap()
@@ -198,5 +214,9 @@ if __name__ == "__main__":  # pragma: no cover - convenience entry point
     import uvicorn
 
     _settings = get_settings()
-    configure_logging(_settings.log_level)
+    configure_logging(
+        _settings.log_level,
+        log_dir=_settings.log_path if _settings.log_to_file else None,
+        file_name=_settings.log_file_name,
+    )
     uvicorn.run("main:app", host=_settings.host, port=_settings.port, reload=False)

@@ -612,6 +612,16 @@ class ReplayManager:
         self._slot = None
         self._task = None
 
+    def release_slot(self) -> None:
+        """Free the execution slot. Idempotent, and safe to call twice.
+
+        Public because the batch driver releases it at a specific point -- once
+        the browser session is closed but before the batch row is marked
+        finished -- rather than leaving it to the task wrapper, which runs
+        later.
+        """
+        self._release()
+
     async def cancel_active(self) -> bool:
         if self._task is None or self._task.done():
             return False
@@ -951,6 +961,12 @@ async def _drive_batch(
         await emit_replay_error(sink, run_id, "internal_error", progress.stopped_reason)
     finally:
         run.finish(batch_terminal(progress))
+        # The browser session closed when the `async with` above exited, so the
+        # execution slot is genuinely free from here. Release it *before*
+        # marking the batch finished, so that "this batch is done" implies
+        # "another one can start" -- the reverse order left a window in which
+        # the UI showed a completed batch and the next request got a 409.
+        manager.release_slot()
         # Shielded for the same reason the lifecycle shields its own write: a
         # cancelled batch must still leave a closed batch row behind.
         await asyncio.shield(_close_batch_row(store, batch_id, progress))

@@ -28,3 +28,6 @@ backend/.playwright-mcp/
 .DS_Store
 .idea/
 .vscode/
+
+# Rotating backend logs (LOG_TO_FILE=true).
+logs/

@@ -193,11 +193,40 @@ class Settings(BaseSettings):
     bootstrap_admin_password: str = ""
     bootstrap_workspace_name: str = "Default"
 
+    # --- Artifact storage --------------------------------------------------
+    #: Where screenshots and other run artifacts are kept. "local" writes under
+    #: artifacts_dir; "s3" uploads to a bucket and serves presigned URLs.
+    #: Rows written under one backend stay readable after switching to the
+    #: other -- see storage.py.
+    storage_backend: Literal["local", "s3"] = "local"
+    s3_bucket: str = ""
+    #: Key prefix inside the bucket, so several deployments can share one.
+    s3_prefix: str = "artifacts"
+    #: Falls back to aws_region when blank.
+    s3_region: str = ""
+    #: For MinIO or any S3-compatible store. Blank means real AWS.
+    s3_endpoint_url: str = ""
+    #: How long a presigned artifact URL stays valid. Short: it is a bearer
+    #: URL for otherwise access-controlled content.
+    s3_url_expiry_seconds: int = 900
+
     # --- Server ------------------------------------------------------------
     host: str = "0.0.0.0"
     port: int = 8000
     artifacts_dir: str = "./artifacts"
     log_level: str = "INFO"
+
+    # --- Logging -----------------------------------------------------------
+    #: Write logs to a rotating file as well as stdout. Containers usually want
+    #: this off (the platform collects stdout); anyone running the backend
+    #: directly wants it on, because stdout scrolls away.
+    log_to_file: bool = True
+    log_dir: str = "./logs"
+    log_file_name: str = "backend.log"
+    #: Rotation. Ten files of 10MB is enough to cover a few days of a busy
+    #: instance without needing a cron job to tidy up.
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backup_count: int = 10
     #: Same NoDecode reasoning as agent_allowed_domains above.
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
@@ -208,12 +237,21 @@ class Settings(BaseSettings):
     def _csv(cls, value):  # noqa: ANN001 - pydantic hook
         return _split_csv(value)
 
-    @field_validator("mcp_storage_state", "aws_region", "aws_profile", mode="before")
+    @field_validator(
+        "mcp_storage_state", "aws_region", "aws_profile", mode="before"
+    )
     @classmethod
     def _blank_to_none(cls, value):  # noqa: ANN001 - pydantic hook
         return value or None
 
     # --- Derived helpers ---------------------------------------------------
+    @property
+    def log_path(self) -> Path:
+        path = Path(self.log_dir)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        return path
+
     @property
     def artifacts_path(self) -> Path:
         path = Path(self.artifacts_dir)

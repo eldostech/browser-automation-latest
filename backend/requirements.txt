@@ -32,6 +32,13 @@ langchain-aws>=1.7,<2.0
 # botocore, for resolving and reporting AWS credentials in /healthz.
 botocore>=1.34,<2.0
 
+# S3 artifact storage (STORAGE_BACKEND=s3). Only imported when that backend is
+# selected, so a local-only deployment never pays for it at runtime -- but it
+# is a hard dependency rather than an extra, because a missing package
+# discovered on the first screenshot of a production run is not a good trade
+# for a few megabytes.
+boto3>=1.34,<2.0
+
 # Reading .xlsx batch input. openpyxl rather than pandas: this needs cell
 # values, not a dataframe, and pandas would pull in numpy for nothing.
 openpyxl>=3.1,<4.0

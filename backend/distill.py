@@ -713,6 +713,30 @@ def _assertion_from(spec: dict[str, Any]) -> Assertion:
     )
 
 
+#: Matches a template that ``apply_declarations`` already put in place.
+_DECLARED_TEMPLATE_RE = re.compile(r"\{\{(input|secret)\.[A-Za-z_][A-Za-z0-9_]*\}\}")
+
+
+def _prefer_declared(recorded_value: Any, override: Any) -> Any:
+    """Keep a declared template rather than the model's replacement for it.
+
+    The model is asked to parameterise the recording, and it does -- including
+    values that were *already* parameterised from the user's declarations,
+    which it renames to something of its own choosing. The result was a use
+    case asking for `{{input.name}}` while the declared input was called
+    `full_name`, so the declared inputs read as unused and were dropped: the
+    user filled in fields at record time and the finished use case never asked
+    for them.
+
+    Where a recorded value already carries a declared template, the user has
+    already said what this parameter is called. The model does not get to
+    overrule that.
+    """
+    if isinstance(recorded_value, str) and _DECLARED_TEMPLATE_RE.search(recorded_value):
+        return recorded_value
+    return override
+
+
 def _build_step(recorded: RecordedStep, plan: dict[str, Any], *, step_id: str) -> Step | None:
     """Turn one recorded call into a :class:`usecase.Step`, applying the plan.
 
@@ -735,7 +759,10 @@ def _build_step(recorded: RecordedStep, plan: dict[str, Any], *, step_id: str) -
                 name=item["name"],
                 # A per-field override is keyed "<step id>.<field name>"; a
                 # whole-step override applies to a single-field form.
-                value=values.get(f"{step_id}.{item['name']}", values.get(step_id, item["value"])),
+                value=_prefer_declared(
+                    item["value"],
+                    values.get(f"{step_id}.{item['name']}", values.get(step_id, item["value"])),
+                ),
                 type=item.get("type", "textbox"),
                 locators=list(item["locators"]),
             )
@@ -758,7 +785,7 @@ def _build_step(recorded: RecordedStep, plan: dict[str, Any], *, step_id: str) -
     }
 
     if action == "navigate":
-        kwargs["url"] = urls.get(step_id, recorded.url)
+        kwargs["url"] = _prefer_declared(recorded.url, urls.get(step_id, recorded.url))
     elif action == "script":
         kwargs["code"] = recorded.arguments.get("code") or ""
     elif action == "wait":
@@ -771,7 +798,9 @@ def _build_step(recorded: RecordedStep, plan: dict[str, Any], *, step_id: str) -
     elif action == "extract":
         kwargs["output"] = recorded.arguments.get("output") or f"{step_id}_value"
     elif recorded.value is not None or step_id in values:
-        kwargs["value"] = values.get(step_id, recorded.value)
+        kwargs["value"] = _prefer_declared(
+            recorded.value, values.get(step_id, recorded.value)
+        )
 
     return Step(**kwargs)
 

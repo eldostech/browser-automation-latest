@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import (
@@ -15,7 +16,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from agent import RunOptions
 from auth.rbac import Permission
@@ -30,6 +31,7 @@ from deps import (
 )
 from events import TERMINAL_STATUSES, dump_event
 from fields import FieldSet
+from storage import S3_SCHEME, StorageError
 from routers.schemas import ApprovalRequest, CreateRunRequest, CreateRunResponse
 from runner import RunManager, RunRequest
 
@@ -223,10 +225,43 @@ async def get_artifact(
     artifact_id: str,
     data: WorkspaceData,
     _: Annotated[Principal, Depends(require(Permission.RUN_READ))],
-) -> FileResponse:
+):
+    """Serve a screenshot from whichever backend holds it.
+
+    Object storage gets a redirect to a short-lived presigned URL, so the bytes
+    travel from S3 to the browser rather than through this process. A local
+    file is streamed from disk.
+
+    Caching is `private` because an artifact is workspace-scoped: a shared
+    proxy must not hold a copy that it could hand to a different tenant.
+    """
     record = await data.get_artifact(artifact_id)
     if record is None:
         raise HTTPException(status_code=404, detail="No such artifact.")
+
+    direct = data.artifact_url(record)
+    if direct:
+        return RedirectResponse(direct, status_code=307)
+
+    if record.path.startswith(S3_SCHEME):
+        # Object storage that could not presign: stream it rather than fail.
+        try:
+            payload = await data.read_artifact(record)
+        except StorageError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return Response(
+            payload,
+            media_type=record.mime,
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        )
+
+    if not Path(record.path).exists():
+        # The row outlived the file -- an artifacts directory cleared by hand,
+        # or a backend switch that left the old files behind.
+        raise HTTPException(
+            status_code=404,
+            detail="That screenshot is recorded but its file is missing from storage.",
+        )
     return FileResponse(
         record.path,
         media_type=record.mime,

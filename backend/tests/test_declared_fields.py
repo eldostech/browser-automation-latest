@@ -202,3 +202,27 @@ def test_a_page_echoing_the_password_back_is_still_redacted():
     """
     redactor = Redactor(make_fields().secret_values.values())
     assert PASSWORD not in redactor.text(f"Welcome, your password {PASSWORD} was accepted")
+
+
+# --- the declaration outranks the model ------------------------------------
+
+
+def test_a_declared_template_survives_the_models_renaming():
+    """The bug this guards: declared fields vanished from the finished use case.
+
+    The model is asked to parameterise the recording, and it does -- including
+    values that were *already* parameterised from the declaration, which it
+    renames to something of its own. The use case then asked for
+    `{{input.name}}` while the declared input was `full_name`, so the declared
+    inputs looked unused and were dropped. A user filled in fields at record
+    time and the finished use case never asked for them.
+    """
+    from distill import _prefer_declared
+
+    # The model's override is refused where a declaration already stands.
+    assert _prefer_declared("{{input.full_name}}", "{{input.name}}") == "{{input.full_name}}"
+    assert _prefer_declared("{{secret.password}}", "{{input.pw}}") == "{{secret.password}}"
+
+    # Where nothing was declared, the model is still free to parameterise.
+    assert _prefer_declared("Nitin Asati", "{{input.name}}") == "{{input.name}}"
+    assert _prefer_declared(None, "{{input.name}}") == "{{input.name}}"

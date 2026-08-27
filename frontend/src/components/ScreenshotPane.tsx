@@ -1,6 +1,7 @@
 import { artifactUrl } from '../lib/api';
 import type { ScreenshotEvent } from '../lib/events';
 import { formatTime } from '../lib/format';
+import { AuthedImage } from './AuthedImage';
 
 interface Props {
   screenshot: ScreenshotEvent | null;
@@ -38,7 +39,7 @@ export function ScreenshotPane({ screenshot, history, selectedIndex, onSelect }:
 
       <div className="shot">
         {current ? (
-          <img
+          <AuthedImage
             src={artifactUrl(current.url)}
             alt={current.caption ?? `Page at step ${current.step}`}
           />
