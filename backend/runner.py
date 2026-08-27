@@ -251,6 +251,10 @@ class RunManager:
         self._distill_llm: LLMClient | None = None
         self._repair_llm: LLMClient | None = None
         self._tasks: dict[str, asyncio.Task] = {}
+        #: Runs someone asked to stop. Recorded explicitly because inferring
+        #: cancellation from a CancelledError arriving is a race: see
+        #: cancel_run and _execute's finally.
+        self._cancel_requested: set[str] = set()
         self._approvals: dict[str, dict[str, PendingApproval]] = {}
         self._pending_events: dict[str, ApprovalRequired] = {}
 
@@ -347,29 +351,36 @@ class RunManager:
     async def cancel_run(self, run_id: str) -> bool:
         """Stop a run. Cancel the task *before* unblocking anything it waits on.
 
-        The order is the whole point, and it used to be the other way round:
-        pending approvals were resolved first, "so the loop is not blocked when
-        the cancellation lands". But resolving an approval as *rejected* is a
-        legitimate answer -- the agent takes it, declines that one tool call,
-        and carries on. On a fast machine it could reach its final turn and
-        finish before ``task.cancel()`` arrived, so cancelling a run awaiting
-        approval reported success and then recorded it as succeeded.
+        Two things happen here, and the *intent* is recorded before either.
 
-        Cancelling first means the ``wait_for`` on the approval raises
-        CancelledError immediately, which is the outcome asked for. The
-        futures are still resolved afterwards, as a fallback for anything
-        waiting that the cancellation did not reach.
+        ``task.cancel()`` does not stop anything immediately -- it requests
+        cancellation, delivered when the event loop next schedules that task.
+        Meanwhile the pending approval has to be resolved or the run sits
+        blocked. But "rejected" is a legitimate answer the agent acts on: it
+        declines that one tool call and carries on, and it can reach its final
+        turn before the cancellation arrives. Which of the two wins depends on
+        the machine and on the Python version -- ``asyncio.wait_for`` was
+        reimplemented in 3.12 -- so a run cancelled while awaiting approval
+        recorded "succeeded" on 3.11 and "cancelled" on 3.13.
+
+        Recording the request in ``_cancel_requested`` makes the outcome
+        independent of who wins. The finaliser reads the intent rather than
+        inferring it from whether a CancelledError happened to arrive in time.
         """
         task = self._tasks.get(run_id)
         cancelled = task is not None and not task.done()
-        if cancelled:
-            task.cancel()
+        if not cancelled:
+            return False
 
+        self._cancel_requested.add(run_id)
+        task.cancel()
+
+        # Unblock anything waiting, in case the cancellation does not reach it.
         for pending in list(self._approvals.get(run_id, {}).values()):
             if not pending.future.done():
                 pending.future.set_result(("rejected", "run cancelled"))
 
-        return cancelled
+        return True
 
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
@@ -378,6 +389,7 @@ class RunManager:
     async def shutdown(self) -> None:
         for run_id in list(self._tasks):
             await self.cancel_run(run_id)
+        self._cancel_requested.clear()
         tasks = list(self._tasks.values())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -491,7 +503,20 @@ class RunManager:
                         )
                     )
                 finally:
-                    if outcome is not None:
+                    # Intent beats timing. A run someone asked to stop is
+                    # cancelled even if the agent managed to finish first --
+                    # reporting "succeeded" for a run the operator cancelled is
+                    # the wrong answer however the race went.
+                    if run_id in self._cancel_requested:
+                        self._cancel_requested.discard(run_id)
+                        run.finish(
+                            Terminal(
+                                status="cancelled",
+                                steps=agent.step if agent else 0,
+                                duration_ms=run.elapsed_ms,
+                            )
+                        )
+                    elif outcome is not None:
                         run.finish(
                             Terminal(
                                 status=outcome.status,

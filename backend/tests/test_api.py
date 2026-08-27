@@ -469,3 +469,55 @@ def test_an_unusable_field_name_is_refused(client):
     )
     assert response.status_code == 422
     assert "field name" in response.text
+
+
+def test_a_cancelled_run_is_recorded_cancelled_even_if_the_agent_finishes_first(client):
+    """Intent beats timing.
+
+    `task.cancel()` only requests cancellation; it is delivered when the loop
+    next schedules that task. Meanwhile the pending approval must be resolved
+    or the run sits blocked -- and "rejected" is an answer the agent acts on,
+    declining that one call and carrying on to finish. Which side wins depends
+    on the machine and on the Python version, since asyncio.wait_for was
+    reimplemented in 3.12: this recorded 'succeeded' on 3.11 and 'cancelled'
+    on 3.13 from identical code.
+
+    Rather than test whichever way the race happens to fall, this forces the
+    losing side -- cancellation is never delivered at all -- and asserts the
+    run is still recorded as cancelled, because that is what was asked for.
+    """
+    use_llm(client, tool_turn("browser_click", {"element": "Submit payment"}), final_turn("x"))
+    manager = client.app.state.manager
+
+    # Cancellation requested but never delivered. The agent will therefore run
+    # to completion and produce a 'succeeded' outcome.
+    original = manager.cancel_run
+
+    async def cancel_without_delivering(run_id: str) -> bool:
+        task = manager._tasks.get(run_id)  # noqa: SLF001 - forcing a race outcome
+        if task is None or task.done():
+            return False
+        manager._cancel_requested.add(run_id)  # noqa: SLF001
+        for pending in list(manager._approvals.get(run_id, {}).values()):  # noqa: SLF001
+            if not pending.future.done():
+                pending.future.set_result(("rejected", "run cancelled"))
+        return True
+
+    manager.cancel_run = cancel_without_delivering
+    try:
+        run_id = client.post("/api/runs", json={"task": "pay"}).json()["run_id"]
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if client.get(f"/api/runs/{run_id}").json().get("pending_approval"):
+                break
+            time.sleep(0.05)
+
+        assert client.post(f"/api/runs/{run_id}/cancel").json()["cancelled"] is True
+        body = wait_for_status(client, run_id)
+    finally:
+        manager.cancel_run = original
+
+    assert body["status"] == "cancelled", (
+        "the agent finished before the cancellation landed, and the run was "
+        "recorded as succeeded -- the operator asked for it to stop"
+    )
