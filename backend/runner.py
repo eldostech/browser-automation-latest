@@ -26,6 +26,7 @@ from batch import BatchProgress, BatchRunner, new_batch_id
 from batch import summarise as batch_summarise
 from bus import EventBus
 from config import Settings
+from fields import FieldSet, SECRET_PLACEHOLDER_RE
 from events import (
     AgentEvent,
     ApprovalRequired,
@@ -57,6 +58,35 @@ ApprovalDecision = Literal["approved", "rejected", "timeout"]
 # EventBus lives in bus.py so that the in-memory and cross-process versions
 # are interchangeable; it is re-exported here because this module has always
 # been where callers import it from.
+
+
+def _revealer(secret_values: dict[str, str]):
+    """Build the function that turns placeholders back into credentials.
+
+    Returns None when the run declared no credentials, so the agent's dispatch
+    path keeps its arguments untouched in the common case rather than walking
+    every tool call looking for something that cannot be there.
+
+    The substitution is the last thing that happens before a value leaves this
+    process for the browser. Everything upstream of it -- the prompt, the
+    model's reply, the message history, the recorded event -- carries only
+    «secret:slot».
+    """
+    if not secret_values:
+        return None
+
+    def reveal(node):
+        if isinstance(node, str):
+            return SECRET_PLACEHOLDER_RE.sub(
+                lambda m: secret_values.get(m.group(1), m.group(0)), node
+            )
+        if isinstance(node, dict):
+            return {k: reveal(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [reveal(v) for v in node]
+        return node
+
+    return reveal
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +212,10 @@ class RunRequest:
     #: Values to keep out of the event log, the database and the logs. Anything
     #: here is replaced with a placeholder on its way to any of the three.
     secrets: list[str] = field(default_factory=list)
+    #: Named values the user declared before recording: the inputs that will
+    #: become use case parameters, and the credentials that must never be
+    #: written down. See fields.py for why declaring beats inferring.
+    fields: FieldSet = field(default_factory=FieldSet)
     #: Which tenant this run belongs to, and who asked for it. Carried on the
     #: request rather than held on the manager because the manager is a
     #: process-wide singleton serving every workspace at once.
@@ -276,13 +310,22 @@ class RunManager:
         run_id = uuid.uuid4().hex
         options = request.options or self.default_options()
         spec = AgentSpec(
-            run_id=run_id, task=request.task, start_url=request.start_url, options=options
+            run_id=run_id,
+            task=request.task,
+            start_url=request.start_url,
+            options=options,
+            fields_block=request.fields.prompt_block(),
         )
 
         persisted = {
             **options.to_dict(),
             "headless": self.settings.mcp_headless if request.headless is None else request.headless,
             "browser": request.browser or self.settings.mcp_browser,
+            # Input names and values, and secret slot *names* only. This is what
+            # lets distillation parameterise the recording deterministically
+            # later, and it is safe to store because the secret values are not
+            # in it.
+            "declared": request.fields.persistable(),
         }
         await self._data(request).create_run(
             run_id, request.task, request.start_url, persisted, owner_id=request.owner_id
@@ -381,6 +424,7 @@ class RunManager:
                         agent = BrowserAgent(
                             spec, mcp, self.llm, run.sink, gate,
                             checkpointer=self.checkpointer,
+                            reveal_secrets=_revealer(request.fields.secret_values),
                         )
                         outcome = await agent.run()
 

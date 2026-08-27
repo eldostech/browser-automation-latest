@@ -979,3 +979,94 @@ button.link.danger {
   color: var(--text);
   text-decoration: underline;
 }
+
+/* --- declared field rows --------------------------------------------------
+   Name, value, and a secret toggle. The secret rows are tinted rather than
+   merely checkboxed: whether a value is about to be sent to a model in clear
+   text should be visible at a glance, not something you verify by reading. */
+
+.fieldrows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.fieldrow {
+  display: grid;
+  /* name | value | secret toggle | remove */
+  grid-template-columns: minmax(120px, 1fr) minmax(160px, 2fr) auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+}
+
+.fieldrow.secret {
+  border-color: var(--sensitive);
+  background: color-mix(in srgb, var(--sensitive) 8%, var(--bg-inset));
+}
+
+.fieldrow input[type='text'],
+.fieldrow input[type='password'] {
+  width: 100%;
+  min-width: 0; /* grid children default to min-content and overflow without this */
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.fieldrow-name {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.fieldrow.secret .fieldrow-value {
+  /* Dots are wider than glyphs; give the masked value room to breathe. */
+  letter-spacing: 0.08em;
+}
+
+.fieldrow-secret {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.fieldrow.secret .fieldrow-secret {
+  color: var(--sensitive);
+}
+
+.fieldrow-remove {
+  padding: 4px 9px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.fieldrow-remove:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--border-strong);
+}
+
+@media (max-width: 620px) {
+  .fieldrow {
+    /* Stack rather than squeeze: a 90px value box is unusable. */
+    grid-template-columns: 1fr auto;
+  }
+  .fieldrow-value {
+    grid-column: 1 / -1;
+  }
+}

@@ -1,19 +1,26 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../lib/api';
-import type { CreateRunPayload } from '../lib/api';
+import type { CreateRunPayload, DeclaredField } from '../lib/api';
 import type { ServerConfig } from '../lib/events';
+import { FieldEditor } from './FieldEditor';
 
 interface Props {
   onStarted: (runId: string) => void;
 }
 
+/**
+ * Prose only. The values live in the field rows below, which is what lets the
+ * recording be parameterised afterwards -- and what keeps a password out of a
+ * string that gets stored on the run and shown in the timeline.
+ */
 const EXAMPLE_TASK =
-  'Search for wireless headphones under $50 and export the top 5 results as JSON ' +
-  'with fields: name, price, rating, url.';
+  'Open the contact form, fill in every field from the values provided, and submit it. ' +
+  'Confirm the page shows a success message.';
 
 export function TaskComposer({ onStarted }: Props) {
   const [config, setConfig] = useState<ServerConfig | null>(null);
   const [task, setTask] = useState('');
+  const [fields, setFields] = useState<DeclaredField[]>([]);
   const [startUrl, setStartUrl] = useState('');
   const [maxSteps, setMaxSteps] = useState(30);
   const [timeoutSeconds, setTimeoutSeconds] = useState(300);
@@ -47,8 +54,10 @@ export function TaskComposer({ onStarted }: Props) {
     setError(null);
     setSubmitting(true);
 
+    const usable = fields.filter((f) => f.name.trim() && f.value !== '');
     const payload: CreateRunPayload = {
       task: task.trim(),
+      fields: usable,
       start_url: startUrl.trim() || null,
       max_steps: maxSteps,
       timeout_seconds: timeoutSeconds,
@@ -59,6 +68,10 @@ export function TaskComposer({ onStarted }: Props) {
 
     try {
       const { run_id } = await api.createRun(payload);
+      // Drop the secret values from component state the moment they have been
+      // sent. They are of no further use here, and holding them keeps them in
+      // a heap snapshot and in React devtools for as long as the tab is open.
+      setFields((current) => current.map((f) => (f.secret ? { ...f, value: '' } : f)));
       onStarted(run_id);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
@@ -80,7 +93,13 @@ export function TaskComposer({ onStarted }: Props) {
       {error && <div className="banner error">{error}</div>}
 
       <div className="field">
-        <label htmlFor="task">Task</label>
+        <label htmlFor="task">Instruction</label>
+        <p className="hint">
+          What to do, in words. Leave the actual values out of this — put them in the rows
+          below and refer to them generally ("fill in every field from the values provided",
+          "sign in with the credentials"). That separation is what lets this recording be
+          replayed later against a file of different records.
+        </p>
         <textarea
           id="task"
           value={task}
@@ -89,6 +108,8 @@ export function TaskComposer({ onStarted }: Props) {
           required
         />
       </div>
+
+      <FieldEditor fields={fields} onChange={setFields} disabled={submitting} />
 
       <div className="field">
         <label htmlFor="start-url">Starting URL (optional)</label>

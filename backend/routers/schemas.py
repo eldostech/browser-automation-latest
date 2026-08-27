@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import re
+
 from pydantic import BaseModel, Field, field_validator
 
 from auth.passwords import MIN_PASSWORD_LENGTH
@@ -53,9 +55,43 @@ class UpdateUserRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class DeclaredFieldPayload(BaseModel):
+    """One named value the recording will use.
+
+    Marking a field `secret` changes three things at once: the model is shown a
+    placeholder instead of the value, the value is registered for redaction on
+    the way to storage, and the use case gets a credential *slot* rather than
+    an input column. See `fields.py`.
+    """
+
+    name: str = Field(min_length=1, max_length=64)
+    #: Write-only. No endpoint returns this for a secret field, and the value
+    #: of a secret is never persisted at all.
+    value: str = Field(max_length=4000)
+    secret: bool = False
+    description: str = Field(default="", max_length=300)
+    example: str = Field(default="", max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def _usable_as_a_column(cls, value: str) -> str:
+        stripped = value.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", stripped):
+            raise ValueError(
+                "a field name becomes a CSV column and a template name, so it must "
+                "be letters, digits and underscores, starting with a letter"
+            )
+        return stripped
+
+
 class CreateRunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=8000)
     start_url: str | None = None
+
+    #: The values the task refers to, named. Keeping them out of the prose is
+    #: what lets the recording be parameterised deterministically afterwards --
+    #: and what keeps a password from being pasted into a stored task string.
+    fields: list[DeclaredFieldPayload] = Field(default_factory=list, max_length=50)
 
     # Guardrail overrides; anything omitted falls back to the server defaults.
     max_steps: int | None = Field(default=None, ge=1, le=200)
@@ -131,6 +167,19 @@ class ScriptsRequest(BaseModel):
     enabled: bool
     #: Free text recorded in the audit entry: why this was considered safe.
     reason: str = Field(default="", max_length=1000)
+
+
+class DistillRequest(BaseModel):
+    """Turn a finished recording into a use case.
+
+    `save_credential_as` decides the fate of any credentials the recording
+    used. Naming one seals them into the vault under that name and binds the
+    slots to the use case; leaving it unset discards them. There is no third
+    option -- they are held in memory only until this call resolves.
+    """
+
+    name: str | None = Field(default=None, max_length=200)
+    save_credential_as: str | None = Field(default=None, max_length=120)
 
 
 class RepairRequest(BaseModel):

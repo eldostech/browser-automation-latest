@@ -4,6 +4,7 @@ import type { DistillResult, RunDetail, ScreenshotEvent } from '../lib/events';
 import { useRunStream, isTerminal } from '../lib/useRunStream';
 import { formatDuration } from '../lib/format';
 import { ApprovalBar } from './ApprovalBar';
+import { KeepCredentials } from './KeepCredentials';
 import { NameUseCase } from './NameUseCase';
 import { ResultPanel } from './ResultPanel';
 import { ScreenshotPane } from './ScreenshotPane';
@@ -22,6 +23,16 @@ interface Props {
  * replays the persisted history from seq 0 and then closes, so there is one
  * rendering path instead of two.
  */
+/** The site a run started on, as a credential-name suggestion. */
+function hostOf(url: string | null | undefined): string {
+  if (!url) return '';
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
 export function RunView({ runId, onBack, onRecorded }: Props) {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -30,6 +41,11 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
   // Held between distillation and the name being confirmed: the model's
   // suggestion cannot exist until the recording has been read.
   const [recorded, setRecorded] = useState<DistillResult | null>(null);
+  // Credential slots this run still holds values for. Asked once the run has
+  // finished, so the record button can offer the choice rather than silently
+  // discarding a login the user just typed.
+  const [heldSlots, setHeldSlots] = useState<string[]>([]);
+  const [decidingCredentials, setDecidingCredentials] = useState(false);
 
   const stream = useRunStream(runId);
 
@@ -49,6 +65,14 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
   useEffect(() => {
     if (!stream.finished) return;
     api.getRun(runId).then(setDetail).catch(() => undefined);
+    // Names only -- there is no endpoint that returns a held value. An empty
+    // list is the normal answer both for a run that used no credentials and
+    // for one whose values have since expired; either way there is nothing to
+    // offer to save.
+    api
+      .heldCredentialSlots(runId)
+      .then(({ slots }) => setHeldSlots(slots))
+      .catch(() => setHeldSlots([]));
   }, [stream.finished, runId]);
 
   const screenshots = useMemo(
@@ -88,17 +112,36 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
    * replay feature ever makes: everything the use case is later run with
    * costs nothing.
    */
+  const distil = useCallback(
+    async (saveCredentialAs: string | null) => {
+      setRecording(true);
+      setActionError(null);
+      try {
+        setRecorded(await api.distillRun(runId, { saveCredentialAs }));
+        // Whichever way it went, the backend has now consumed them.
+        setHeldSlots([]);
+        setDecidingCredentials(false);
+      } catch (error) {
+        setActionError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setRecording(false);
+      }
+    },
+    [runId],
+  );
+
+  /**
+   * Turn this run into a use case. When the recording used credentials, the
+   * choice of whether to keep them has to be made first -- distilling is what
+   * consumes them, so afterwards is too late.
+   */
   const record = useCallback(async () => {
-    setRecording(true);
-    setActionError(null);
-    try {
-      setRecorded(await api.distillRun(runId));
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setRecording(false);
+    if (heldSlots.length > 0) {
+      setDecidingCredentials(true);
+      return;
     }
-  }, [runId, onRecorded]);
+    await distil(null);
+  }, [heldSlots, distil]);
 
   /** Apply the confirmed name, then open the use case for review. */
   const confirmName = useCallback(
@@ -164,6 +207,16 @@ export function RunView({ runId, onBack, onRecorded }: Props) {
       </div>
 
       {actionError && <div className="banner error">{actionError}</div>}
+
+      {decidingCredentials && (
+        <KeepCredentials
+          slots={heldSlots}
+          suggestion={hostOf(detail?.start_url) || ''}
+          busy={recording}
+          onDecide={distil}
+          onCancel={() => setDecidingCredentials(false)}
+        />
+      )}
 
       {recorded && (
         <NameUseCase

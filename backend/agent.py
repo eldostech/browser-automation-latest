@@ -147,6 +147,10 @@ class AgentSpec:
     task: str
     start_url: str | None = None
     options: RunOptions = field(default_factory=RunOptions)
+    #: Rendered table of the values the user declared, appended to the task.
+    #: Secrets appear as their placeholder, never as their value -- the prompt
+    #: and the message history built from it must stay safe to persist.
+    fields_block: str = ""
 
 
 @dataclass(slots=True)
@@ -185,12 +189,17 @@ class BrowserAgent:
         sink: EventSink,
         approvals: ApprovalGate,
         checkpointer: Any | None = None,
+        reveal_secrets: Any = None,
     ) -> None:
         self.spec = spec
         self.mcp = mcp
         self.llm = llm
         self.sink = sink
         self.approvals = approvals
+        #: Turns «secret:slot» placeholders back into real credentials, applied
+        #: to tool arguments immediately before dispatch. None when the run
+        #: declared no credentials, which is the common case.
+        self.reveal_secrets = reveal_secrets
         #: Where the graph persists its state between supersteps. None means
         #: LangGraph's in-memory saver, which is right for tests and wrong for
         #: production -- see checkpoints.py.
@@ -459,11 +468,17 @@ class BrowserAgent:
     async def _invoke_with_retry(self, call: ToolCallRequest) -> dict[str, Any]:
         last_error: Exception | None = None
 
+        # The last moment before the value leaves this process. The model was
+        # given «secret:slot» and echoes it back here; the real credential is
+        # substituted now and exists nowhere else -- not in the prompt, not in
+        # the message history, not in the event this call is recorded as.
+        arguments = self.reveal_secrets(call.input) if self.reveal_secrets else call.input
+
         for attempt in range(1, len(RETRY_BACKOFF) + 1):
             self._check_deadline()
             try:
                 outcome = await self.mcp.call_tool(
-                    call.name, call.input, timeout=min(self._remaining(), self.mcp.config.tool_timeout)
+                    call.name, arguments, timeout=min(self._remaining(), self.mcp.config.tool_timeout)
                 )
             except MCPToolError as exc:
                 last_error = exc
@@ -707,7 +722,7 @@ class BrowserAgent:
         options = self.spec.options
         return render(
             TASK,
-            task=self.spec.task,
+            task=self.spec.task + self.spec.fields_block,
             allowed_domains=", ".join(options.allowed_domains)
             or "(none -- navigation is blocked)",
             max_steps=options.max_steps,

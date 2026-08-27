@@ -359,3 +359,107 @@ def test_screenshots_are_served_as_artifacts(client):
 
 def test_unknown_artifact_is_404(client):
     assert client.get("/api/artifacts/deadbeef").status_code == 404
+
+
+# --- declared fields and credential handling --------------------------------
+
+
+def test_a_declared_credential_never_reaches_storage(client):
+    """End to end: the value goes to the browser and nowhere else.
+
+    The strongest form of this assertion is a search of everything that was
+    persisted -- the run row, every event, the task text -- for the literal
+    password. Anything weaker tests the mechanism rather than the guarantee.
+    """
+    use_llm(
+        client,
+        tool_turn(
+            "browser_type",
+            {"text": "«secret:password»", "element": "Password"},
+            text="Filling the password in.",
+        ),
+        final_turn("Signed in."),
+    )
+
+    created = client.post(
+        "/api/runs",
+        json={
+            # Typing into a password field is a sensitive action, so the
+            # default policy would pause for approval. This test is about where
+            # the value ends up, not about the approval gate.
+            "require_approval": False,
+            "task": "Sign in with the credentials provided.",
+            "fields": [
+                {"name": "work_email", "value": "nitin@example.com"},
+                {"name": "password", "value": "s3cret-Example-Pw!", "secret": True},
+            ],
+        },
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["run_id"]
+    wait_for_status(client, run_id)
+
+    everything = client.get(f"/api/runs/{run_id}").text
+    everything += client.get(f"/api/runs/{run_id}/events").text
+
+    assert "s3cret-Example-Pw!" not in everything
+    # The declared *input* is ordinary data and is supposed to survive: it is
+    # what makes the recording parameterisable.
+    assert "nitin@example.com" in everything
+
+
+def test_the_run_records_its_declared_fields(client):
+    use_llm(client, final_turn("done"))
+    run_id = client.post(
+        "/api/runs",
+        json={
+            "task": "Fill the form in.",
+            "fields": [
+                {"name": "full_name", "value": "Nitin Asati", "description": "Contact name"},
+                {"name": "password", "value": "s3cret-Example-Pw!", "secret": True},
+            ],
+        },
+    ).json()["run_id"]
+    wait_for_status(client, run_id)
+
+    options = client.get(f"/api/runs/{run_id}").json()["options"]
+    declared = options["declared"]
+    assert declared["inputs"] == {"full_name": "Nitin Asati"}
+    assert declared["secret_slots"] == ["password"]
+    assert "s3cret-Example-Pw!" not in str(options)
+
+
+def test_held_credential_slots_are_reported_by_name_only(client):
+    use_llm(client, final_turn("done"))
+    run_id = client.post(
+        "/api/runs",
+        json={
+            "task": "Sign in.",
+            "fields": [{"name": "password", "value": "s3cret-Example-Pw!", "secret": True}],
+        },
+    ).json()["run_id"]
+    wait_for_status(client, run_id)
+
+    body = client.get(f"/api/runs/{run_id}/credential-slots").json()
+    assert body["slots"] == ["password"]
+    assert "s3cret-Example-Pw!" not in str(body)
+
+
+def test_a_run_with_no_credentials_holds_nothing(client):
+    use_llm(client, final_turn("done"))
+    run_id = client.post(
+        "/api/runs",
+        json={"task": "Read the page.", "fields": [{"name": "city", "value": "Manchester"}]},
+    ).json()["run_id"]
+    wait_for_status(client, run_id)
+
+    assert client.get(f"/api/runs/{run_id}/credential-slots").json()["slots"] == []
+
+
+def test_an_unusable_field_name_is_refused(client):
+    response = client.post(
+        "/api/runs",
+        json={"task": "x", "fields": [{"name": "full name", "value": "Nitin"}]},
+    )
+    assert response.status_code == 422
+    assert "field name" in response.text

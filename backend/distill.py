@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from events import AgentEvent
 from prompt_loader import DISTILL, load
 from snapshot import Snapshot, extract_ref, is_ref, parse as parse_snapshot
+from fields import parameterise, substitution_map
 from usecase import (
     Assertion,
     FormField,
@@ -485,19 +486,74 @@ def summarise(result: PreFilterResult) -> str:
     )
 
 
-def as_prompt_json(result: PreFilterResult, task: str) -> str:
+def apply_declarations(result: PreFilterResult, declared: dict[str, Any] | None) -> list[str]:
+    """Rewrite recorded values into templates, using what the user declared.
+
+    This is the deterministic half of parameterisation, and it runs *before*
+    the model sees anything. Where the old flow showed the model a list of
+    literals and asked which ones vary per row, a declared field needs no such
+    judgement: the user said "full_name is Nitin Asati", so every occurrence of
+    that string becomes ``{{input.full_name}}`` by lookup.
+
+    Secrets need no lookup at all. They were never recorded in the first place:
+    the model was given ``«secret:password»`` and the real value was
+    substituted at dispatch, so the recording already contains the placeholder
+    and this only rewrites its spelling to ``{{secret.password}}``.
+
+    Returns the names actually found, so the caller can warn about a field that
+    was declared and then never used -- which usually means the recording did
+    not go the way the user thought it did.
+    """
+    mapping = substitution_map(declared or {})
+    found: list[str] = []
+
+    for step in result.steps:
+        before = json.dumps(step.arguments, sort_keys=True, ensure_ascii=False)
+        step.arguments = parameterise(step.arguments, mapping)
+        if step.value is not None:
+            step.value = parameterise(step.value, mapping)
+        if step.url is not None:
+            step.url = parameterise(step.url, mapping)
+        if step.fields:
+            step.fields = parameterise(step.fields, mapping)
+        after = json.dumps(step.arguments, sort_keys=True, ensure_ascii=False)
+        if before != after:
+            for literal, template in mapping.items():
+                if literal in before and template not in found:
+                    found.append(template)
+
+    # A declared value that never reached the page is worth surfacing: it means
+    # the recording typed something else, or nothing at all.
+    result.literals = [
+        literal for literal in result.literals if literal not in mapping
+    ]
+    return found
+
+
+def as_prompt_json(result: PreFilterResult, task: str, declared: dict[str, Any] | None = None) -> str:
     """The compact JSON document the distiller prompt embeds."""
-    return json.dumps(
-        {
-            "task": task,
-            "start_url": result.start_url,
-            "observed_domains": result.domains,
-            "literal_values": result.literals,
-            "steps": result.to_prompt_payload(),
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
+    payload: dict[str, Any] = {
+        "task": task,
+        "start_url": result.start_url,
+        "observed_domains": result.domains,
+        "literal_values": result.literals,
+        "steps": result.to_prompt_payload(),
+    }
+    if declared:
+        # Told to the model as settled fact, not as a suggestion. The steps it
+        # is shown already contain these templates, so its job is to select and
+        # order steps rather than to decide what varies.
+        payload["already_parameterised"] = {
+            "inputs": sorted((declared.get("inputs") or {})),
+            "secrets": sorted(declared.get("secret_slots") or []),
+            "note": (
+                "The user declared these before recording and the steps below already "
+                "reference them as {{input.name}} / {{secret.name}}. Do not rename them, "
+                "do not add them to your `inputs` or `secrets` lists, and do not "
+                "parameterise anything else that looks similar."
+            ),
+        }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -720,12 +776,68 @@ def _build_step(recorded: RecordedStep, plan: dict[str, Any], *, step_id: str) -
     return Step(**kwargs)
 
 
+def _merge_input_specs(
+    proposed: list[dict[str, Any]], declared: dict[str, Any] | None
+) -> list[InputSpec]:
+    """Input specs, with anything the user declared taking precedence.
+
+    The model is allowed to propose inputs -- a recording can legitimately have
+    a per-row value the user did not think to declare. But where the two
+    disagree about a name the user chose, the user wins: they named the column
+    their CSV will carry, and a model renaming it to something tidier would
+    silently break the file they have already prepared.
+    """
+    by_name: dict[str, InputSpec] = {}
+    for spec in proposed:
+        try:
+            entry = InputSpec(**spec)
+        except Exception:  # noqa: BLE001 - a malformed proposal is not fatal
+            continue
+        by_name[entry.name] = entry
+
+    meta = (declared or {}).get("input_meta") or {}
+    for name in (declared or {}).get("inputs") or {}:
+        hint = meta.get(name) or {}
+        existing = by_name.get(name)
+        by_name[name] = InputSpec(
+            name=name,
+            type=existing.type if existing else "string",
+            required=True,
+            description=hint.get("description") or (existing.description if existing else ""),
+            example=hint.get("example") or "",
+        )
+    return list(by_name.values())
+
+
+def _merge_secret_specs(
+    proposed: list[dict[str, Any]], declared: dict[str, Any] | None
+) -> list[SecretSpec]:
+    """Credential slots, with declared ones taking precedence.
+
+    A declared slot is certain: the user marked that field secret, so the
+    recording definitely used a credential by that name. A proposed one is the
+    model's reading of a recording where nothing was declared, which is still
+    worth keeping for the older flow.
+    """
+    by_name: dict[str, SecretSpec] = {}
+    for spec in proposed:
+        try:
+            entry = SecretSpec(**spec)
+        except Exception:  # noqa: BLE001
+            continue
+        by_name[entry.name] = entry
+    for name in (declared or {}).get("secret_slots") or []:
+        by_name[name] = SecretSpec(name=name)
+    return list(by_name.values())
+
+
 def build_usecase(
     plan: dict[str, Any],
     pre: PreFilterResult,
     *,
     source_run_id: str | None = None,
     task: str = "",
+    declared: dict[str, Any] | None = None,
 ) -> UseCase:
     """Assemble a :class:`UseCase` from the model's plan and the recording.
 
@@ -883,13 +995,13 @@ def build_usecase(
     # An input nothing reads is worse than useless: it demands a value per row
     # and then ignores it. This happens when the model parameterises a literal
     # that lives inside `script` code, which nothing can substitute into.
-    declared = [InputSpec(**spec) for spec in (plan.get("inputs") or [])]
+    specs = _merge_input_specs(plan.get("inputs") or [], declared)
     referenced = {name for step in all_steps for kind, name in step.references() if kind == "input"}
     if row_reset is not None:
         referenced |= {name for kind, name in row_reset.references() if kind == "input"}
 
-    used = [spec for spec in declared if spec.name in referenced]
-    unused = [spec.name for spec in declared if spec.name not in referenced]
+    used = [spec for spec in specs if spec.name in referenced]
+    unused = [spec.name for spec in specs if spec.name not in referenced]
     if unused:
         warnings.append(
             "dropped input(s) that no step reads: "
@@ -918,7 +1030,7 @@ def build_usecase(
         allowed_domains=list(pre.domains),
         allow_scripts=False,
         inputs=used,
-        secrets=[SecretSpec(**spec) for spec in (plan.get("secrets") or [])],
+        secrets=_merge_secret_specs(plan.get("secrets") or [], declared),
         setup_steps=setup_steps,
         session_check=session_check,
         row_reset=row_reset,
@@ -949,12 +1061,18 @@ async def distill(
     task: str,
     llm: Any,
     source_run_id: str | None = None,
+    declared: dict[str, Any] | None = None,
     timeout: float = 120.0,
 ) -> UseCase:
     """Pre-filter a run, then spend exactly one LLM call turning it into a use case.
 
     This is the only function in the replay feature that touches a model. Its
     cost is paid once and amortised over every future execution.
+
+    ``declared`` is what the user named before recording, read back off the
+    run. Where it is present, parameterisation stops being a judgement call:
+    the values are substituted by lookup before the model is asked anything,
+    and the resulting inputs and secrets carry the names the user chose.
     """
     pre = pre_filter(events)
     if not pre.steps:
@@ -963,9 +1081,13 @@ async def distill(
             "failed or was observation-only."
         )
 
+    # Before the model sees the recording, not after: shown the real literals
+    # it would parameterise them again, under names of its own choosing.
+    substituted = apply_declarations(pre, declared)
+
     turn = await llm.run_turn(
         system=load(DISTILL),
-        messages=[{"role": "user", "content": as_prompt_json(pre, task)}],
+        messages=[{"role": "user", "content": as_prompt_json(pre, task, declared)}],
         tools=[BUILD_TOOL],
         timeout=timeout,
     )
@@ -977,6 +1099,30 @@ async def distill(
             + (turn.text or "(nothing)")[:400]
         )
 
-    usecase = build_usecase(call.input, pre, source_run_id=source_run_id, task=task)
+    usecase = build_usecase(
+        call.input, pre, source_run_id=source_run_id, task=task, declared=declared
+    )
     usecase.warnings.insert(0, summarise(pre))
+
+    # A field the user declared and the recording never used means the run did
+    # not go the way they expected -- worth saying, because the use case will
+    # then ask for a value on every row and put it nowhere.
+    unused = _declared_but_unused(declared, substituted)
+    if unused:
+        usecase.warnings.append(
+            "declared field(s) never appeared in the recording: "
+            + ", ".join(unused)
+            + ". The run may not have entered them, or entered something else. Check the "
+            "steps before publishing."
+        )
     return usecase
+
+
+def _declared_but_unused(
+    declared: dict[str, Any] | None, substituted: list[str]
+) -> list[str]:
+    expected = {f"{{{{input.{name}}}}}" for name in (declared or {}).get("inputs") or {}}
+    return sorted(
+        name.removeprefix("{{input.").removesuffix("}}")
+        for name in expected - set(substituted)
+    )

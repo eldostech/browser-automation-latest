@@ -25,9 +25,28 @@ import { session, type CurrentUser } from './session';
 /** Empty by default: Vite (dev) and nginx (prod) proxy /api to the backend. */
 export const API_BASE: string = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
 
+/**
+ * One named value a recording will use.
+ *
+ * `secret: true` changes three things at once on the server: the model is
+ * shown a placeholder instead of the value, the value is registered for
+ * redaction, and the resulting use case gets a credential slot rather than an
+ * input column. The value is write-only in both directions — no endpoint
+ * returns it, and nothing here should ever put it in application state longer
+ * than the form needs it.
+ */
+export interface DeclaredField {
+  name: string;
+  value: string;
+  secret: boolean;
+  description?: string;
+}
+
 export interface CreateRunPayload {
   task: string;
   start_url?: string | null;
+  /** Values the instruction refers to, named. See DeclaredField. */
+  fields?: DeclaredField[];
   max_steps?: number;
   timeout_seconds?: number;
   allowed_domains?: string[];
@@ -152,8 +171,26 @@ export const api = {
   // --- use cases ------------------------------------------------------------
 
   /** Promote a succeeded run into a reusable use case. The one LLM call. */
-  distillRun: (runId: string) =>
-    request<DistillResult>(`/api/runs/${runId}/distill`, { method: 'POST' }),
+  /**
+   * Turn a finished recording into a use case.
+   *
+   * `saveCredentialAs` decides what happens to the credentials the recording
+   * used: naming one keeps them, omitting it discards them. There is no third
+   * option — they are held in memory on the backend only until this call
+   * resolves, so not choosing *is* discarding.
+   */
+  distillRun: (runId: string, options?: { name?: string; saveCredentialAs?: string | null }) =>
+    request<DistillResult>(`/api/runs/${runId}/distill`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: options?.name ?? null,
+        save_credential_as: options?.saveCredentialAs ?? null,
+      }),
+    }),
+
+  /** Which credential slots this run still holds values for. Names only. */
+  heldCredentialSlots: (runId: string) =>
+    request<{ run_id: string; slots: string[] }>(`/api/runs/${runId}/credential-slots`),
 
   listUseCases: (status?: string) => {
     const params = new URLSearchParams();

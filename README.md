@@ -409,6 +409,80 @@ MCP_SERVER_URL=http://localhost:8931/sse
 
 ---
 
+## Writing a task: instruction and values
+
+A run is described in two parts, and keeping them apart is what makes the
+recording reusable afterwards.
+
+**The instruction** says what to do, in words, and names no values:
+
+> Open the contact form, fill in every field from the values provided, and
+> submit it. Confirm the page shows a success message.
+
+**The values** are named rows beneath it:
+
+| Name | Value | Secret |
+|---|---|---|
+| `full_name` | Nitin Asati | |
+| `work_email` | nitin@example.com | |
+| `password` | ●●●●●●●● | ✓ |
+
+### Why not just write it all in the prose
+
+Because three things become impossible once the values are embedded in a
+sentence:
+
+* **The password is in clear text.** The task string is stored on the run and
+  shown in the timeline. A credential pasted into it is a credential written
+  down.
+* **Nothing knows which words are parameters.** When the recording is turned
+  into a reusable use case, something has to decide that `Nitin Asati` varies
+  per record but `Submit` does not. Guessing is the wrong mechanism for
+  something you already know.
+* **You find out what the parameters are afterwards**, from whatever was
+  guessed, rather than declaring them.
+
+Naming them fixes all three at once. `full_name` becomes the CSV column
+`full_name` — deterministically, by matching the value you supplied, with no
+model judgement involved.
+
+### What "secret" changes
+
+Marking a row secret changes its handling in three places:
+
+1. **The model never sees the value.** It is shown `«secret:password»` and
+   types that; the real credential is substituted at the moment the tool call
+   reaches the browser. This matters more than redaction does, because the
+   message history is replayed to the model on every turn — a secret that
+   enters the conversation cannot be taken back out of it later.
+2. **Nothing persists it.** Not the task, not the run options, not an event.
+   The recording contains the placeholder, so the use case can still be
+   parameterised without the value ever being stored.
+3. **The use case gets a credential slot**, not an input column — so the
+   operator running a thousand records binds one stored login instead of
+   putting a password in a spreadsheet.
+
+Redaction still runs as a second line of defence: the model is never given the
+credential, but a *page* can echo one back into a tool result, and that path
+still needs cleaning.
+
+### What happens to the credentials afterwards
+
+They are held in the backend's memory for the life of the recording, and
+nowhere else. When you press **Record as use case** you are asked once:
+
+* **Save them as …** — sealed into the encrypted vault under a name, reusable
+  by any use case in the workspace needing the same slots.
+* **Discard them** — forgotten immediately.
+
+There is no third option, and doing nothing is discarding: a restart, or half
+an hour's inactivity, drops them. That is deliberate. The common case is a
+recording you throw away, and the alternative design — writing them down and
+deleting them if unwanted — puts a password in durable storage every time you
+experiment.
+
+---
+
 ## Walkthrough: one task, start to finish
 
 The example below uses `example.com` because it is in the default allowlist and

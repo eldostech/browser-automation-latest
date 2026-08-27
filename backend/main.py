@@ -27,6 +27,7 @@ from jobs import JobQueue
 from logging_setup import configure_logging
 from mcp_client import MCPConfig, probe
 from routers import ALL_ROUTERS
+from stash import SecretStash
 from runner import ReplayManager, RunManager
 from store import Store
 
@@ -69,6 +70,10 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.auth = AuthService(store.sessions, settings)
     app.state.queue = JobQueue(store.sessions)
+    # Credentials a recording used, held only until the user decides whether
+    # to keep them. In memory, with a TTL, and never written down -- see
+    # stash.py for what that costs and why it is the right trade.
+    app.state.stash = SecretStash()
 
     # A deployment must have an administrator to be reachable at all.
     generated = await app.state.auth.bootstrap()

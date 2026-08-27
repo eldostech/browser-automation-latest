@@ -11,6 +11,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -28,6 +29,7 @@ from deps import (
     run_or_404,
 )
 from events import TERMINAL_STATUSES, dump_event
+from fields import FieldSet
 from routers.schemas import ApprovalRequest, CreateRunRequest, CreateRunResponse
 from runner import RunManager, RunRequest
 
@@ -46,6 +48,7 @@ Manager = Annotated[RunManager, Depends(get_manager)]
 @router.post("/runs", response_model=CreateRunResponse, status_code=201)
 async def create_run(
     body: CreateRunRequest,
+    request: Request,
     manager: Manager,
     principal: Annotated[Principal, Depends(require(Permission.RUN_CREATE))],
 ) -> CreateRunResponse:
@@ -61,6 +64,11 @@ async def create_run(
     if body.screenshot_every_step is not None:
         options.screenshot_every_step = body.screenshot_every_step
 
+    try:
+        fields = FieldSet.from_payload([f.model_dump() for f in body.fields])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     run_id = await manager.start_run(
         RunRequest(
             task=body.task,
@@ -69,10 +77,19 @@ async def create_run(
             headless=body.headless,
             browser=body.browser,
             secrets=list(body.secrets or []),
+            fields=fields,
             workspace_id=principal.workspace_id,
             owner_id=principal.user_id,
         )
     )
+
+    # Held in memory only, and only until the user decides whether to keep
+    # them. Nothing about this reaches disk. See stash.py.
+    if fields.secret_values:
+        request.app.state.stash.put(
+            run_id, fields.secret_values, workspace_id=principal.workspace_id
+        )
+
     return CreateRunResponse(run_id=run_id, status="pending")
 
 
@@ -109,6 +126,30 @@ async def get_run(
             {"id": a.id, "kind": a.kind, "mime": a.mime, "url": f"/api/artifacts/{a.id}"}
             for a in await data.list_artifacts(run_id)
         ],
+    }
+
+
+@router.get("/runs/{run_id}/credential-slots")
+async def held_credential_slots(
+    run_id: str,
+    request: Request,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.RUN_READ))],
+) -> dict[str, Any]:
+    """Which credential slots this recording still has values for.
+
+    Names only -- there is no endpoint that returns a held value. The UI asks
+    this when offering "save these credentials with the use case", so that it
+    only offers when there is something to save and can say which slots.
+
+    An empty list is the normal answer for a run that used no credentials, and
+    also for one whose values have expired. The two are deliberately not
+    distinguished: either way there is nothing to save.
+    """
+    await run_or_404(run_id, data)
+    return {
+        "run_id": run_id,
+        "slots": request.app.state.stash.slots(run_id, workspace_id=principal.workspace_id),
     }
 
 

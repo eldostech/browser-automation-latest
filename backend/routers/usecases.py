@@ -5,12 +5,21 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from auth.rbac import Permission
 from auth.service import Principal
-from deps import WorkspaceData, get_manager, get_replays, require, run_or_404, usecase_or_404
+from credentials import NO_KEY_MESSAGE, Vault, new_credential_id
+from deps import (
+    WorkspaceData,
+    get_manager,
+    get_replays,
+    get_vault,
+    require,
+    run_or_404,
+    usecase_or_404,
+)
 from distill import DistillationError, distill
 from repair import (
     RepairError,
@@ -21,7 +30,7 @@ from repair import (
     is_unchanged,
     validate_patched,
 )
-from routers.schemas import RenameRequest, RepairRequest, ScriptsRequest
+from routers.schemas import DistillRequest, RenameRequest, RepairRequest, ScriptsRequest
 from runner import ReplayManager, RunManager
 from services import find_failed_execution
 from usecase import UseCase
@@ -37,9 +46,12 @@ Replays = Annotated[ReplayManager, Depends(get_replays)]
 @router.post("/runs/{run_id}/distill", status_code=201)
 async def distill_run(
     run_id: str,
+    request: Request,
     data: WorkspaceData,
     manager: Manager,
+    vault: Annotated[Vault, Depends(get_vault)],
     principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+    body: DistillRequest | None = None,
 ) -> dict[str, Any]:
     """Promote a successful run into a reusable use case.
 
@@ -58,9 +70,17 @@ async def distill_run(
         )
 
     events = await data.get_events(run_id)
+    # What the user named before recording. Present, parameterisation is a
+    # lookup rather than a judgement -- see fields.py.
+    declared = (run.options or {}).get("declared") or {}
+
     try:
         use_case = await distill(
-            events, task=run.task, llm=manager.distill_llm, source_run_id=run_id
+            events,
+            task=run.task,
+            llm=manager.distill_llm,
+            source_run_id=run_id,
+            declared=declared,
         )
     except DistillationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -72,12 +92,23 @@ async def distill_run(
             detail=f"This run could not be turned into a use case: {exc}",
         ) from exc
 
+    body = body or DistillRequest()
+    if body.name:
+        use_case.name = body.name.strip() or use_case.name
+
     definition = use_case.model_dump(mode="json", by_alias=True)
     usecase_id, version = await data.save_usecase(
         definition,
         created_by="distilled",
         created_by_id=principal.user_id,
         owner_id=principal.user_id,
+    )
+
+    # The credentials the recording used have been sitting in memory since it
+    # started. This is the moment they are either kept or forgotten -- there is
+    # no third state, and doing nothing means forgetting.
+    credential = await _resolve_recorded_credential(
+        request.app.state.stash, run_id, body, data, vault, principal
     )
 
     await data.audit(
@@ -106,6 +137,60 @@ async def distill_run(
         "inputs": [spec.name for spec in use_case.inputs],
         "secrets": [spec.name for spec in use_case.secrets],
         "blocked_scripts": use_case.blocked_scripts,
+        "credential": credential,
+    }
+
+
+async def _resolve_recorded_credential(
+    stash, run_id: str, body: DistillRequest, data, vault: Vault, principal: Principal
+) -> dict[str, Any] | None:
+    """Save the recording's credentials, or discard them. Never neither.
+
+    ``take`` removes them from memory whichever way this goes, so an aborted
+    save does not leave a password sitting in the process.
+    """
+    values = stash.take(run_id, workspace_id=principal.workspace_id)
+    if not values:
+        return None
+
+    if not body.save_credential_as:
+        log.info(
+            "discarded the credentials a recording used",
+            extra={"run_id": run_id, "slots": len(values)},
+        )
+        return {"saved": False, "slots": sorted(values)}
+
+    if not vault.available:
+        # Refusing beats pretending: the user asked for them to be kept and
+        # they cannot be, so say so rather than silently dropping them.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                NO_KEY_MESSAGE + " The credentials from this recording have been "
+                "discarded; set the key and re-record, or add them by hand later."
+            ),
+        )
+
+    credential_id = await data.save_credential(
+        new_credential_id(),
+        body.save_credential_as.strip(),
+        Vault.slots_of(values),
+        vault.seal(values),
+        owner_id=principal.user_id,
+    )
+    await data.audit(
+        "credential.save",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="credential",
+        resource_id=credential_id,
+        detail={"name": body.save_credential_as, "from_run": run_id},
+    )
+    return {
+        "saved": True,
+        "id": credential_id,
+        "name": body.save_credential_as.strip(),
+        "slots": Vault.slots_of(values),
     }
 
 
