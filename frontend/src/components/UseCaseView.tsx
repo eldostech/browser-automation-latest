@@ -77,6 +77,16 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
     return () => window.clearInterval(timer);
   }, [batch]);
 
+  /**
+   * Does this use case sign in at all?
+   *
+   * The distillation records a `secrets` slot for every value the recording
+   * typed into a password field. No slots means no sign-in, and every piece of
+   * credential UI below is then not merely unnecessary but misleading -- it
+   * reads as something the run is waiting for.
+   */
+  const needsCredentials = (useCase?.secrets.length ?? 0) > 0;
+
   const missingSlots = useMemo(() => {
     if (!useCase) return [];
     const chosen = credentials.find((c) => c.id === credentialId);
@@ -475,22 +485,29 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
 
       {mode !== 'review' && (
         <>
-          <div className="card">
-            <h3>Sign in as</h3>
-            <select value={credentialId} onChange={(e) => setCredentialId(e.target.value)}>
-              <option value="">(no credential)</option>
-              {credentials.map((credential) => (
-                <option key={credential.id} value={credential.id}>
-                  {credential.name} — {credential.slots.join(', ')}
-                </option>
-              ))}
-            </select>
-            {missingSlots.length > 0 && (
-              <p className="hint" style={{ color: 'var(--danger)' }}>
-                This use case still needs: {missingSlots.join(', ')}. Add them below.
-              </p>
-            )}
-          </div>
+          {/* Only for a use case that actually signs in. A recording with no
+              secrets has nothing to bind a credential to, and offering the
+              choice reads as a requirement -- which is how a use case that
+              needed no credentials ended up looking like it was asking for
+              one. */}
+          {needsCredentials && (
+            <div className="card">
+              <h3>Sign in as</h3>
+              <select value={credentialId} onChange={(e) => setCredentialId(e.target.value)}>
+                <option value="">(no credential)</option>
+                {credentials.map((credential) => (
+                  <option key={credential.id} value={credential.id}>
+                    {credential.name} — {credential.slots.join(', ')}
+                  </option>
+                ))}
+              </select>
+              {missingSlots.length > 0 && (
+                <p className="hint" style={{ color: 'var(--danger)' }}>
+                  This use case still needs: {missingSlots.join(', ')}. Add them below.
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="card">
             <h3>Browser</h3>
@@ -510,12 +527,18 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             </label>
           </div>
 
-          {(missingSlots.length > 0 || credentials.length === 0 || !vaultAvailable) && (
-            <CredentialsPanel
-              requiredSlots={useCase.secrets.map((s) => s.name)}
-              onChange={load}
-            />
-          )}
+          {/* `credentials.length === 0` and `!vaultAvailable` say something
+              about the *installation*, not about this use case -- so they only
+              matter once this use case needs a credential at all. Without the
+              first clause, a fresh install showed the add-a-credential form on
+              every use case, including ones that never sign in. */}
+          {needsCredentials &&
+            (missingSlots.length > 0 || credentials.length === 0 || !vaultAvailable) && (
+              <CredentialsPanel
+                requiredSlots={useCase.secrets.map((s) => s.name)}
+                onChange={load}
+              />
+            )}
         </>
       )}
 

@@ -79,6 +79,26 @@ USE_CASE = {
     "outputs": ["score"],
 }
 
+#: A recording that never signs in -- a public form, which is what most of them
+#: are. Kept whole rather than derived from USE_CASE by deleting `secrets`,
+#: because that leaves the setup steps referencing {{secret.*}} and the use
+#: case is then correctly rejected as invalid: it declares nothing but uses
+#: something. The interesting case is a use case with no secrets *anywhere*.
+NO_LOGIN_USE_CASE = {
+    "name": "Open a public record",
+    "status": "ready",
+    "allowed_domains": ["example.com"],
+    "inputs": [{"name": "record_url", "type": "url", "required": True}],
+    "secrets": [],
+    "setup_steps": [],
+    "row_reset": {"id": "reset", "action": "navigate", "url": "{{input.record_url}}"},
+    "row_steps": [
+        {"id": "s1", "action": "extract", "output": "score",
+         "locators": [{"strategy": "role", "role": "status", "name": "Score"}]},
+    ],
+    "outputs": ["score"],
+}
+
 
 @pytest.fixture
 def client(db_settings, db_engine, tmp_path, monkeypatch):
@@ -231,6 +251,40 @@ async def test_the_vault_reports_itself_disabled_without_a_key(client: TestClien
 
     assert response.status_code == 503
     assert "CREDENTIALS_KEY" in response.json()["detail"]
+
+
+# --- use cases that do not sign in -----------------------------------------
+
+
+async def test_a_use_case_with_no_secrets_runs_without_a_credential(client: TestClient):
+    """The common case, and the one that had no test.
+
+    Every other fixture here declares `secrets`, so nothing exercised a
+    recording that never signs in -- which is most of them. A contact form, for
+    instance, has no login at all, and asking for a credential before running
+    it is asking for something that does not exist.
+    """
+    usecase_id = await seed(client, NO_LOGIN_USE_CASE)
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={"inputs": {"record_url": "https://example.com/r"}},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "succeeded"
+
+
+async def test_a_use_case_with_no_secrets_batches_without_a_credential(client: TestClient):
+    usecase_id = await seed(client, NO_LOGIN_USE_CASE)
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": "record_url\nhttps://example.com/a\nhttps://example.com/b\n"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["total"] == 2
 
 
 # --- guards ----------------------------------------------------------------
