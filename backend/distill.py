@@ -1135,6 +1135,27 @@ def build_usecase(
             "fatal, but as recorded every row gets the same value."
         )
 
+    # A step whose only locator is a css selector or raw text is fragile: it
+    # was not resolved against the accessibility tree, so it cannot survive a
+    # markup change and cannot be retargeted by a repair. Worth saying while a
+    # person is reviewing, because the failure otherwise arrives on the first
+    # replay as "does not match any elements".
+    fragile = [
+        step.id
+        for step in all_steps
+        if step.locators and all(loc.strategy != "role" for loc in step.locators)
+    ]
+    if fragile:
+        warnings.append(
+            "step(s) "
+            + ", ".join(fragile)
+            + " are targeted by a CSS selector or text rather than by role and name, "
+            "so they will break on any markup change and cannot be repaired "
+            "automatically. This happens when the recording passed a selector instead "
+            "of an element ref. Re-recording usually fixes it; otherwise edit the "
+            "locator by hand."
+        )
+
     # A use case with no allowlist cannot navigate anywhere: replay enforces the
     # use case's own list, not the server's, so every navigation is refused with
     # "its host is not in the allowed domain list (empty)". That happened when a

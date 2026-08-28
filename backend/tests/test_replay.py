@@ -802,3 +802,32 @@ async def test_an_empty_snapshot_does_not_leave_stale_refs_matchable():
     assert "no element matched" in (result.error or "")
     # The click was never attempted with a ref from the vanished page.
     assert not mcp.calls_to("browser_click")
+
+
+async def test_a_css_only_ladder_also_waits_for_the_page():
+    """The settle-wait must not depend on which rungs were recorded.
+
+    A css or text rung is handed to the server, which does its own matching,
+    so there is nothing here to retry -- but dispatching one at a page that has
+    not rendered yet fails just as surely as a role lookup. A ladder with no
+    role rung previously got no wait at all, and a recording that produced css
+    selectors failed on its first field every time.
+    """
+    use_case = UseCase(
+        name="x", allowed_domains=["example.com"],
+        row_steps=[
+            Step(id="s1", action="fill", value="someone",
+                 locators=[Locator(strategy="css", selector='[placeholder="you@x.com"]')]),
+        ],
+    )
+    mcp = ScriptedMCP([SIGNED_OUT])
+    _slow_render(mcp, blank_snapshots=2)
+
+    runner = executor(use_case, mcp, step_timeout=5.0)
+    result = await runner.run_row({})
+
+    assert result.ok, result.error
+    typed = mcp.calls_to("browser_type")
+    assert typed and typed[0]["target"] == '[placeholder="you@x.com"]'
+    # It waited rather than dispatching at a blank page.
+    assert len(mcp.calls_to("browser_snapshot")) >= 3

@@ -705,24 +705,34 @@ class UseCaseExecutor:
         role_rungs = [(i, loc) for i, loc in enumerate(locators) if loc.strategy == "role"]
         weak_rungs = [(i, loc) for i, loc in enumerate(locators) if loc.strategy != "role"]
 
-        if role_rungs:
-            budget = ROLE_GRACE_SECONDS if weak_rungs else self.step_timeout
-            deadline = time.monotonic() + min(budget, self.step_timeout)
-            while True:
-                await self._refresh_snapshot()
-                if self._last_snapshot is not None:
-                    for rung, locator in role_rungs:
-                        node = self._last_snapshot.locate(
-                            locator.role or "", locator.name, locator.nth
-                        )
-                        if node is not None:
-                            self._last_node = node
-                            if rung > 0:
-                                self._note_drift(step_id, rung)
-                            return f"ref={node.ref}", rung, locator.describe()
-                if time.monotonic() >= deadline:
+        # Wait for the page regardless of which rungs were recorded. A css or
+        # text rung is handed to the server, which does its own matching, so
+        # there is nothing here to retry -- but dispatching one at a page that
+        # has not rendered yet fails just as surely as a role lookup does, and
+        # a ladder with no role rung was previously given no wait at all.
+        # Waiting for the page to expose *anything* is the part we can do.
+        budget = ROLE_GRACE_SECONDS if (role_rungs and weak_rungs) else self.step_timeout
+        deadline = time.monotonic() + min(budget, self.step_timeout)
+        while True:
+            await self._refresh_snapshot()
+            page_ready = self._last_snapshot is not None and len(self._last_snapshot) > 0
+            if page_ready:
+                for rung, locator in role_rungs:
+                    node = self._last_snapshot.locate(
+                        locator.role or "", locator.name, locator.nth
+                    )
+                    if node is not None:
+                        self._last_node = node
+                        if rung > 0:
+                            self._note_drift(step_id, rung)
+                        return f"ref={node.ref}", rung, locator.describe()
+                if not role_rungs:
+                    # Nothing to resolve ourselves, and the page has content:
+                    # hand the recorded selector over and let the server match.
                     break
-                await asyncio.sleep(POLL_INTERVAL)
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
 
         for rung, locator in weak_rungs:
             if locator.strategy == "css" and locator.selector:
