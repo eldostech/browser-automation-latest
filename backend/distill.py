@@ -85,6 +85,12 @@ TOOL_ACTIONS: dict[str, str] = {
 #: versions. Checked in order.
 TARGET_KEYS: tuple[str, ...] = ("target", "selector", "ref", "element")
 
+#: Roles that describe structure rather than a control. A locator with one of
+#: these and no accessible name matches half the wrappers on any page; replay
+#: refuses to guess (snapshot.locate), so a step recorded against one is warned
+#: about here, while a person is reviewing.
+ANONYMOUS_ROLES: frozenset[str] = frozenset({"generic", "group", "none", "presentation"})
+
 #: Argument keys that have held a typed value.
 VALUE_KEYS: tuple[str, ...] = ("text", "value", "key", "values", "paths")
 
@@ -371,6 +377,19 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
 
         target = _argument(arguments, TARGET_KEYS)
         locators, unresolved, described = _locators_for(target, snapshot_before(event.seq))
+        for locator in locators:
+            if (
+                locator.strategy == "role"
+                and (locator.role or "") in ANONYMOUS_ROLES
+                and not locator.name
+            ):
+                warnings.append(
+                    f"step {event.step}: the element the recording used exposes no "
+                    f"accessible name (role {locator.role!r}), so no reliable locator "
+                    "exists for it. Replay will refuse to guess and the step will "
+                    "fail; give the element a label or an aria-label in the "
+                    "application, or edit the step to target something named."
+                )
         if unresolved:
             warnings.append(
                 f"step {event.step}: ref {unresolved!r} did not appear in any preceding "

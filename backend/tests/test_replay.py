@@ -128,6 +128,7 @@ class ScriptedMCP(FakeMCPSession):
 
 
 def executor(usecase: UseCase, mcp: ScriptedMCP, **kwargs) -> UseCaseExecutor:
+    kwargs.setdefault("step_timeout", 1.0)
     return UseCaseExecutor(usecase, mcp, RecordingSink(), run_id="r1", **kwargs)
 
 
@@ -682,3 +683,122 @@ async def test_a_failed_row_is_photographed_where_it_failed():
 
     assert not result.ok
     assert _captions(runner) == ["failure"]
+
+
+# --- the page must be given time to settle ----------------------------------
+#
+# The failure these guard: a single-page app that has just navigated exposes an
+# EMPTY accessibility tree for the first moment. Resolution used to run once,
+# immediately, so every element step failed with "no element matched" before
+# the page had drawn anything. Recording never showed it, because the model's
+# think-time between actions is an accidental sleep of several seconds; replay
+# has no model and no pause.
+
+BLANK_PAGE = """### Page
+- Page URL: https://example.com/signin
+### Snapshot
+```yaml
+```"""
+
+
+def _slow_render(mcp: ScriptedMCP, blank_snapshots: int) -> None:
+    """Make the first N snapshot calls return an empty page, as a real SPA does."""
+    remaining = {"n": blank_snapshots}
+
+    def handler(arguments):
+        if remaining["n"] > 0:
+            remaining["n"] -= 1
+            return ToolOutcome(name="browser_snapshot", text=BLANK_PAGE, duration_ms=1)
+        return ToolOutcome(name="browser_snapshot", text=mcp.page, duration_ms=1)
+
+    for tool in mcp._tools:  # noqa: SLF001 - rewiring the fake
+        if tool.name == "browser_snapshot":
+            tool.handler = handler
+
+
+async def test_an_element_that_renders_late_is_still_found():
+    """Replay must wait for the page the way Playwright's own actions do."""
+    use_case = UseCase(
+        name="x", allowed_domains=["example.com"],
+        row_steps=[
+            Step(id="s1", action="fill", value="{{secret.userid}}",
+                 locators=[Locator(strategy="role", role="textbox", name="Username")]),
+        ],
+        secrets=[SecretSpec(name="userid")],
+    )
+    mcp = ScriptedMCP([SIGNED_OUT])
+    _slow_render(mcp, blank_snapshots=2)  # ~1s of blank page at POLL_INTERVAL=0.5
+
+    runner = executor(use_case, mcp, secrets={"userid": "someone"}, step_timeout=5.0)
+    result = await runner.run_row({})
+
+    assert result.ok, result.error
+    typed = mcp.calls_to("browser_type")
+    assert typed and typed[0]["text"] == "someone"
+
+
+async def test_a_truly_missing_element_still_fails_after_the_deadline():
+    use_case = UseCase(
+        name="x", allowed_domains=["example.com"],
+        row_steps=[Step(id="s1", action="click", locators=[role("Never Appears")])],
+    )
+    runner = executor(use_case, ScriptedMCP([SIGNED_OUT]), step_timeout=1.2)
+    result = await runner.run_row({})
+
+    assert not result.ok
+    assert "no element matched" in (result.error or "")
+
+
+async def test_weak_rungs_wait_for_the_role_grace_not_the_full_timeout(monkeypatch):
+    """A renamed element with a css fallback costs seconds per row, not the
+    whole step timeout -- and the fallback is still taken."""
+    import replay as replay_module
+
+    monkeypatch.setattr(replay_module, "ROLE_GRACE_SECONDS", 0.3)
+    use_case = UseCase(
+        name="x", allowed_domains=["example.com"],
+        row_steps=[
+            Step(id="s1", action="click",
+                 locators=[role("Renamed Button"),
+                           Locator(strategy="css", selector="#submit")]),
+        ],
+    )
+    mcp = ScriptedMCP([SIGNED_OUT])
+    runner = executor(use_case, mcp, step_timeout=30.0)
+
+    import time as time_module
+    started = time_module.monotonic()
+    result = await runner.run_row({})
+    elapsed = time_module.monotonic() - started
+
+    assert result.ok, result.error
+    assert mcp.calls_to("browser_click")[0]["target"] == "#submit"
+    assert elapsed < 5, f"fallback took {elapsed:.1f}s; the grace should be ~0.3s"
+    # Falling through to a weaker rung is drift, and it is still recorded.
+    assert runner.locator_drift.get("s1")
+
+
+async def test_an_empty_snapshot_does_not_leave_stale_refs_matchable():
+    """A page that currently exposes nothing must not 'match' the old page.
+
+    A stale ref handed to the server is rejected as an error the retry loop
+    cannot see past -- worse than honestly reporting no match.
+    """
+    use_case = UseCase(
+        name="x", allowed_domains=["example.com"],
+        row_steps=[Step(id="s1", action="click", locators=[role("Sign in")])],
+    )
+    mcp = ScriptedMCP([SIGNED_OUT])
+    runner = executor(use_case, mcp, step_timeout=1.2)
+
+    # Seed the cache with a real page, then make every snapshot come back blank.
+    await runner._refresh_snapshot()  # noqa: SLF001
+    assert runner._last_snapshot is not None  # noqa: SLF001
+    _slow_render(mcp, blank_snapshots=10_000)
+
+    result = await runner.run_row({})
+
+    assert not result.ok
+    assert "no element matched" in (result.error or "")
+    # The click was never attempted with a ref from the vanished page.
+    assert not mcp.calls_to("browser_click")

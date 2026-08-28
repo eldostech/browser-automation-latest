@@ -74,6 +74,14 @@ RETRY_BACKOFF = (0.4, 1.2)
 #: How often an assertion re-checks while waiting for its timeout.
 POLL_INTERVAL = 0.5
 
+#: How long the durable (role) rungs are given to appear before a weaker
+#: recorded rung -- css or text -- is tried instead. Short on purpose: when a
+#: weak rung exists, the element may be genuinely renamed, and a batch should
+#: not spend the whole step timeout per row discovering that. When the ladder
+#: is role-only there is nothing to fall back to, so the roles get the full
+#: step timeout instead of this grace.
+ROLE_GRACE_SECONDS = 5.0
+
 #: Cap on the page snapshot stored alongside a failure, for later repair.
 FAILURE_SNAPSHOT_CHARS = 12_000
 
@@ -665,37 +673,67 @@ class UseCaseExecutor:
     async def _resolve(
         self, locators: list[Locator], step_id: str
     ) -> tuple[str, int, str] | None:
-        """Walk the ladder. Returns ``(target, rung_index, description)``.
+        """Walk the ladder, waiting for the page to settle. Returns
+        ``(target, rung_index, description)``.
 
-        The ``role`` rung is resolved against a snapshot taken *now*, which is
-        what lets a use case recorded months ago survive a redesign. Later
+        The ``role`` rungs are resolved against snapshots taken *now*, which is
+        what lets a use case recorded months ago survive a redesign. Weaker
         rungs are handed to the server as recorded.
+
+        **The waiting is not optional.** This used to resolve once, against a
+        single immediate snapshot -- and a single-page app that has just
+        navigated exposes an *empty* accessibility tree for the first moment,
+        so every element step failed with "no element matched" before the page
+        had drawn anything. Recording never showed the problem, because the
+        model's own think-time between actions is an accidental sleep of
+        several seconds; replay has no model and no such pause. Playwright's
+        own actions auto-wait for exactly this reason, and resolving refs from
+        our own snapshots means the waiting is ours to do.
+
+        Role rungs are retried against fresh snapshots until they match or
+        time runs out: the whole step timeout when they are all the ladder
+        has, or :data:`ROLE_GRACE_SECONDS` when a weaker recorded rung exists
+        to fall back to -- a genuinely renamed element should cost seconds,
+        not the full timeout on every row of a batch.
         """
         self._last_node = None
-        for rung, locator in enumerate(locators):
-            if locator.strategy == "role":
-                await self._refresh_snapshot()
-                if self._last_snapshot is None:
-                    continue
-                node = self._last_snapshot.locate(locator.role or "", locator.name, locator.nth)
-                if node is None:
-                    continue
-                self._last_node = node
-                if rung > 0:
-                    self._note_drift(step_id, rung)
-                return f"ref={node.ref}", rung, locator.describe()
+        if not locators:
+            return None
 
+        # Ladders are built role-first, so partitioning preserves the
+        # recorded preference order.
+        role_rungs = [(i, loc) for i, loc in enumerate(locators) if loc.strategy == "role"]
+        weak_rungs = [(i, loc) for i, loc in enumerate(locators) if loc.strategy != "role"]
+
+        if role_rungs:
+            budget = ROLE_GRACE_SECONDS if weak_rungs else self.step_timeout
+            deadline = time.monotonic() + min(budget, self.step_timeout)
+            while True:
+                await self._refresh_snapshot()
+                if self._last_snapshot is not None:
+                    for rung, locator in role_rungs:
+                        node = self._last_snapshot.locate(
+                            locator.role or "", locator.name, locator.nth
+                        )
+                        if node is not None:
+                            self._last_node = node
+                            if rung > 0:
+                                self._note_drift(step_id, rung)
+                            return f"ref={node.ref}", rung, locator.describe()
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(POLL_INTERVAL)
+
+        for rung, locator in weak_rungs:
             if locator.strategy == "css" and locator.selector:
                 if rung > 0:
                     self._note_drift(step_id, rung)
                 return locator.selector, rung, locator.describe()
-
             if locator.strategy == "text" and locator.text:
                 if rung > 0:
                     self._note_drift(step_id, rung)
                 # Playwright's text engine, which the MCP server accepts.
                 return f"text={locator.text}", rung, locator.describe()
-
             if locator.strategy == "nth":
                 if rung > 0:
                     self._note_drift(step_id, rung)
@@ -853,12 +891,28 @@ class UseCaseExecutor:
         except (MCPToolError, MCPConnectionError) as exc:
             log.debug("snapshot failed", extra={"error": str(exc)})
             return
-        await self._absorb(result.text or "")
+        had_nodes = await self._absorb(result.text or "")
+        if not had_nodes:
+            # An explicit snapshot that came back with no elements means the
+            # page currently exposes nothing. Keeping the previous parse would
+            # let a role rung "match" a ref from a page that is gone, and the
+            # server would reject that stale ref as an error the retry loop
+            # cannot see past. ``_absorb`` keeps stale parses on purpose for
+            # *action* results, which often carry no snapshot at all; an
+            # explicit browser_snapshot is authoritative.
+            self._last_snapshot = None
 
-    async def _absorb(self, text: str) -> None:
-        """Update the cached page view from any tool result that carries one."""
+    async def _absorb(self, text: str) -> bool:
+        """Update the cached page view from any tool result that carries one.
+
+        Returns whether ``text`` contained a parseable snapshot with nodes. A
+        result without one leaves the previous parse in place: an action
+        result saying "typed" carries no page, and forgetting the page over it
+        would be wrong. Explicit snapshots are treated more strictly by
+        ``_refresh_snapshot`` above.
+        """
         if not text:
-            return
+            return False
         self._last_snapshot_text = text
         parsed = parse_snapshot(text)
         if len(parsed):
@@ -868,6 +922,7 @@ class UseCaseExecutor:
             self._last_page_url = match.group(1)
         elif parsed.page_url:
             self._last_page_url = parsed.page_url
+        return len(parsed) > 0
 
     async def _record_failure_context(self, step_id: str, message: str) -> None:
         """Persist the page as it was when a step failed.

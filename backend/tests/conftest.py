@@ -322,6 +322,22 @@ async def db_engine(db_settings: Settings):
 
 
 @pytest.fixture(autouse=True)
+def _fast_replay_clocks(monkeypatch):
+    """Shrink replay's settle-waits for every test.
+
+    Resolution waits for the page to render, which is correct against a real
+    browser and pure dead time against a fake that will never change its
+    answer. Suite-wide because the replay path is exercised from many files --
+    scoping this to one of them made a deliberate miss elsewhere wait the full
+    production timeout, and the suite went from four minutes to ten.
+    """
+    import replay as replay_module
+
+    monkeypatch.setattr(replay_module, "POLL_INTERVAL", 0.05)
+    monkeypatch.setattr(replay_module, "ROLE_GRACE_SECONDS", 0.2)
+
+
+@pytest.fixture(autouse=True)
 async def clean_tables(db_engine):
     """Empty every table before each test.
 
@@ -423,6 +439,9 @@ def api_settings(db_settings: Settings, tmp_path: Path, **overrides) -> Settings
         # bcrypt's cost is the point in production and pure waste in a suite
         # that logs in on every test. 4 is the library minimum.
         auth_bcrypt_rounds=4,
+        # A deliberately missing element should cost a moment, not the
+        # production settle-timeout, in every API test that exercises one.
+        replay_step_timeout=0.5,
         # Several pools are alive at once during an API test (the app's, and
         # any the test opens on its own loop). Keep each one small so a few
         # hundred tests cannot exhaust Postgres's connection limit.

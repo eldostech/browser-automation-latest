@@ -219,3 +219,24 @@ def test_a_bare_ref_is_a_ref_not_a_selector():
 )
 def test_is_ref_rejects_real_selectors(value: str):
     assert is_ref(value) is False
+
+
+def test_an_unnamed_structural_role_refuses_to_match():
+    """`generic` with no name describes half the wrappers on any page.
+
+    Returning "the first one" meant a recorded click on an unlabelled element
+    silently landed on a near-arbitrary node -- the inconsistent-replay bug in
+    person. Refusing is honest: the step fails with a clear message, and
+    distillation warns about such steps while a reviewer is looking.
+    """
+    snap = parse(
+        "```yaml\n"
+        '- generic [ref=e1]\n'
+        '- generic [ref=e2]\n'
+        '- button "Save" [ref=e3]\n'
+        "```"
+    )
+    assert snap.locate("generic", None) is None
+    # A *named* structural node is a deliberate target and still matches.
+    named = parse('```yaml\n- generic "User menu" [ref=e7]\n```')
+    assert named.locate("generic", "User menu") is not None

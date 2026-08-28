@@ -157,7 +157,17 @@ class Snapshot:
 
         Structural wrappers are skipped when anything interactive matches, so a
         ``generic`` container never shadows the button inside it.
+
+        An *unnamed* structural role refuses to match at all. ``generic`` with
+        no accessible name describes half the wrappers on any real page, so
+        "the first one" is a near-arbitrary element -- and clicking the wrong
+        thing silently is strictly worse than failing loudly. A recording can
+        end up with such a locator when the page itself exposes nothing better;
+        distillation warns about those steps so a reviewer sees it before a
+        batch does.
         """
+        if role in _STRUCTURAL_ROLES and not name:
+            return None
         matches = self.find(role, name)
         interactive = [n for n in matches if n.interactive]
         pool = interactive or matches
