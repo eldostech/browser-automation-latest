@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
+from fnmatch import fnmatch
 from urllib.parse import urlparse
 
 from prompt_loader import NAVIGATION_BLOCKED, render
@@ -148,12 +149,20 @@ def domain_allowed(url: str, allowlist: Iterable[str]) -> bool:
       * ``example.com`` matches the exact host only.
       * ``*.example.com`` matches any subdomain **and** the apex domain, which
         is what people mean in practice when they write it.
+      * Any other pattern containing ``*`` or ``?`` is matched as a glob, so
+        ``*localhost*`` and ``dev-*.internal`` work. This used to match
+        nothing at all: only the two forms above were understood, so a pattern
+        like ``*localhost*`` was silently inert while the refusal message
+        listed it back verbatim -- which reads as the allowlist contradicting
+        itself.
       * Non-http(s) schemes (``about:``, ``data:``, ``file:``) are refused.
       * An empty allowlist refuses everything (deny by default).
+
+    A glob matches substrings, so ``*localhost*`` also permits
+    ``notlocalhost.example.com``. That is what the pattern asks for; prefer a
+    bare ``localhost`` when an exact host is what you mean.
     """
     patterns = [p.strip().lower() for p in allowlist if p and p.strip()]
-    if "*" in patterns:
-        return True
     if not patterns:
         return False
 
@@ -163,8 +172,17 @@ def domain_allowed(url: str, allowlist: Iterable[str]) -> bool:
         # Unparseable (unbalanced brackets, bad IPv6 literal, ...). Deny rather
         # than raise -- a malformed URL must never take the whole run down.
         return False
+
+    # The scheme is checked BEFORE the "*" escape hatch, not after. "*" means
+    # "any host", not "any URL": it used to short-circuit first, so a wildcard
+    # allowlist -- which people reach for while getting something working --
+    # also permitted file:///etc/passwd and data: URLs. Widening which *sites*
+    # are reachable should never widen what a page can be.
     if parsed.scheme not in ("http", "https"):
         return False
+
+    if "*" in patterns:
+        return True
 
     host = (parsed.hostname or "").lower()
     if not host:
@@ -174,6 +192,9 @@ def domain_allowed(url: str, allowlist: Iterable[str]) -> bool:
         if pattern.startswith("*."):
             base = pattern[2:]
             if host == base or host.endswith("." + base):
+                return True
+        elif "*" in pattern or "?" in pattern:
+            if fnmatch(host, pattern):
                 return True
         elif host == normalise_domain(pattern):
             return True

@@ -172,3 +172,45 @@ def test_categories_are_deduplicated():
         allowlist=ALLOWLIST,
     )
     assert len(decision.categories) == len(set(decision.categories))
+
+
+# --- glob patterns in the allowlist ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,allowed",
+    [
+        ("http://localhost:8000", True),
+        ("http://localhost:8000/login", True),
+        ("http://my-localhost-box:3000", True),
+        ("https://example.com", False),
+    ],
+)
+def test_a_wildcard_pattern_is_matched_as_a_glob(url: str, allowed: bool):
+    """`*localhost*` used to match nothing at all.
+
+    Only two forms were understood -- an exact host and a leading `*.` -- so a
+    pattern with wildcards anywhere else was silently inert, while the refusal
+    message listed it back verbatim. The allowlist appeared to contradict
+    itself: "host is not in the allowed domain list (*localhost*)".
+    """
+    assert domain_allowed(url, ["*localhost*"]) is allowed
+
+
+def test_a_glob_matches_substrings_which_is_what_it_asks_for():
+    """Worth knowing rather than surprising: `*localhost*` is broad."""
+    assert domain_allowed("https://notlocalhost.evil.com", ["*localhost*"]) is True
+    # An exact host is the narrower thing most people mean.
+    assert domain_allowed("https://notlocalhost.evil.com", ["localhost"]) is False
+
+
+def test_subdomain_patterns_still_match_the_apex():
+    """The `*.` form keeps its special meaning rather than becoming a glob."""
+    assert domain_allowed("https://example.com", ["*.example.com"]) is True
+    assert domain_allowed("https://a.b.example.com", ["*.example.com"]) is True
+
+
+def test_globs_do_not_weaken_the_scheme_or_empty_list_rules():
+    assert domain_allowed("about:blank", ["*localhost*"]) is False
+    assert domain_allowed("file:///etc/passwd", ["*"]) is False
+    assert domain_allowed("http://localhost:8000", []) is False
