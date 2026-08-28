@@ -335,7 +335,18 @@ def test_a_new_use_case_is_always_a_draft(recording):
 
 
 def test_allowed_domains_default_to_what_the_recording_visited(recording):
-    assert build_usecase(PLAN, recording).allowed_domains == ["www.ixl.com"]
+    """Every host the session was actually on, in the order first seen.
+
+    The shared SNAPSHOT fixture reports example.com as the page while this
+    recording navigates to ixl.com -- an inconsistency that went unnoticed
+    while hosts came only from navigate arguments. Both are "what the
+    recording visited" as its own data describes it, and both are now
+    collected: a recording whose navigation happens without a navigate call
+    otherwise yields an empty allowlist, and replay then refuses every step.
+    """
+    domains = build_usecase(PLAN, recording).allowed_domains
+    assert "www.ixl.com" in domains
+    assert domains[0] == "www.ixl.com", "navigate targets come first"
 
 
 def test_steps_the_plan_ignored_are_reported(recording):
@@ -887,3 +898,51 @@ def test_a_snapshot_returned_by_an_action_is_used_for_later_refs():
         for s in pre.steps
     ]
     assert signout[0].locators[0].strategy == "role"
+
+
+# --- the allowlist a use case carries ---------------------------------------
+
+
+def test_domains_come_from_pages_visited_not_only_navigate_calls():
+    """A recording that navigates by script still gets an allowlist.
+
+    Hosts used to be harvested only from browser_navigate's `url` argument, so
+    a recording whose navigation happened another way -- a script calling
+    page.goto, a click following a link -- was distilled with an EMPTY
+    allowlist. Replay enforces the use case's own list, so every navigation was
+    then refused: "its host is not in the allowed domain list (empty)".
+    """
+    page = (
+        "- Page URL: http://localhost:8000/login\n"
+        "- Page Snapshot:\n```yaml\n- button \"Sign In\" [ref=e1]\n```"
+    )
+    events = [
+        RunStarted(run_id="r", seq=1, task="sign in"),
+        ToolCall(run_id="r", seq=2, step=1, call_id="c0", name="browser_run_code_unsafe",
+                 arguments={"code": "async (page) => { await page.goto('http://localhost:8000'); }"}),
+        ToolResult(run_id="r", seq=3, step=1, call_id="c0", name="browser_run_code_unsafe",
+                   ok=True, duration_ms=5, text=page),
+        ToolCall(run_id="r", seq=4, step=2, call_id="c1", name="browser_click",
+                 arguments={"target": "ref=e1", "element": "Sign In"}),
+        ToolResult(run_id="r", seq=5, step=2, call_id="c1", name="browser_click", ok=True,
+                   duration_ms=5, text=page),
+        RunFinished(run_id="r", seq=6, status="succeeded", steps=2, duration_ms=50),
+    ]
+
+    pre = pre_filter(events)
+
+    assert "localhost" in pre.domains, pre.domains
+    # A host with no dot is still a host; insisting on a TLD would drop exactly
+    # the address people develop against.
+    assert all(d not in {"about", "data", "blank"} for d in pre.domains), pre.domains
+
+
+def test_non_page_schemes_never_reach_the_allowlist():
+    """about:blank and friends are not sites."""
+    from distill import _host_of
+
+    for value in ("about:blank", "data:text/html,x", "chrome-error://chromewebdata/",
+                  "file:///tmp/x", "mailto:a@b.c"):
+        assert _host_of(value) is None, value
+    assert _host_of("http://localhost:8000/login") == "localhost"
+    assert _host_of("https://sub.example.co.uk/a?b#c") == "sub.example.co.uk"

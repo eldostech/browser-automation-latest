@@ -246,6 +246,36 @@ def _result_failed(event: Any) -> bool:
     return bool(_SOFT_FAILURE_RE.match(getattr(event, "text", "") or ""))
 
 
+def _host_of(url: str | None) -> str | None:
+    """The bare host of a URL, or None.
+
+    Port and scheme are stripped because the allowlist matches hosts, and
+    ``localhost`` is as valid a host as ``example.com`` -- a check that
+    insisted on a dot would drop exactly the case people develop against.
+    """
+    if not url:
+        return None
+    value = url.strip()
+
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        rest = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
+    elif re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        return None  # ftp://, chrome-error://, file:// -- not a page to allow
+    elif re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d)", value):
+        # An opaque scheme: about:blank, data:, mailto:. A naive split would
+        # have yielded "about" and put it in the allowlist as though it were
+        # a site.
+        return None
+    else:
+        rest = value  # a bare host, possibly with :port
+
+    host = rest.split("/")[0].split("?")[0].split("#")[0]
+    host = host.split("@")[-1]  # strip any userinfo
+    if not host.startswith("["):  # keep IPv6 literals intact
+        host = host.split(":")[0]
+    return host or None
+
+
 def _locators_for(target: Any, snapshot: Snapshot | None) -> tuple[list[Locator], str | None, str]:
     """Build the locator ladder for one recorded target.
 
@@ -317,11 +347,22 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
     # all. ``parse_snapshot`` yields nothing for a result without one, and the
     # length check below already discards that.
     snapshots: list[tuple[int, Snapshot]] = []
+    #: Hosts of every page the recording was actually on. Collected here rather
+    #: than only from browser_navigate's `url` argument, because a recording
+    #: that navigates some other way -- a script calling page.goto, a click
+    #: that follows a link -- issues no navigate call at all, and the use case
+    #: was then distilled with an EMPTY allowlist. Replay enforces the use
+    #: case's own list, so every navigation was refused: "its host is not in
+    #: the allowed domain list (empty)".
+    observed_hosts: list[str] = []
     for event in events:
         if event.type == "tool_result":
             parsed = parse_snapshot(event.text or "")
             if len(parsed):
                 snapshots.append((event.seq, parsed))
+            host = _host_of(parsed.page_url)
+            if host and host not in observed_hosts:
+                observed_hosts.append(host)
 
     def snapshot_before(seq: int) -> Snapshot | None:
         best: Snapshot | None = None
@@ -430,7 +471,7 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
         if url:
             if start_url is None:
                 start_url = url
-            host = re.sub(r"^https?://", "", url).split("/")[0].split(":")[0]
+            host = _host_of(url)
             if host and host not in domains:
                 domains.append(host)
 
@@ -498,7 +539,7 @@ def pre_filter(events: list[AgentEvent]) -> PreFilterResult:
         dropped=dropped,
         literals=literals,
         start_url=start_url,
-        domains=domains,
+        domains=domains + [h for h in observed_hosts if h not in domains],
         stats=stats,
     )
 
@@ -1092,6 +1133,18 @@ def build_usecase(
             + ". Script steps can read inputs -- replace the literal with "
             "{{input.<name>}} and declare the input -- so this is fixable rather than "
             "fatal, but as recorded every row gets the same value."
+        )
+
+    # A use case with no allowlist cannot navigate anywhere: replay enforces the
+    # use case's own list, not the server's, so every navigation is refused with
+    # "its host is not in the allowed domain list (empty)". That happened when a
+    # recording navigated by means other than browser_navigate, and it is worth
+    # saying loudly rather than discovering on the first replay.
+    if not pre.domains:
+        warnings.append(
+            "no allowed domains could be determined from this recording, so replay "
+            "will refuse every navigation. Add the site's host to allowed_domains "
+            "before publishing."
         )
 
     usecase = UseCase(
