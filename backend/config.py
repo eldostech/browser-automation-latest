@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     agent_require_approval: bool = True
     agent_approval_timeout_seconds: float = 300.0
     agent_screenshot_every_step: bool = True
+    #: Whether the recording agent is offered the raw-JavaScript tools. Off by
+    #: default: see BrowserAgent._offered_tools for what a script step costs a
+    #: recording, and .env.example for the operator-facing version.
+    agent_allow_script_tool: bool = False
     # Tool results are fed back to the model verbatim; cap them so one enormous
     # accessibility snapshot cannot blow the context window.
     agent_max_tool_result_chars: int = 20_000

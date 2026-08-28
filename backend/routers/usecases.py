@@ -465,6 +465,30 @@ async def repair_usecase(
             status_code=422, detail=f"The stored use case is invalid: {exc}"
         ) from exc
 
+    # A script step has no locators, so there is nothing for a repair to
+    # retarget. Saying so costs nothing and beats spending an LLM call to be
+    # told the same thing in vaguer words.
+    failed_id = execution.get("failed_step_id")
+    failed_step = next((s for s in use_case.all_steps if s.id == failed_id), None)
+    if failed_step is not None and failed_step.action == "script":
+        return {
+            "usecase_id": usecase_id,
+            "repaired": False,
+            "diagnosis": (
+                f"Step {failed_id!r} is raw JavaScript, so there is no locator to repair."
+            ),
+            "unfixable_reason": (
+                "A script step carries code rather than a target, so nothing here can be "
+                "retargeted at a changed page -- and a script that finds nothing usually "
+                "returns quietly rather than failing, which is why the error surfaced at a "
+                "later step instead. Re-record this task: the recorder no longer offers the "
+                "model a JavaScript tool, so it will produce ordinary click and fill steps "
+                "that can be reviewed and repaired."
+            ),
+            "confidence": "high",
+            "llm_tokens": 0,
+        }
+
     context = gather_context(use_case, execution, events)
     doctor = UseCaseDoctor(manager.repair_llm)
     try:

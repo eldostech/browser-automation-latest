@@ -81,6 +81,13 @@ TRANSPORT_FAILURE_LIMIT = 3
 #: Retry schedule for transient tool failures, in seconds.
 RETRY_BACKOFF = (0.5, 1.5, 3.0)
 
+#: Tools that run arbitrary JavaScript in the page. Withheld from the model
+#: during recording unless ``RunOptions.allow_script_tool`` says otherwise --
+#: see ``BrowserAgent._offered_tools`` for what a script step costs.
+SCRIPT_TOOLS: frozenset[str] = frozenset(
+    {"browser_run_code_unsafe", "browser_evaluate", "browser_run_code"}
+)
+
 #: Minimum interval between streamed `thinking` updates, to keep the WebSocket
 #: from carrying one message per token.
 THINKING_FLUSH_INTERVAL = 0.2
@@ -127,6 +134,10 @@ class RunOptions:
     require_approval: bool = True
     approval_timeout_seconds: float = 300.0
     screenshot_every_step: bool = True
+    #: Whether the model may call browser_run_code_unsafe / browser_evaluate.
+    #: Off by default: see BrowserAgent._offered_tools for what a script step
+    #: costs a recording.
+    allow_script_tool: bool = False
     max_tool_result_chars: int = 20_000
     max_history_messages: int = 60
 
@@ -138,6 +149,7 @@ class RunOptions:
             "require_approval": self.require_approval,
             "approval_timeout_seconds": self.approval_timeout_seconds,
             "screenshot_every_step": self.screenshot_every_step,
+            "allow_script_tool": self.allow_script_tool,
         }
 
 
@@ -227,7 +239,7 @@ class BrowserAgent:
                 task=self.spec.task,
                 start_url=self.spec.start_url,
                 options=options.to_dict(),
-                tools=self.mcp.tool_names,
+                tools=[t["name"] for t in self._offered_tools()],
             )
         )
 
@@ -403,7 +415,7 @@ class BrowserAgent:
         turn = await self.llm.run_turn(
             system=load(SYSTEM),
             messages=self.messages,
-            tools=self.mcp.anthropic_tools(),
+            tools=self._offered_tools(),
             on_text_delta=on_delta,
             timeout=self._remaining(),
         )
@@ -717,6 +729,30 @@ class BrowserAgent:
         return artifact_id
 
     # -- bookkeeping --------------------------------------------------------
+    def _offered_tools(self) -> list[dict[str, Any]]:
+        """The tool schema handed to the model.
+
+        The raw-JavaScript tools are withheld unless deliberately enabled, and
+        withholding beats asking. The system prompt already tells the model to
+        prefer the ordinary browser tools; it still reached for
+        ``browser_run_code_unsafe`` for every step of a recording, because
+        writing ``page.click('button:has-text("Sign out")')`` is easier than
+        working through the accessibility tree.
+
+        What that costs is the whole point of the recorder. A script step has
+        no locators, so it cannot be reviewed as steps, cannot be repaired when
+        the page changes, and cannot be retargeted -- "Fix with AI" has nothing
+        to offer it. Worse, it cannot reliably *fail*: a script that finds
+        nothing returns a string like "not found" and the step is recorded as a
+        success, so the run breaks later at an unrelated assertion.
+
+        A tool the model cannot see is a tool it cannot reach for.
+        """
+        offered = self.mcp.anthropic_tools()
+        if self.spec.options.allow_script_tool:
+            return offered
+        return [t for t in offered if t.get("name") not in SCRIPT_TOOLS]
+
     def _initial_prompt(self) -> str:
         """The first user turn. Wording lives in ``prompts/task.md``."""
         options = self.spec.options

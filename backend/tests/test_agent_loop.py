@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from agent import AgentSpec, BrowserAgent
+from agent import AgentSpec, BrowserAgent, RunOptions
 from conftest import (
     AutoApprovalGate,
     FakeMCPSession,
@@ -426,3 +426,47 @@ async def test_tools_are_taken_from_the_server_not_hardcoded(spec, sink):
 
     assert outcome.status == "succeeded"
     assert [t["name"] for t in llm.tool_schemas[0]] == ["page_open", "page_capture_image"]
+
+
+# --- the raw-JavaScript tool is withheld ------------------------------------
+
+
+async def test_the_script_tool_is_not_offered_to_the_model_by_default(sink, mcp):
+    """A tool the model cannot see is a tool it cannot reach for.
+
+    Told to prefer the ordinary browser tools, the model still used
+    browser_run_code_unsafe for every step of a real recording -- writing
+    `page.click('button:has-text("Sign out")')` is simply easier than working
+    through the accessibility tree. The resulting use case had no locators to
+    review, nothing for "Fix with AI" to repair, and steps that could not fail:
+    a script that finds nothing returns "not found" and is recorded as a
+    success, so the run broke later at an unrelated assertion.
+    """
+    mcp._tools.append(FakeTool("browser_run_code_unsafe"))  # noqa: SLF001
+    llm = ScriptedLLM([final_turn("done")])
+    agent = BrowserAgent(
+        AgentSpec(run_id="r1", task="t", options=RunOptions(allowed_domains=["example.com"])),
+        mcp, llm, sink, AutoApprovalGate(),
+    )
+
+    await agent.run()
+
+    offered = {t["name"] for t in llm.tool_schemas[0]}
+    assert "browser_run_code_unsafe" not in offered
+    assert "browser_click" in offered, "the ordinary tools are untouched"
+
+
+async def test_the_script_tool_can_be_switched_back_on(sink, mcp):
+    mcp._tools.append(FakeTool("browser_run_code_unsafe"))  # noqa: SLF001
+    llm = ScriptedLLM([final_turn("done")])
+    agent = BrowserAgent(
+        AgentSpec(
+            run_id="r1", task="t",
+            options=RunOptions(allowed_domains=["example.com"], allow_script_tool=True),
+        ),
+        mcp, llm, sink, AutoApprovalGate(),
+    )
+
+    await agent.run()
+
+    assert "browser_run_code_unsafe" in {t["name"] for t in llm.tool_schemas[0]}

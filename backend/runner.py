@@ -299,6 +299,7 @@ class RunManager:
             require_approval=s.agent_require_approval,
             approval_timeout_seconds=s.agent_approval_timeout_seconds,
             screenshot_every_step=s.agent_screenshot_every_step,
+            allow_script_tool=s.agent_allow_script_tool,
             max_tool_result_chars=s.agent_max_tool_result_chars,
             max_history_messages=s.agent_max_history_messages,
         )
