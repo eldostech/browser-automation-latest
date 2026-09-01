@@ -84,12 +84,6 @@ class EventBus:
                 # reconnect and replay from its last seq.
                 log.warning("dropping event for slow subscriber", extra={"run_id": run_id})
 
-    def subscriber_count(self, run_id: str) -> int:
-        return len(self._subscribers.get(run_id, ()))
-
-    def watched_runs(self) -> set[str]:
-        return set(self._subscribers)
-
     # -- lifecycle, so callers can treat both buses the same -----------------
     async def start(self) -> None:
         return None

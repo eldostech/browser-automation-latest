@@ -11,11 +11,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import FakeMCPSession, ScriptedLLM
+from conftest import ScriptedLLM
 from llm import LLMTurn, ToolCallRequest
 
 # Reuse the app fixture wiring from the main API tests.
-from test_api import FakeMCPBrowserSession, _fake_probe  # noqa: F401
+from test_api import FakeBrowser
 
 SNAPSHOT = """### Page
 - Page URL: https://example.com/signin
@@ -49,7 +49,7 @@ PLAN = {
 def client(db_settings, db_engine, tmp_path, monkeypatch):
     from conftest import authenticate, build_app
 
-    app = build_app(db_settings, tmp_path, monkeypatch, session_cls=FakeMCPBrowserSession)
+    app = build_app(db_settings, tmp_path, monkeypatch, session_cls=FakeBrowser)
     with TestClient(app) as test_client:
         yield authenticate(test_client)
 
@@ -115,94 +115,60 @@ async def seed_run(client: TestClient, *, status: str = "succeeded") -> str:
     return run_id
 
 
+async def seed_usecase(client: TestClient, **overrides) -> str:
+    """A draft use case in the store, without going through a recording.
+
+    These tests are about what happens to a use case *after* it exists --
+    editing it, publishing it, renaming it, archiving it. How it came to exist
+    is the recorder's business and is tested there.
+    """
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
+    definition = {
+        "id": "uc-seed",
+        "name": "Sign in and open a record",
+        "status": "draft",
+        "allowed_domains": ["example.com"],
+        "inputs": [{"name": "record_url", "type": "url", "required": True}],
+        "secrets": [{"name": "username"}, {"name": "password"}],
+        "setup_steps": [
+            {"id": "u1", "action": "navigate", "url": "https://example.com/signin"},
+            {
+                "id": "u2",
+                "action": "fill",
+                "value": "{{secret.username}}",
+                "locators": [{"strategy": "label", "text": "Username"}],
+            },
+        ],
+        "row_steps": [
+            {"id": "s1", "action": "navigate", "url": "{{input.record_url}}"},
+        ],
+        **overrides,
+    }
+    usecase_id, _ = await store.save_usecase(definition)
+    return usecase_id
+
+
 def use_plan_llm(client: TestClient, plan: dict | None = PLAN) -> PlanLLM:
     llm = PlanLLM(plan)
-    client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
+    client.app.state.repair_model._client = llm  # noqa: SLF001 - test seam
     return llm
 
 
 # --- distilling ------------------------------------------------------------
 
 
-async def test_distilling_a_run_creates_a_draft_use_case(client: TestClient):
-    run_id = await seed_run(client)
-    llm = use_plan_llm(client)
-
-    response = client.post(f"/api/runs/{run_id}/distill")
-
-    assert response.status_code == 201
-    body = response.json()
-    assert body["name"] == "Sign in and open a record"
-    assert body["status"] == "draft", "review is mandatory"
-    assert body["setup_steps"] == 4, "three recorded steps plus the woven-in assertion"
-    assert body["row_steps"] == 1
-    assert body["inputs"] == ["record_url"]
-    assert sorted(body["secrets"]) == ["password", "username"]
-    assert llm.calls == 1, "the entire cost of the feature"
-
-
-async def test_the_stored_definition_contains_no_ephemeral_refs(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
-
-    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
-    assert "ref=e" not in str(definition), "a ref would point at the wrong element next time"
-
-
-async def test_credentials_do_not_reach_the_stored_definition(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
-
-    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
-    assert "someone" not in str(definition)
-    assert "{{secret.username}}" in str(definition)
-
-
-async def test_a_failed_run_cannot_be_distilled(client: TestClient):
-    run_id = await seed_run(client, status="failed")
-    llm = use_plan_llm(client)
-
-    response = client.post(f"/api/runs/{run_id}/distill")
-
-    assert response.status_code == 409
-    assert "succeeded" in response.json()["detail"]
-    assert llm.calls == 0, "a failed run must not cost a token"
-
-
-async def test_distilling_an_unknown_run_is_a_404(client: TestClient):
-    assert client.post("/api/runs/nope/distill").status_code == 404
-
-
-async def test_a_model_that_returns_no_plan_is_reported_as_unprocessable(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client, plan=None)
-
-    response = client.post(f"/api/runs/{run_id}/distill")
-
-    assert response.status_code == 422
-    assert "no idea" in response.json()["detail"]
-
-
-# --- listing, reading, editing --------------------------------------------
-
-
 async def test_use_cases_are_listed_newest_first(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    client.post(f"/api/runs/{run_id}/distill")
+    await seed_usecase(client)
 
     rows = client.get("/api/usecases").json()["usecases"]
     assert len(rows) == 1
     assert rows[0]["status"] == "draft"
-    assert rows[0]["source_run_id"] == run_id
 
 
 async def test_an_edit_appends_a_version_rather_than_rewriting_one(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
     definition["name"] = "Renamed by a reviewer"
@@ -220,9 +186,7 @@ async def test_an_edit_appends_a_version_rather_than_rewriting_one(client: TestC
 
 
 async def test_an_invalid_edit_is_rejected_with_the_reason(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
     definition["row_steps"][0]["url"] = "{{input.undeclared}}"
@@ -240,18 +204,14 @@ async def test_editing_an_unknown_use_case_is_a_404(client: TestClient):
 
 
 async def test_publishing_moves_a_draft_to_ready(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     assert client.post(f"/api/usecases/{usecase_id}/publish").json()["status"] == "ready"
     assert client.get(f"/api/usecases/{usecase_id}").json()["definition"]["status"] == "ready"
 
 
 async def test_a_use_case_with_scripts_cannot_be_published_without_the_opt_in(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
     definition["row_steps"].append(
@@ -270,9 +230,7 @@ async def test_a_use_case_with_scripts_cannot_be_published_without_the_opt_in(cl
 
 
 async def test_archiving_keeps_the_record(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     assert client.delete(f"/api/usecases/{usecase_id}").json()["status"] == "archived"
     assert client.get(f"/api/usecases/{usecase_id}").status_code == 200, "history still resolves"
@@ -286,18 +244,14 @@ async def test_publishing_an_unknown_use_case_is_a_404(client: TestClient):
 
 
 async def test_archiving_is_reversible_and_keeps_the_record(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     assert client.delete(f"/api/usecases/{usecase_id}").json()["status"] == "archived"
     assert client.get(f"/api/usecases/{usecase_id}").status_code == 200
 
 
 async def test_purging_removes_the_use_case_for_good(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     response = client.delete(f"/api/usecases/{usecase_id}", params={"purge": "true"})
 
@@ -308,12 +262,11 @@ async def test_purging_removes_the_use_case_for_good(client: TestClient):
     assert client.get("/api/usecases").json()["usecases"] == []
 
 
-async def test_purging_keeps_the_run_that_produced_it(client: TestClient):
-    """The timeline records what happened to a browser; deleting a recipe
-    must not erase the history of things it actually did."""
+async def test_purging_keeps_the_runs_it_produced(client: TestClient):
+    """The timeline records what happened to a browser; deleting a recipe must
+    not erase the history of things it actually did."""
     run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     client.delete(f"/api/usecases/{usecase_id}", params={"purge": "true"})
 
@@ -332,20 +285,8 @@ async def test_purging_an_unknown_use_case_is_a_404(client: TestClient):
 # later. A rename is a label change, not a change to what runs.
 
 
-async def test_distilling_returns_the_name_as_a_suggestion(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-
-    body = client.post(f"/api/runs/{run_id}/distill").json()
-
-    assert body["suggested_name"] == "Sign in and open a record"
-    assert body["name"] == body["suggested_name"]
-
-
 async def test_renaming_changes_the_label_without_creating_a_version(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     response = client.patch(f"/api/usecases/{usecase_id}", json={"name": "Nightly demo requests"})
 
@@ -357,9 +298,7 @@ async def test_renaming_changes_the_label_without_creating_a_version(client: Tes
 
 
 async def test_a_rename_shows_up_in_the_list(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     client.patch(f"/api/usecases/{usecase_id}", json={"name": "Renamed"})
 
@@ -367,9 +306,7 @@ async def test_a_rename_shows_up_in_the_list(client: TestClient):
 
 
 async def test_renaming_leaves_the_steps_alone(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
     before = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
 
     client.patch(f"/api/usecases/{usecase_id}", json={"name": "Something else"})
@@ -381,9 +318,7 @@ async def test_renaming_leaves_the_steps_alone(client: TestClient):
 
 
 async def test_a_description_can_be_changed_too(client: TestClient):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     client.patch(
         f"/api/usecases/{usecase_id}",
@@ -395,9 +330,7 @@ async def test_a_description_can_be_changed_too(client: TestClient):
 
 async def test_renaming_a_published_use_case_does_not_unpublish_it(client: TestClient):
     """A label change must not send something back for review."""
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
     client.post(f"/api/usecases/{usecase_id}/publish")
 
     client.patch(f"/api/usecases/{usecase_id}", json={"name": "Still ready"})
@@ -407,9 +340,7 @@ async def test_renaming_a_published_use_case_does_not_unpublish_it(client: TestC
 
 @pytest.mark.parametrize("name", ["", "   ", "x" * 201])
 async def test_an_unusable_name_is_refused(client: TestClient, name: str):
-    run_id = await seed_run(client)
-    use_plan_llm(client)
-    usecase_id = client.post(f"/api/runs/{run_id}/distill").json()["usecase_id"]
+    usecase_id = await seed_usecase(client)
 
     response = client.patch(f"/api/usecases/{usecase_id}", json={"name": name})
     assert response.status_code == 422
@@ -419,28 +350,133 @@ async def test_renaming_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.patch("/api/usecases/nope", json={"name": "x"}).status_code == 404
 
 
-async def test_a_replay_run_cannot_be_distilled(client: TestClient):
-    """A replay is a use case being executed, not a recording of new work.
+# ---------------------------------------------------------------------------
+# Promotion: moving one document between environments
+# ---------------------------------------------------------------------------
 
-    Distilling one would spend an LLM call to derive a use case from a use
-    case -- and because the original's parameters are already substituted into
-    the executed steps, the "inputs" it inferred would be whichever row
-    happened to run. The UI no longer offers it; this is the guard that makes
-    the API correct regardless of the client.
+
+def promotable(**overrides: Any) -> dict[str, Any]:
+    """A definition of the shape an export from dev produces."""
+    definition = {
+        "id": "9f3c2a1b4d5e6f708192a3b4c5d6e7f8",
+        "name": "Create a project",
+        "status": "ready",
+        "base_url": "https://dev.example.com",
+        "allowed_domains": ["{{env.base_url}}"],
+        "inputs": [{"name": "reference"}],
+        "secrets": [{"name": "password"}],
+        "row_steps": [
+            {"id": "s1", "action": "navigate", "url": "{{env.base_url}}/orders"},
+            {
+                "id": "s2",
+                "action": "fill",
+                "value": "{{input.reference}}",
+                "locators": [{"strategy": "label", "text": "Reference"}],
+            },
+        ],
+    }
+    return {**definition, **overrides}
+
+
+def test_a_definition_from_another_environment_can_be_imported(client: TestClient):
+    """The gap that made promotion impossible.
+
+    ``PUT /usecases/{id}`` calls ``usecase_or_404`` first, so it can only update
+    something that already exists, and the only path that created a use case was
+    saving a recording. A document that would run unchanged in UAT had no way to
+    get there short of re-recording it -- which produces a different document --
+    or writing to the database by hand.
     """
-    from conftest import app_workspace
+    response = client.post("/api/usecases/import", json=promotable())
+    assert response.status_code == 201, response.text
+    body = response.json()
 
-    store = await app_workspace(client.app)
-    await store.create_run(
-        "replay-run",
-        "Replay: Contact form",
-        None,
-        {"usecase_id": "uc-1", "version": 1, "replay": True},
+    assert body["usecase_id"] == "9f3c2a1b4d5e6f708192a3b4c5d6e7f8", (
+        "the id is preserved, so one use case is the same use case in every "
+        "environment and its runs can be lined up"
     )
-    await store.finish_run("replay-run", "succeeded", steps=3, duration_ms=100)
+    assert body["version"] == 1
 
-    response = client.post("/api/runs/replay-run/distill")
+    stored = client.get(f"/api/usecases/{body['usecase_id']}").json()["definition"]
+    assert stored["base_url"] == "https://dev.example.com"
+    assert stored["allowed_domains"] == ["{{env.base_url}}"]
+    assert [s["url"] for s in stored["row_steps"] if s["action"] == "navigate"] == [
+        "{{env.base_url}}/orders"
+    ]
 
-    assert response.status_code == 409
-    assert "nothing here to distil" in response.json()["detail"]
-    assert "uc-1" in response.json()["detail"]
+
+def test_an_import_always_arrives_as_a_draft(client: TestClient):
+    """An approval given in dev is not an approval in production."""
+    response = client.post("/api/usecases/import", json=promotable(status="ready"))
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "draft"
+
+
+def test_an_import_never_carries_permission_to_run_javascript(client: TestClient):
+    """The flag that matters most, and the one easiest to carry across silently.
+
+    ``allow_scripts`` lets a use case run arbitrary JavaScript against a live
+    page, and it is granted by a person who has read that code. Carrying it
+    would let code approved against dev's data execute against production's,
+    which nobody in production agreed to.
+    """
+    response = client.post(
+        "/api/usecases/import", json=promotable(status="ready", allow_scripts=True)
+    )
+    assert response.status_code == 201, response.text
+
+    stored = client.get(f"/api/usecases/{response.json()['usecase_id']}").json()
+    assert stored["definition"]["allow_scripts"] is False
+
+
+def test_re_importing_appends_a_version_rather_than_duplicating(client: TestClient):
+    """Promoting a revision is the same gesture as promoting it the first time."""
+    first = client.post("/api/usecases/import", json=promotable())
+    assert first.status_code == 201, first.text
+
+    revised = promotable()
+    revised["name"] = "Create a project (revised)"
+    second = client.post("/api/usecases/import", json=revised)
+
+    assert second.status_code == 201, second.text
+    assert second.json()["usecase_id"] == first.json()["usecase_id"]
+    assert second.json()["version"] == 2
+
+    listed = client.get("/api/usecases").json()["usecases"]
+    assert len([u for u in listed if u["id"] == first.json()["usecase_id"]]) == 1
+
+
+def test_a_run_id_from_the_source_environment_is_dropped(client: TestClient):
+    """It names a run in another database, so it resolves to nothing here."""
+    response = client.post(
+        "/api/usecases/import",
+        json=promotable(source_run_id="a-run-that-only-exists-in-dev"),
+    )
+    assert response.status_code == 201, response.text
+
+    stored = client.get(f"/api/usecases/{response.json()['usecase_id']}").json()
+    assert not stored["definition"].get("source_run_id")
+
+
+def test_a_definition_this_environment_cannot_validate_is_refused(client: TestClient):
+    """Said verbatim: it is the most useful thing to show whoever is promoting."""
+    broken = promotable()
+    broken["row_steps"][1]["locators"] = []
+
+    response = client.post("/api/usecases/import", json=broken)
+
+    assert response.status_code == 422
+    assert "locator" in response.json()["detail"]
+
+
+def test_importing_is_recorded_against_whoever_did_it(client: TestClient):
+    """Each environment's approval trail is its own."""
+    response = client.post("/api/usecases/import", json=promotable())
+    assert response.status_code == 201, response.text
+
+    activity = client.get(
+        f"/api/usecases/{response.json()['usecase_id']}/activity"
+    ).json()
+    actions = [entry["action"] for entry in activity["entries"]]
+    assert "usecase.import" in actions

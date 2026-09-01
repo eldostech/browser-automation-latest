@@ -126,14 +126,3 @@ class Redactor:
 #: A redactor with nothing registered. Every method is a pass-through, so code
 #: paths with no secrets pay nothing and need no ``if redactor is not None``.
 NULL_REDACTOR = Redactor()
-
-
-def secrets_from_mapping(values: dict[str, Any] | None) -> list[str]:
-    """Every string value in a secret mapping, ready for :meth:`Redactor.update`.
-
-    Accepts the shape the credential vault hands back (``{slot: value}``) and
-    ignores anything non-textual.
-    """
-    if not values:
-        return []
-    return [v for v in values.values() if isinstance(v, str) and v]

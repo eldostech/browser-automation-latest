@@ -39,19 +39,20 @@ log = logging.getLogger(__name__)
 def _assert_schema_matches(settings: Settings) -> None:
     """Refuse to run if the configured schema is not the one the models use.
 
-    ``MetaData`` fixes the schema when the model modules are imported, from the
-    ``DB_SCHEMA`` environment variable. If ``Settings.db_schema`` says something
-    else -- because it was passed programmatically, or a ``.env`` disagrees with
-    the process environment -- then DDL lands in one schema while queries read
+    ``MetaData`` fixes the schema when the model modules are imported, from
+    ``DB_SCHEMA`` in the environment or in ``.env``. If ``Settings.db_schema``
+    says something else -- because it was passed programmatically, or a second
+    ``.env`` disagrees -- then DDL lands in one schema while queries read
     another, and the symptom is an empty database rather than an error. Fail
     here instead, where the message can say what to fix.
     """
     if settings.db_schema != DEFAULT_SCHEMA:
         raise RuntimeError(
             f"Configured db_schema is {settings.db_schema!r} but the models were built "
-            f"for {DEFAULT_SCHEMA!r}. The schema is fixed when db.base is imported, so "
-            f"set the DB_SCHEMA environment variable to {settings.db_schema!r} before "
-            "importing the application."
+            f"for {DEFAULT_SCHEMA!r}. The schema is fixed when db.base is imported, "
+            f"which reads DB_SCHEMA from the environment first and .env second. Either "
+            f"this Settings was constructed with a different schema than the file says, "
+            f"or a DB_SCHEMA={DEFAULT_SCHEMA!r} in the environment is overriding it."
         )
 
 #: The application driver. See the module docstring for why it is not psycopg.

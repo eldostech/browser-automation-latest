@@ -15,11 +15,14 @@ from fastapi.responses import PlainTextResponse
 
 from auth.rbac import Permission
 from auth.service import Principal
-from batch import BatchInputError, results_csv, validate_rows
+from batch import results_csv, validate_rows
+from ingest import BatchInputError, Dataset, rows_from_json
+from mapping import apply_mapping
+from store import WorkspaceStore
 from deps import WorkspaceData, batch_or_404, get_replays, get_vault, require
 from credentials import Vault
 from routers.schemas import BatchRequestBody, ExecuteRequest
-from runner import BatchRequest, ExecutionBusy, ExecutionRequest, ReplayManager
+from runner import BatchRequest, ExecutionRequest, ReplayManager
 from services import (
     load_runnable_usecase,
     require_missing_nothing,
@@ -27,7 +30,7 @@ from services import (
     resolve_secrets,
     rows_from_body,
 )
-from usecase import UseCase
+from usecase import TargetMissing, UseCase
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +72,7 @@ async def execute_usecase(
                 version=version,
                 inputs=values,
                 secrets=secrets,
+                base_url=body.base_url,
                 headless=body.headless,
                 browser=body.browser,
                 workspace_id=principal.workspace_id,
@@ -76,8 +80,11 @@ async def execute_usecase(
                 owner_email=principal.email,
             )
         )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TargetMissing as exc:
+        # A named target this deployment has no address for. Said plainly to
+        # whoever pressed the button; guessing at one is how a workflow ends
+        # up run against the wrong site.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Batches were audited from the start; a single row was not, so the most
     # common way to run a use case left no trace of who did it. The inputs go
@@ -117,6 +124,42 @@ async def list_usecase_executions(
 # ---------------------------------------------------------------------------
 
 
+async def rows_for_batch(body: BatchRequestBody, data: WorkspaceStore) -> Dataset:
+    """The rows this batch will run, however the caller named them.
+
+    A stored dataset is read here rather than in ``services.rows_from_body``
+    because it needs the request scope, and reaching the store from a function
+    that otherwise only parses bytes would make it much harder to see that one
+    tenant cannot read another tenant's file.
+
+    The mapping is applied at this point -- before validation, before the batch
+    row is written, before a browser exists -- so everything downstream works in
+    declared field names and never has to know what the spreadsheet called its
+    columns.
+    """
+    if body.dataset_id is None:
+        return rows_from_body(body)
+
+    stored = await data.get_dataset(body.dataset_id, sample=0)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="No such dataset.")
+    rows = await data.get_dataset_rows(body.dataset_id) or []
+
+    if body.mapping:
+        known = {column["name"] for column in stored["columns"]}
+        unknown = sorted(set(body.mapping.values()) - known)
+        if unknown:
+            raise BatchInputError(
+                "the mapping names column(s) that are not in this dataset: "
+                + ", ".join(unknown)
+            )
+        rows = apply_mapping(rows, body.mapping)
+
+    if not rows:
+        raise BatchInputError("that dataset has no rows")
+    return rows_from_json(rows)
+
+
 @router.post("/usecases/{usecase_id}/batch", status_code=202)
 async def start_batch(
     usecase_id: str,
@@ -135,7 +178,7 @@ async def start_batch(
     await require_scripts_permitted(usecase_id, use_case, data)
 
     try:
-        parsed = rows_from_body(body)
+        parsed = await rows_for_batch(body, data)
     except BatchInputError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -149,8 +192,23 @@ async def start_batch(
             },
         )
 
+    if body.secrets:
+        # A batch is claimed by a worker that may be another process, and the
+        # only thing it is given is the credential id. Inline values would have
+        # to be written into the job payload to survive that hop, and writing a
+        # password into a table a batch listing reads is precisely what the
+        # vault exists to avoid. See stash.py for the same argument at the
+        # other end of the recording flow.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A batch cannot take inline secrets. Save the login as a credential "
+                "and pass its credential_id instead."
+            ),
+        )
+
     secrets = await resolve_secrets(
-        ExecuteRequest(credential_id=body.credential_id, secrets=body.secrets), data, vault
+        ExecuteRequest(credential_id=body.credential_id, secrets=None), data, vault
     )
     require_missing_nothing(use_case, secrets)
 
@@ -161,7 +219,9 @@ async def start_batch(
                 version=version,
                 rows=parsed.rows,
                 secrets=secrets,
+                base_url=body.base_url,
                 credential_id=body.credential_id,
+                dataset_id=body.dataset_id,
                 headless=body.headless,
                 browser=body.browser,
                 workspace_id=principal.workspace_id,
@@ -169,8 +229,8 @@ async def start_batch(
                 owner_email=principal.email,
             )
         )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TargetMissing as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     await data.audit(
         "batch.start",
@@ -178,12 +238,16 @@ async def start_batch(
         actor_email=principal.email,
         resource_type="batch",
         resource_id=batch_id,
-        detail={"usecase_id": usecase_id, "rows": len(parsed)},
+        detail={
+            "usecase_id": usecase_id,
+            "rows": len(parsed),
+            "dataset_id": body.dataset_id,
+        },
     )
     return {
         "batch_id": batch_id,
         "total": len(parsed),
-        "columns": parsed.columns,
+        "columns": parsed.column_names,
         "warnings": parsed.warnings,
     }
 
@@ -222,7 +286,26 @@ async def resume_batch(
     """
     batch = await batch_or_404(batch_id, data)
 
-    outstanding = await replays.pending_row_indices(batch_id, principal.workspace_id)
+    # The rows the batch was queued with, not a reconstruction from the
+    # executions it managed to create. Rebuilding from `executions.inputs`
+    # yielded an empty row for anything never attempted -- which is exactly the
+    # set a resume exists to run -- so a resume after the circuit breaker
+    # tripped used to replay blanks.
+    rows = await data.get_batch_rows(batch_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="No such batch.")
+    if not rows:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This batch was queued before its rows were stored with it, so there is "
+                "nothing to resume from. Start it again from the input file."
+            ),
+        )
+
+    outstanding = await replays.pending_row_indices(
+        batch_id, principal.workspace_id, total=len(rows)
+    )
     if not outstanding:
         raise HTTPException(status_code=409, detail="Every row in this batch already succeeded.")
 
@@ -231,19 +314,19 @@ async def resume_batch(
     )
     await require_scripts_permitted(batch["usecase_id"], use_case, data)
 
-    executions = await data.list_executions(batch_id=batch_id)
-    by_index = {
-        int(row["row_index"]): row["inputs"]
-        for row in executions
-        if row["row_index"] is not None
-    }
-    highest = max(by_index) if by_index else -1
-    rows = [by_index.get(index, {}) for index in range(highest + 1)]
+    if body.secrets:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A batch cannot take inline secrets. Save the login as a credential "
+                "and pass its credential_id instead."
+            ),
+        )
 
     secrets = await resolve_secrets(
         ExecuteRequest(
             credential_id=body.credential_id or batch.get("credential_id"),
-            secrets=body.secrets,
+            secrets=None,
         ),
         data,
         vault,
@@ -258,6 +341,11 @@ async def resume_batch(
                 rows=rows,
                 secrets=secrets,
                 credential_id=body.credential_id or batch.get("credential_id"),
+                # A resume goes back to the address the original ran against unless
+                # the caller deliberately names another. Re-resolving would let a
+                # target edited in between move the remaining rows to a different
+                # deployment from the ones already done.
+                base_url=body.base_url or str(batch.get("base_url") or ""),
                 only_rows=outstanding,
                 headless=body.headless,
                 browser=body.browser,
@@ -266,8 +354,8 @@ async def resume_batch(
                 owner_email=principal.email,
             )
         )
-    except ExecutionBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TargetMissing as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return {"batch_id": new_id, "resumed_from": batch_id, "rows": len(outstanding)}
 
@@ -277,22 +365,27 @@ async def cancel_batch(
     batch_id: str,
     data: WorkspaceData,
     replays: Replays,
-    _: Annotated[Principal, Depends(require(Permission.RUN_CANCEL))],
+    principal: Annotated[Principal, Depends(require(Permission.RUN_CANCEL))],
 ) -> dict[str, Any]:
-    """Stop after the row in flight finishes.
+    """Stop a batch, queued or in flight.
 
-    The order of these two checks is deliberate. "Not running" is answered
-    first, so a batch id that does not exist gets the same 409 as one that
-    exists but is idle -- cancelling is about the execution slot, not about the
-    record. Ownership is checked only once we know the batch *is* running,
-    which is the point at which the answer could otherwise leak: without it,
-    one tenant could stop another's batch by guessing its id.
+    Ownership is established first now. It used to be checked only after "is
+    this running?", so that a batch id which did not exist and one that existed
+    but was idle gave the same answer -- when cancelling meant taking the
+    in-process slot, that was the whole story. A queued batch lives in a table
+    a tenant either can or cannot see, so the scoped lookup is both the 404 and
+    the tenancy check, and it has to come first.
+
+    A running batch stops after the row in flight finishes. A queued one is
+    cancelled in the queue and never starts.
     """
-    active = replays.active
-    if not active or active.get("batch_id") != batch_id:
-        raise HTTPException(status_code=409, detail="That batch is not running.")
     await batch_or_404(batch_id, data)
-    return {"batch_id": batch_id, "cancelled": await replays.cancel_active()}
+    cancelled = await replays.cancel_batch(batch_id, principal.workspace_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=409, detail="That batch is not running and is not queued."
+        )
+    return {"batch_id": batch_id, "cancelled": True}
 
 
 @router.get("/batches/{batch_id}/results.csv")

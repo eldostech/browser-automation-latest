@@ -68,6 +68,13 @@ class DeclaredFieldPayload(BaseModel):
     #: Write-only. No endpoint returns this for a secret field, and the value
     #: of a secret is never persisted at all.
     value: str = Field(max_length=4000)
+    #: Which of the recording's typed values this field names, as a position in
+    #: ``Recording.typed``. Values alone cannot identify a field: type the same
+    #: text into two boxes -- a name and a description, say -- and both steps
+    #: collapse onto whichever field was declared last, leaving the other
+    #: declared but unreferenced. The position tells them apart. Optional, so a
+    #: client that does not send it keeps the older value-matching behaviour.
+    index: int | None = Field(default=None, ge=0)
     secret: bool = False
     description: str = Field(default="", max_length=300)
     example: str = Field(default="", max_length=200)
@@ -206,8 +213,19 @@ class CredentialRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class TargetRequest(BaseModel):
+    """The address this deployment gives one target."""
+
+    base_url: str = Field(min_length=1, max_length=2000)
+    description: str = Field(default="", max_length=300)
+
+
 class ExecuteRequest(BaseModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
+    #: Run against this address instead of the use case's target. For a one-off
+    #: against a branch deployment or one customer's tenant, where a standing
+    #: target would be ceremony for a single run.
+    base_url: str = Field(default="", max_length=2000)
     #: Bind stored credentials by id, or pass values inline for a one-off.
     credential_id: str | None = None
     secrets: dict[str, str] | None = None
@@ -216,9 +234,70 @@ class ExecuteRequest(BaseModel):
     browser: str | None = None
 
 
-class BatchRequestBody(BaseModel):
-    """Rows arrive as CSV text, a base64 .xlsx workbook, or JSON objects."""
+class StartRecordingRequest(BaseModel):
+    """Open a browser window at a URL and record what happens in it."""
 
+    start_url: str
+    name: str = ""
+
+
+class SaveRecordingRequest(BaseModel):
+    """Turn a finished recording into a draft use case.
+
+    ``fields`` names the values that were typed: which become per-row inputs,
+    and which are credentials. It is the same payload the distil path takes,
+    because it answers the same question about the same kind of recording.
+    """
+
+    name: str = ""
+    description: str = ""
+    fields: list[DeclaredFieldPayload] = []
+
+
+class RememberFixRequest(BaseModel):
+    """A repair a person worked out, recorded so the next run recalls it.
+
+    ``page`` and ``page_url`` are what the failure looked like: the URL scopes
+    recall to a domain, and the page is what gets embedded. Both come back from
+    the failure the user is looking at, so the UI does not ask them to type
+    anything it already knows.
+    """
+
+    step_id: str
+    page_url: str
+    page: str = ""
+    step_summary: str = ""
+    wanted: str = ""
+    explanation: str = Field(min_length=1, max_length=2000)
+    usecase_id: str | None = None
+    old_locator: dict[str, Any] | None = None
+    new_locator: dict[str, Any] | None = None
+    error_kind: str = "not_found"
+
+
+class MappingRequest(BaseModel):
+    """Which dataset to line up against which version of a use case."""
+
+    dataset_id: str
+    version: int | None = None
+
+
+class BatchRequestBody(BaseModel):
+    """Rows arrive as an uploaded dataset, CSV text, a base64 .xlsx workbook,
+    or JSON objects.
+
+    ``dataset_id`` is the route the UI takes, because it is the only one where
+    the columns were profiled and mapped before anything ran. The others remain
+    for callers driving the API directly.
+    """
+
+    #: An already-uploaded dataset. With it, ``mapping`` says which column
+    #: fills which declared input; without a mapping the column names must
+    #: already be the field names.
+    dataset_id: str | None = None
+    mapping: dict[str, str] | None = None
+    #: Run every row against this address instead of the use case's target.
+    base_url: str = Field(default="", max_length=2000)
     csv: str | None = None
     #: A base64-encoded .xlsx. Spreadsheets are how people actually keep lists
     #: of records, and re-saving one as CSV silently mangles leading zeros,
@@ -236,6 +315,10 @@ class BatchRequestBody(BaseModel):
 __all__ = [
     "ApprovalRequest",
     "BatchRequestBody",
+    "MappingRequest",
+    "RememberFixRequest",
+    "SaveRecordingRequest",
+    "StartRecordingRequest",
     "ChangePasswordRequest",
     "CreateRunRequest",
     "CreateRunResponse",

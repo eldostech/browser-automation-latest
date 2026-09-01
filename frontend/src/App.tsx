@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from './lib/api';
 import { session, type CurrentUser } from './lib/session';
+import { HealingMemory } from './components/HealingMemory';
+import { Targets } from './components/Targets';
+import { RecordWorkflow } from './components/RecordWorkflow';
 import { RunHistory } from './components/RunHistory';
 import { SignIn } from './components/SignIn';
 import { RunView } from './components/RunView';
-import { TaskComposer } from './components/TaskComposer';
 import { UseCaseList } from './components/UseCaseList';
 import { UseCaseView } from './components/UseCaseView';
 
 type View =
-  | { name: 'compose' }
+  | { name: 'record' }
   | { name: 'history' }
+  | { name: 'memory' }
+  | { name: 'targets' }
   | { name: 'run'; runId: string }
   | { name: 'usecases' }
   | { name: 'usecase'; usecaseId: string };
@@ -26,9 +30,11 @@ function viewFromHash(): View {
     const usecaseId = hash.slice('usecases/'.length);
     if (usecaseId) return { name: 'usecase', usecaseId };
   }
-  if (hash === 'usecases') return { name: 'usecases' };
   if (hash === 'history') return { name: 'history' };
-  return { name: 'compose' };
+  if (hash === 'memory') return { name: 'memory' };
+  if (hash === 'targets') return { name: 'targets' };
+  if (hash === 'usecases') return { name: 'usecases' };
+  return { name: 'record' };
 }
 
 function hashFor(view: View): string {
@@ -36,15 +42,19 @@ function hashFor(view: View): string {
   if (view.name === 'usecase') return `#/usecases/${view.usecaseId}`;
   if (view.name === 'usecases') return '#/usecases';
   if (view.name === 'history') return '#/history';
-  return '#/';
+  if (view.name === 'memory') return '#/memory';
+  if (view.name === 'targets') return '#/targets';
+  return '#/record';
 }
 
 export default function App() {
   const [user, setUser] = useState<CurrentUser | null>(session.user);
   const [view, setView] = useState<View>(viewFromHash);
-  const [health, setHealth] = useState<{ status?: string; mcp?: { ok?: boolean | null } } | null>(
-    null,
-  );
+  const [health, setHealth] = useState<{
+    status?: string;
+    queue?: { queued?: number; running?: number };
+  } | null>(null);
+  const [environment, setEnvironment] = useState('');
 
   const navigate = useCallback((next: View) => {
     setView(next);
@@ -69,37 +79,70 @@ export default function App() {
     if (session.isSignedIn) api.me().then(setUser).catch(() => undefined);
   }, []);
 
+  // Polled rather than fetched once. A single attempt at mount meant a backend
+  // that was still starting left the header saying "unreachable" for the whole
+  // session -- tolerable for a status line, not for the environment badge,
+  // which is there so nobody starts a batch against the wrong deployment.
   useEffect(() => {
     if (!user) return;
-    api
-      .health()
-      .then((body) => setHealth(body as { status?: string }))
-      .catch(() => setHealth({ status: 'unreachable' }));
+    let live = true;
+    const poll = () => {
+      api
+        .health()
+        .then((body) => live && setHealth(body as { status?: string }))
+        .catch(() => live && setHealth({ status: 'unreachable' }));
+      api
+        .getConfig()
+        .then((body) => live && setEnvironment(body.environment ?? ''))
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 30_000);
+    return () => {
+      live = false;
+      window.clearInterval(timer);
+    };
   }, [user]);
 
-  const mcpOk = health?.mcp?.ok;
+  const queued = health?.queue?.queued ?? 0;
+  const running = health?.queue?.running ?? 0;
 
   if (!user) return <SignIn onSignedIn={setUser} />;
 
   return (
     <div className="app">
       <header className="topbar">
-        <h1>Browser Agent</h1>
+        <div className="brand">
+          <span className="mark" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3l7.5 3v6c0 4.4-3 7.9-7.5 9-4.5-1.1-7.5-4.6-7.5-9V6z" />
+              <path d="M9 12l2.2 2.2L15.5 10" />
+            </svg>
+          </span>
+          <h1>Understudy</h1>
+          <span className="qualifier">Automation Platform</span>
+          {environment && (
+            <span className="env" title="The deployment this dashboard is pointed at">
+              <span className="dot" />
+              {environment}
+            </span>
+          )}
+          <span className="spacer" />
+          <span className="meta">
+            {health === null
+              ? 'checking backend...'
+              : health.status === 'unreachable'
+                ? 'backend unreachable'
+                : `backend ${health.status} - ${running} running, ${queued} queued`}
+          </span>
+          <span className="who" title={`${user.email} (${user.role})`}>
+            {user.email} <span className="role-chip">{user.role}</span>
+          </span>
+          <button type="button" className="linkish" onClick={() => api.logout()}>
+            Sign out
+          </button>
+        </div>
         <nav>
-          <button
-            type="button"
-            className={view.name === 'compose' ? 'active' : ''}
-            onClick={() => navigate({ name: 'compose' })}
-          >
-            New run
-          </button>
-          <button
-            type="button"
-            className={view.name === 'history' ? 'active' : ''}
-            onClick={() => navigate({ name: 'history' })}
-          >
-            History
-          </button>
           <button
             type="button"
             className={view.name === 'usecases' || view.name === 'usecase' ? 'active' : ''}
@@ -108,42 +151,57 @@ export default function App() {
           >
             Use cases
           </button>
+          <button
+            type="button"
+            className={view.name === 'record' ? 'active' : ''}
+            onClick={() => navigate({ name: 'record' })}
+            title="Do the task once by hand; no model, no tokens"
+          >
+            Record
+          </button>
+          <button
+            type="button"
+            className={view.name === 'history' ? 'active' : ''}
+            onClick={() => navigate({ name: 'history' })}
+          >
+            Runs
+          </button>
+          <button
+            type="button"
+            className={view.name === 'targets' ? 'active' : ''}
+            onClick={() => navigate({ name: 'targets' })}
+            title="Which site each use case runs against, in this deployment"
+          >
+            Targets
+          </button>
+          <button
+            type="button"
+            className={view.name === 'memory' ? 'active' : ''}
+            onClick={() => navigate({ name: 'memory' })}
+            title="Locators that broke, and what fixed them"
+          >
+            Learned fixes
+          </button>
         </nav>
-        <span className="spacer" />
-        <span className="meta">
-          {health === null
-            ? 'checking backend...'
-            : health.status === 'unreachable'
-              ? 'backend unreachable'
-              : `backend ${health.status} - mcp ${mcpOk === true ? 'ok' : mcpOk === false ? 'down' : 'unknown'}`}
-        </span>
-        <span className="who" title={`${user.email} (${user.role})`}>
-          {user.email} <span className="role-chip">{user.role}</span>
-        </span>
-        <button type="button" className="linkish" onClick={() => api.logout()}>
-          Sign out
-        </button>
       </header>
 
       <main className={view.name === 'run' || view.name === 'usecase' ? 'page' : 'page narrow'}>
-        {view.name === 'compose' && !session.can('run:create') && (
+        {view.name === 'record' && !session.can('usecase:create') && (
           <div className="banner">
-            Your role ({user.role}) can view runs but not start them. Ask an administrator
-            for the operator role if you need to record a task.
+            Your role ({user.role}) cannot record workflows. Ask an administrator for the
+            operator role.
           </div>
         )}
 
-        {view.name === 'compose' && session.can('run:create') && (
-          <>
-            {health?.status === 'degraded' && (
-              <div className="banner error">
-                The backend reports a degraded state. Check <code>/healthz</code> -- usually a
-                AWS credentials Bedrock will not accept, or an MCP server that will not start.
-              </div>
-            )}
-            <TaskComposer onStarted={(runId) => navigate({ name: 'run', runId })} />
-          </>
+        {view.name === 'record' && session.can('usecase:create') && (
+          <RecordWorkflow
+            onSaved={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
+          />
         )}
+
+        {view.name === 'memory' && <HealingMemory />}
+
+        {view.name === 'targets' && <Targets />}
 
         {view.name === 'history' && (
           <RunHistory onOpen={(runId) => navigate({ name: 'run', runId })} />
@@ -153,7 +211,6 @@ export default function App() {
           <RunView
             runId={view.runId}
             onBack={() => navigate({ name: 'history' })}
-            onRecorded={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
             onOpenUseCase={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
           />
         )}

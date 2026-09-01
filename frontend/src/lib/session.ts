@@ -15,8 +15,8 @@
  * If this ever holds anything more valuable, revisit that.
  */
 
-const TOKEN_KEY = 'browser-agent.token';
-const USER_KEY = 'browser-agent.user';
+const TOKEN_KEY = 'understudy.token';
+const USER_KEY = 'understudy.user';
 
 export interface CurrentUser {
   id: string;

@@ -7,7 +7,19 @@ dependency once for every route it carries, the shared 404 lookups live in
 underneath can be tested without a ``TestClient``.
 """
 
-from routers import admin, auth, credentials, executions, health, runs, usecases
+from routers import (
+    admin,
+    auth,
+    credentials,
+    datasets,
+    executions,
+    health,
+    memory,
+    targets,
+    recordings,
+    runs,
+    usecases,
+)
 
 #: Registration order matters only for documentation grouping; FastAPI matches
 #: on path, so there is no shadowing between these.
@@ -18,7 +30,23 @@ ALL_ROUTERS = (
     runs.router,
     usecases.router,
     credentials.router,
+    datasets.router,
     executions.router,
+    recordings.router,
+    memory.router,
+    targets.router,
 )
 
-__all__ = ["ALL_ROUTERS", "admin", "auth", "credentials", "executions", "health", "runs", "usecases"]
+__all__ = [
+    "ALL_ROUTERS",
+    "admin",
+    "auth",
+    "credentials",
+    "datasets",
+    "executions",
+    "health",
+    "memory",
+    "recordings",
+    "runs",
+    "usecases",
+]

@@ -19,20 +19,56 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import DateTime, MetaData, String
 from sqlalchemy.orm import DeclarativeBase, mapped_column
 
-#: The schema every table lives in.
-#:
-#: Read from the environment at *import* time, because SQLAlchemy binds the
-#: schema into ``MetaData`` when the model classes are defined -- long before
-#: any ``Settings`` object exists. A process serves exactly one schema, so this
-#: is a deployment constant rather than a runtime setting, and
-#: ``db.engine.create_engine`` refuses to start if ``Settings.db_schema``
-#: disagrees with it. That check exists because the failure mode otherwise is
-#: silent and awful: tables created in one schema while queries read another.
-DEFAULT_SCHEMA = os.environ.get("DB_SCHEMA", "browser")
+def _schema() -> str:
+    """The schema every table lives in, resolved at import time.
+
+    SQLAlchemy binds the schema into ``MetaData`` when the model classes are
+    defined, which happens long before any ``Settings`` object exists. So this
+    cannot come from ``Settings`` -- it has to be read here, first.
+
+    That used to mean reading only ``os.environ``, and it made ``DB_SCHEMA`` the
+    one setting that did not work from ``.env``: pydantic-settings loads that
+    file when ``Settings()`` is constructed, by which point the models are
+    already built for the wrong schema. The application then refused to start
+    with a message telling the operator to set an environment variable --
+    correct, but a poor answer to "I put it in the documented place".
+
+    So the file is read here too, with the same precedence pydantic-settings
+    uses: a real environment variable wins, then ``.env``, then the default.
+    Nothing is written back into ``os.environ`` -- this reads the file, it does
+    not take over the process's configuration.
+    """
+    from_env = os.environ.get("DB_SCHEMA")
+    if from_env:
+        return from_env
+
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover - python-dotenv is a dependency
+        return "browser"
+
+    # The same two locations `Settings` looks in, in the same order.
+    for candidate in (Path(__file__).resolve().parent.parent.parent / ".env", Path(".env")):
+        try:
+            if candidate.is_file():
+                value = (dotenv_values(candidate) or {}).get("DB_SCHEMA")
+                if value:
+                    return value.strip().strip("\"'")
+        except OSError:  # pragma: no cover - unreadable file is not fatal
+            continue
+    return "browser"
+
+
+#: A process serves exactly one schema, so this is a deployment constant rather
+#: than a runtime setting. ``db.engine.create_engine`` refuses to start if
+#: ``Settings.db_schema`` disagrees with it, because the failure mode otherwise
+#: is silent and awful: tables created in one schema while queries read another.
+DEFAULT_SCHEMA = _schema()
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_N_label)s",
@@ -86,10 +122,6 @@ def iso(value: datetime | None) -> str | None:
 
 def id_column():
     return mapped_column(String(32), primary_key=True, default=new_id)
-
-
-def timestamp_column(**kwargs):
-    return mapped_column(DateTime(timezone=True), **kwargs)
 
 
 def created_at_column():

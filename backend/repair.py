@@ -29,6 +29,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from memory import as_prompt
 from prompt_loader import REPAIR, REPAIR_REQUEST, load, render
 from snapshot import Node, Snapshot, parse as parse_snapshot
 from usecase import Assertion, Locator, UseCase
@@ -139,6 +140,11 @@ class FailureContext:
     snapshot: Snapshot
     page_url: str | None = None
     inputs: dict[str, Any] = field(default_factory=dict)
+    #: Whether the run got far enough to fail *on a step*. False means it died
+    #: before that -- the browser would not start, or setup never completed --
+    #: and no page was ever on screen to capture. The two cases need different
+    #: things from the person reading the refusal, so they are told apart.
+    reached_a_step: bool = False
 
     @property
     def failed_step(self):
@@ -179,9 +185,11 @@ def gather_context(
     """
     snapshot_text = ""
     page_url: str | None = None
+    reached_a_step = False
 
     for event in events:
         if getattr(event, "type", None) == "error" and getattr(event, "kind", "") == "step_failed":
+            reached_a_step = True
             detail = getattr(event, "detail", {}) or {}
             if detail.get("snapshot"):
                 snapshot_text = str(detail["snapshot"])
@@ -199,6 +207,7 @@ def gather_context(
         snapshot=parsed,
         page_url=page_url or parsed.page_url,
         inputs=execution.get("inputs") or {},
+        reached_a_step=reached_a_step,
     )
 
 
@@ -232,9 +241,15 @@ class RepairProposal:
 class UseCaseDoctor:
     """One LLM call: look at a failure and propose the smallest set of edits."""
 
-    def __init__(self, llm: Any, max_tokens: int = 30_000) -> None:
+    def __init__(self, llm: Any, max_tokens: int = 30_000, memory: Any = None) -> None:
         self.llm = llm
         self.max_tokens = max_tokens
+        #: What has already been worked out on this site. The healer has always
+        #: consulted this; the repair button did not, so pressing it a second
+        #: time on a failure somebody had already solved re-derived the answer
+        #: from scratch at the cost of another call. Optional: healing memory
+        #: can be switched off, and a repair still has to work without it.
+        self.memory = memory
 
     async def diagnose(self, context: FailureContext) -> RepairProposal:
         options = candidates(context.snapshot)
@@ -242,6 +257,29 @@ class UseCaseDoctor:
             # Without the page there is nothing to point at, so every fix the
             # model could name would be a guess. Say so instead of paying for
             # a refusal.
+            if not context.reached_a_step:
+                # It never got as far as a step, so there was no page to record
+                # and re-running changes nothing until the underlying error is
+                # dealt with. Repeating "run it once more" here would send a
+                # person round the same loop.
+                raise RepairError(
+                    "This run failed before any step could be attempted, so no page was "
+                    "ever on screen to repair against. Nothing in the use case is "
+                    f"necessarily wrong. The run failed with: {context.error}"
+                )
+            if any(True for _ in context.snapshot):
+                # There *is* a page; it just has nothing on it. Almost always a
+                # step that ran before the page finished rendering, which is a
+                # timing problem rather than a locator problem -- and proposing
+                # a new locator for it would be a confident wrong answer.
+                raise RepairError(
+                    "The page was captured, but it was empty apart from its frame -- "
+                    "nothing had rendered yet when the step ran. That is a timing "
+                    "problem, not a locator problem, so there is nothing here to repair. "
+                    "The step gave up before the page finished arriving; re-run it, and "
+                    "if it happens again the page needs longer than the step timeout "
+                    "allows."
+                )
             raise RepairError(
                 "The page was not recorded for this failure, so there is nothing to match "
                 "against and any repair would be guesswork. This affects runs from before "
@@ -256,6 +294,19 @@ class UseCaseDoctor:
             or "(the page was not captured, so no elements can be offered)"
         )
         step = context.failed_step
+
+        # Evidence for the model, never an instruction: whatever it picks still
+        # has to be one of the candidates above.
+        past: list[Any] = []
+        if self.memory is not None:
+            past = await self.memory.recall(
+                step_summary=step.summary() if step else context.error[:200],
+                wanted=(
+                    step.locators[0].describe() if step and step.locators else ""
+                ),
+                page_url=context.page_url or "",
+                page=listing,
+            )
 
         turn = await self.llm.run_turn(
             system=load(REPAIR),
@@ -278,6 +329,7 @@ class UseCaseDoctor:
                         allowed_domains=", ".join(context.usecase.allowed_domains) or "(none)",
                         steps=_describe_steps(context.usecase),
                         candidates=listing,
+                        past_fixes=as_prompt(past),
                     ),
                 }
             ],
@@ -308,6 +360,59 @@ class UseCaseDoctor:
             unfixable_reason=str(payload.get("unfixable_reason") or ""),
             tokens=tokens,
         )
+
+
+
+@dataclass(slots=True)
+class LocatorChange:
+    """One ladder that a repair gave a new head, and what it had before."""
+
+    step_id: str
+    #: The form field whose ladder changed, when the step fills a form and each
+    #: field carries its own. Empty for an ordinary step.
+    field_name: str
+    old_locator: dict[str, Any] | None
+    new_locator: dict[str, Any]
+
+
+def locator_changes(before: dict[str, Any], after: dict[str, Any]) -> list[LocatorChange]:
+    """What a repair changed, read off the result rather than the proposal.
+
+    Taken by comparing the two definitions instead of by instrumenting
+    ``apply_fixes``, for one reason: a fix that was proposed is not a fix that
+    landed. The model can name a step that does not exist or an element index
+    off the end of the page, and those are skipped. Reading the outcome means
+    only real changes are learned from, and it cannot drift out of step with
+    the code that applies them.
+    """
+    changes: list[LocatorChange] = []
+
+    def head(holder: dict[str, Any]) -> dict[str, Any] | None:
+        ladder = holder.get("locators") or []
+        return ladder[0] if ladder else None
+
+    def compare(step_id: str, field_name: str, was: dict, now: dict) -> None:
+        old, new = head(was), head(now)
+        if new is not None and new != old:
+            changes.append(LocatorChange(step_id, field_name, old, new))
+
+    for phase in ("setup_steps", "row_steps", "teardown_steps"):
+        older = {s.get("id"): s for s in (before.get(phase) or [])}
+        for step in after.get(phase) or []:
+            was = older.get(step.get("id"))
+            if was is None:
+                continue
+            step_id = str(step.get("id") or "")
+            compare(step_id, "", was, step)
+            # A fill_form step holds no ladder of its own; each field has one,
+            # and that is what both the executor and a repair actually touch.
+            was_fields = {f.get("name"): f for f in (was.get("fields") or [])}
+            for field in step.get("fields") or []:
+                previous = was_fields.get(field.get("name"))
+                if previous is not None:
+                    compare(step_id, str(field.get("name") or ""), previous, field)
+
+    return changes
 
 
 def apply_fixes(

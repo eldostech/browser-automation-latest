@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from batch import BatchInputError, parse_csv, parse_workbook, rows_from_json
+from ingest import BatchInputError, Dataset, read_csv_text, read_table, rows_from_json
 from credentials import Vault, VaultError, VaultUnavailable
 from routers.schemas import BatchRequestBody, ExecuteRequest, RepairRequest
 from store import WorkspaceStore
@@ -107,16 +107,21 @@ async def require_scripts_permitted(usecase_id: str, use_case: UseCase, data: Wo
         )
 
 
-def rows_from_body(body: BatchRequestBody):
-    """Whichever way the rows arrived, one shape comes out."""
+def rows_from_body(body: BatchRequestBody) -> Dataset:
+    """Whichever way the rows arrived, one shape comes out.
+
+    A dataset uploaded beforehand is not handled here: it is read from the
+    store, which needs the request scope, so the router resolves that case
+    before calling this.
+    """
     if body.xlsx_base64 is not None:
         try:
             data = base64.b64decode(body.xlsx_base64, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise BatchInputError(f"the workbook was not valid base64: {exc}") from exc
-        return parse_workbook(data, body.sheet)
+        return read_table(data, "upload.xlsx", body.sheet)
     if body.csv is not None:
-        return parse_csv(body.csv)
+        return read_csv_text(body.csv)
     return rows_from_json(body.rows)
 
 

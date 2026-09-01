@@ -1,14 +1,21 @@
 # ---------------------------------------------------------------------------
-# The backend image ships Node (for `npx @playwright/mcp`), Python, and the
-# Playwright browser binaries, because in stdio mode the MCP server is a child
-# process of the backend. Switch MCP_TRANSPORT=http and uncomment the `mcp`
-# service to run the browser in its own container instead.
-# ---------------------------------------------------------------------------
+# One command to get the whole thing running: Postgres with pgvector, the API,
+# a batch worker, and the dashboard.
+#
+# The image carries Python, Playwright and the browser binaries. There is no
+# MCP server any more -- a replay drives Playwright directly -- and no recorder
+# here either: `playwright codegen` opens a headed browser and a container has
+# no display, so workflows are recorded with `make backend` on a machine that
+# does and run anywhere.
+
 services:
   # The application's own database. A named schema inside it (DB_SCHEMA) means
   # this can just as easily be an existing Postgres shared with other systems.
   postgres:
-    image: postgres:18
+    # pgvector rather than stock postgres: healing memory needs the `vector`
+    # extension, and the migration that creates it fails with a sentence
+    # saying so if the server cannot offer it.
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
@@ -90,11 +97,6 @@ services:
     depends_on:
       - backend
 
-  # Optional: run the Playwright MCP server as its own service.
-  # Set MCP_TRANSPORT=http and MCP_SERVER_URL=http://mcp:8931/sse in .env.
-  # mcp:
-  #   image: mcr.microsoft.com/playwright:v1.49.0-noble
-  #   command: npx -y @playwright/mcp@latest --port 8931 --host 0.0.0.0 --headless --isolated
   #   ports:
   #     - "8931:8931"
   #   shm_size: "1gb"

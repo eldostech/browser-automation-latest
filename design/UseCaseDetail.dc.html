@@ -1,0 +1,209 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <style>
+    body { margin: 0; font-family: 'Public Sans', 'Segoe UI', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: #10566B; text-decoration: none; }
+    a:hover { color: #0B3F4F; text-decoration: underline; }
+  </style>
+</helmet>
+
+<div style="width: 1440px; min-height: 900px; background: #F4F2ED; color: #16232E; display: flex; flex-direction: column;">
+
+  <div style="background: #12293D; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; height: 60px;">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#C9A227" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 3v6c0 4.4-3 7.9-7.5 9-4.5-1.1-7.5-4.6-7.5-9V6z"></path><path d="M9 12l2.2 2.2L15.5 10"></path></svg>
+      <span style="font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600; color: #FFFFFF;">Browser Agent</span>
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #92A9BC; border-left: 1px solid rgba(255,255,255,0.2); padding-left: 14px;">Automation Platform</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 20px;">
+      <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #E8C86A; background: rgba(201,162,39,0.14); border: 1px solid rgba(201,162,39,0.4); border-radius: 2px; padding: 4px 9px;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #C9A227;"></span>UAT</span>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="width: 30px; height: 30px; border-radius: 50%; background: #274A66; color: #FFFFFF; font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center;">NA</span>
+        <div style="display: flex; flex-direction: column; gap: 1px;">
+          <span style="font-size: 13px; font-weight: 600; color: #FFFFFF;">Nitin Asati</span>
+          <span style="font-size: 11px; color: #92A9BC;">Author</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="background: #0D1F2E; padding: 0 40px; display: flex; align-items: stretch; gap: 4px; height: 46px;">
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 600; color: #FFFFFF; border-bottom: 3px solid #C9A227;">Use cases</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Record</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Runs</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Datasets</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Learned fixes</span>
+  </div>
+
+  <div style="flex-grow: 1; padding: 24px 40px 48px;">
+
+    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 13px; color: #55636F;">
+      <a href="#">Use cases</a>
+      <span style="color: #C9C3B8;">/</span>
+      <span style="color: #16232E;">Create a project</span>
+    </div>
+
+    <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 40px; margin-bottom: 24px;">
+      <div style="display: flex; flex-direction: column; gap: 10px; max-width: 720px;">
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <h1 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; color: #12293D;">Create a project</h1>
+          <span style="display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 2px; background: #EAF2ED; border: 1px solid #BFD8CB; color: #2C6E49; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2C6E49;"></span>Ready</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #8A96A1;">v2</span>
+        </div>
+        <p style="margin: 0; font-size: 14px; line-height: 1.55; color: #55636F;">Signs in, opens the new-project form, and files one project per row of the dataset.</p>
+      </div>
+      <div style="display: flex; gap: 10px; flex-shrink: 0;">
+        <button style="height: 38px; padding: 0 16px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Export definition</button>
+        <button style="height: 38px; padding: 0 16px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Run once</button>
+        <button style="height: 38px; padding: 0 18px; border-radius: 3px; border: 1px solid #12293D; background: #12293D; color: #FFFFFF; font-size: 14px; font-weight: 600;">Run a batch</button>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 24px; align-items: start;">
+
+      <!-- steps -->
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+          <div style="padding: 16px 20px; border-bottom: 1px solid #E2DED6; display: flex; align-items: center; justify-content: space-between;">
+            <div style="display: flex; flex-direction: column; gap: 3px;">
+              <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 17px; font-weight: 600; color: #12293D;">Setup</h2>
+              <span style="font-size: 12.5px; color: #55636F;">Runs once for the whole batch, not once per row</span>
+            </div>
+            <span style="font-size: 12.5px; color: #8A96A1;">4 steps</span>
+          </div>
+          <div style="display: flex; flex-direction: column;">
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s4</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #10566B; background: #EAF1F4; border: 1px solid #C6DBE3; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Navigate</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E;">uat.schemora.ai/login</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s6</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Fill</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=textbox name="Email"</span>
+              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #8A5A0B; background: #F5F2EA; border: 1px solid #DED5BF; border-radius: 2px; padding: 3px 8px;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="4" y="10" width="16" height="10" rx="1.5"></rect><path d="M8 10V7a4 4 0 018 0v3"></path></svg>
+                secret.email
+              </span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s9</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Fill</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=textbox name="Password"</span>
+              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #8A5A0B; background: #F5F2EA; border: 1px solid #DED5BF; border-radius: 2px; padding: 3px 8px;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="4" y="10" width="16" height="10" rx="1.5"></rect><path d="M8 10V7a4 4 0 018 0v3"></path></svg>
+                secret.password
+              </span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s10</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Click</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E;">role=button name="Sign In"</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+          <div style="padding: 16px 20px; border-bottom: 1px solid #E2DED6; display: flex; align-items: center; justify-content: space-between;">
+            <div style="display: flex; flex-direction: column; gap: 3px;">
+              <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 17px; font-weight: 600; color: #12293D;">Per row</h2>
+              <span style="font-size: 12.5px; color: #55636F;">Repeated for every row of the dataset</span>
+            </div>
+            <span style="font-size: 12.5px; color: #8A96A1;">15 steps</span>
+          </div>
+          <div style="display: flex; flex-direction: column;">
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s13</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Fill</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=textbox name="Legacy CRM to&hellip;"</span>
+              <span style="font-size: 12px; font-weight: 600; color: #10566B; background: #EAF1F4; border: 1px solid #C6DBE3; border-radius: 2px; padding: 3px 8px;">input.project_name</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s15</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Fill</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=textbox name="Brief description"</span>
+              <span style="font-size: 12px; font-weight: 600; color: #10566B; background: #EAF1F4; border: 1px solid #C6DBE3; border-radius: 2px; padding: 3px 8px;">input.description</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid #F2EFE9;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s16</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Select</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=combobox [0]</span>
+              <span style="font-size: 12px; font-weight: 600; color: #10566B; background: #EAF1F4; border: 1px solid #C6DBE3; border-radius: 2px; padding: 3px 8px;">input.source</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 14px; padding: 12px 20px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1; width: 26px;">s17</span>
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #55636F; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 2px; padding: 3px 8px; width: 62px; text-align: center;">Select</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; color: #16232E; flex-grow: 1;">role=combobox [1]</span>
+              <span style="font-size: 12px; font-weight: 600; color: #10566B; background: #EAF1F4; border: 1px solid #C6DBE3; border-radius: 2px; padding: 3px 8px;">input.target</span>
+            </div>
+          </div>
+          <div style="padding: 11px 20px; background: #FAF8F5; border-top: 1px solid #E2DED6;">
+            <a href="#" style="font-size: 13px; font-weight: 600;">Show all 15 steps</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- side -->
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px; padding: 18px 20px; display: flex; flex-direction: column; gap: 14px;">
+          <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 16px; font-weight: 600; color: #12293D;">Environment</h2>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: #55636F;">Base address</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #16232E;">https://uat.schemora.ai</span>
+            <span style="font-size: 12.5px; line-height: 1.5; color: #55636F;">Supplied by this deployment. The definition itself carries no environment, so the same version runs in dev, UAT and production.</span>
+          </div>
+          <div style="height: 1px; background: #EFEBE4;"></div>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: #55636F;">May visit</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #16232E;">uat.schemora.ai</span>
+          </div>
+        </div>
+
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+          <div style="padding: 16px 20px 12px;">
+            <h2 style="margin: 0 0 3px; font-family: 'Source Serif 4', Georgia, serif; font-size: 16px; font-weight: 600; color: #12293D;">Inputs</h2>
+            <span style="font-size: 12.5px; color: #55636F;">One spreadsheet column each</span>
+          </div>
+          <div style="display: flex; flex-direction: column;">
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 20px; border-top: 1px solid #F2EFE9;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">project_name</span><span style="font-size: 12px; color: #8A96A1;">text</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 20px; border-top: 1px solid #F2EFE9;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">description</span><span style="font-size: 12px; color: #8A96A1;">text</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 20px; border-top: 1px solid #F2EFE9;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">source</span><span style="font-size: 12px; color: #8A96A1;">option id</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 20px; border-top: 1px solid #F2EFE9;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">target</span><span style="font-size: 12px; color: #8A96A1;">option id</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 20px; border-top: 1px solid #F2EFE9;"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">prompt</span><span style="font-size: 12px; color: #8A96A1;">option id</span></div>
+          </div>
+        </div>
+
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px;">
+          <div style="display: flex; flex-direction: column; gap: 3px;">
+            <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 16px; font-weight: 600; color: #12293D;">Credentials</h2>
+            <span style="font-size: 12.5px; line-height: 1.5; color: #55636F;">Supplied once per run and stored encrypted. Never written into the definition.</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 3px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">email</span>
+              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #2C6E49;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>Provided</span>
+            </div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 3px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px;">password</span>
+              <span style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #2C6E49;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>Provided</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

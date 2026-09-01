@@ -29,13 +29,12 @@ from string import Template
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 #: Prompt names, so call sites are not stringly typed.
-SYSTEM = "system"
-TASK = "task"
-LOOP_NUDGE = "loop_nudge"
-APPROVAL_REJECTED = "approval_rejected"
+#:
+#: The agent's prompts -- its system prompt, the task template, the loop nudge,
+#: the approval rejection and the empty-result note -- went with it, and so did
+#: the distillation prompt. What is left is what a model is still asked: repair
+#: a broken locator, and explain a navigation the allowlist refused.
 NAVIGATION_BLOCKED = "navigation_blocked"
-EMPTY_TOOL_RESULT = "empty_tool_result"
-DISTILL = "distill"
 HEAL = "heal"
 HEAL_REQUEST = "heal_request"
 REPAIR = "repair"
@@ -43,15 +42,9 @@ REPAIR_REQUEST = "repair_request"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
-#: suite instead of an agent run.
+#: suite rather than a run.
 REQUIRED_PROMPTS: tuple[str, ...] = (
-    SYSTEM,
-    TASK,
-    LOOP_NUDGE,
-    APPROVAL_REJECTED,
     NAVIGATION_BLOCKED,
-    EMPTY_TOOL_RESULT,
-    DISTILL,
     HEAL,
     HEAL_REQUEST,
     REPAIR,

@@ -19,7 +19,19 @@ artifacts/
 # Playwright MCP writes session output here when run with a relative output dir
 .playwright-mcp/
 backend/.playwright-mcp/
+# Every local variant, not just the exact name. A ".env copy" made while
+# switching deployments carries DB_PASSWORD and CREDENTIALS_KEY like the
+# original does, and CREDENTIALS_KEY decrypts every credential ever stored.
 .env
+.env.*
+.env[ -]*
+*.env
+
+# The published design canvas: ~2 MB of editor bundled into one generated
+# file. The .dc.html artboards beside it are the source and are tracked.
+design/*.html
+!design/*.dc.html
+
 *.db
 *.db-journal
 *.sqlite3

@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <style>
+    body { margin: 0; font-family: 'Public Sans', 'Segoe UI', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: #10566B; text-decoration: none; }
+    a:hover { color: #0B3F4F; text-decoration: underline; }
+    table { border-collapse: collapse; }
+  </style>
+</helmet>
+
+<div style="width: 1440px; min-height: 900px; background: #F4F2ED; color: #16232E; display: flex; flex-direction: column;">
+
+  <!-- brand bar -->
+  <div style="background: #12293D; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; height: 60px;">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#C9A227" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 3v6c0 4.4-3 7.9-7.5 9-4.5-1.1-7.5-4.6-7.5-9V6z"></path><path d="M9 12l2.2 2.2L15.5 10"></path></svg>
+      <span style="font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600; color: #FFFFFF; letter-spacing: 0.005em;">Browser Agent</span>
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #92A9BC; border-left: 1px solid rgba(255,255,255,0.2); padding-left: 14px;">Automation Platform</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 20px;">
+      <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #E8C86A; background: rgba(201,162,39,0.14); border: 1px solid rgba(201,162,39,0.4); border-radius: 2px; padding: 4px 9px;">
+        <span style="width: 6px; height: 6px; border-radius: 50%; background: #C9A227;"></span>UAT
+      </span>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="width: 30px; height: 30px; border-radius: 50%; background: #274A66; color: #FFFFFF; font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center;">NA</span>
+        <div style="display: flex; flex-direction: column; gap: 1px;">
+          <span style="font-size: 13px; font-weight: 600; color: #FFFFFF;">Nitin Asati</span>
+          <span style="font-size: 11px; color: #92A9BC;">Author</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- navigation -->
+  <div style="background: #0D1F2E; padding: 0 40px; display: flex; align-items: stretch; gap: 4px; height: 46px;">
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 600; color: #FFFFFF; border-bottom: 3px solid #C9A227;">Use cases</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Record</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Runs</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Datasets</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Learned fixes</span>
+  </div>
+
+  <!-- page -->
+  <div style="flex-grow: 1; padding: 32px 40px 48px;">
+
+    <div style="display: flex; align-items: flex-end; justify-content: space-between; gap: 40px; margin-bottom: 26px;">
+      <div style="display: flex; flex-direction: column; gap: 7px; max-width: 640px;">
+        <h1 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; color: #12293D;">Use cases</h1>
+        <p style="margin: 0; font-size: 14px; line-height: 1.55; color: #55636F;">Recorded workflows that run against a spreadsheet of rows. A use case must be published before it can be run.</p>
+      </div>
+      <div style="display: flex; gap: 10px;">
+        <button style="height: 38px; padding: 0 16px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Import definition</button>
+        <button style="height: 38px; padding: 0 18px; border-radius: 3px; border: 1px solid #12293D; background: #12293D; color: #FFFFFF; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8"></circle><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"></circle></svg>
+          Record a workflow
+        </button>
+      </div>
+    </div>
+
+    <!-- filters -->
+    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 18px;">
+      <div style="display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 12px; background: #FFFFFF; border: 1px solid #C9C3B8; border-radius: 3px; width: 320px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8A96A1" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+        <span style="font-size: 14px; color: #8A96A1;">Search use cases</span>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <span style="height: 30px; display: inline-flex; align-items: center; padding: 0 13px; border-radius: 2px; font-size: 13px; font-weight: 600; background: #12293D; color: #FFFFFF;">All</span>
+        <span style="height: 30px; display: inline-flex; align-items: center; padding: 0 13px; border-radius: 2px; font-size: 13px; font-weight: 500; background: #FFFFFF; border: 1px solid #E2DED6; color: #55636F;">Ready</span>
+        <span style="height: 30px; display: inline-flex; align-items: center; padding: 0 13px; border-radius: 2px; font-size: 13px; font-weight: 500; background: #FFFFFF; border: 1px solid #E2DED6; color: #55636F;">Draft</span>
+        <span style="height: 30px; display: inline-flex; align-items: center; padding: 0 13px; border-radius: 2px; font-size: 13px; font-weight: 500; background: #FFFFFF; border: 1px solid #E2DED6; color: #55636F;">Archived</span>
+      </div>
+      <span style="margin-left: auto; font-size: 13px; color: #55636F;">5 use cases</span>
+    </div>
+
+    <!-- table -->
+    <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px; overflow: hidden;">
+      <table style="width: 100%; font-size: 14px;">
+        <thead>
+          <tr style="background: #FAF8F5; border-bottom: 1px solid #E2DED6;">
+            <th style="text-align: left; padding: 12px 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #55636F;">Use case</th>
+            <th style="text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #55636F; width: 118px;">Status</th>
+            <th style="text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #55636F; width: 168px;">Inputs</th>
+            <th style="text-align: left; padding: 12px 16px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #55636F; width: 150px;">Last run</th>
+            <th style="text-align: left; padding: 12px 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #55636F; width: 90px;">Version</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom: 1px solid #EFEBE4;">
+            <td style="padding: 15px 20px;">
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <a href="#" style="font-size: 14px; font-weight: 600;">Create a project</a>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">uat.schemora.ai &middot; 19 steps</span>
+              </div>
+            </td>
+            <td style="padding: 15px 16px;"><span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #EAF2ED; border: 1px solid #BFD8CB; color: #2C6E49; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2C6E49;"></span>Ready</span></td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">5 inputs, 2 secrets</td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">30 Aug, 20:44</td>
+            <td style="padding: 15px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #55636F;">v2</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #EFEBE4;">
+            <td style="padding: 15px 20px;">
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <a href="#" style="font-size: 14px; font-weight: 600;">Login to bank home page</a>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">uat.schemora.ai &middot; 9 steps</span>
+              </div>
+            </td>
+            <td style="padding: 15px 16px;"><span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #EAF2ED; border: 1px solid #BFD8CB; color: #2C6E49; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2C6E49;"></span>Ready</span></td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">0 inputs, 2 secrets</td>
+            <td style="padding: 15px 16px; color: #9B2226; font-size: 13px; font-weight: 600;">Failed &middot; 30 Aug</td>
+            <td style="padding: 15px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #55636F;">v2</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #EFEBE4; background: #FDFCFA;">
+            <td style="padding: 15px 20px;">
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <a href="#" style="font-size: 14px; font-weight: 600;">View uploaded document</a>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">uat.schemora.ai &middot; 11 steps</span>
+              </div>
+            </td>
+            <td style="padding: 15px 16px;"><span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #F5F2EA; border: 1px solid #DED5BF; color: #8A5A0B; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #8A5A0B;"></span>Draft</span></td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">2 inputs, 2 secrets</td>
+            <td style="padding: 15px 16px; color: #8A96A1; font-size: 13px;">Never run</td>
+            <td style="padding: 15px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #55636F;">v2</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #EFEBE4;">
+            <td style="padding: 15px 20px;">
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <a href="#" style="font-size: 14px; font-weight: 600;">Home page smoke test</a>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">uat.schemora.ai &middot; 9 steps</span>
+              </div>
+            </td>
+            <td style="padding: 15px 16px;"><span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #EAF2ED; border: 1px solid #BFD8CB; color: #2C6E49; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #2C6E49;"></span>Ready</span></td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">2 inputs, 0 secrets</td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">30 Aug, 20:37</td>
+            <td style="padding: 15px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #55636F;">v1</td>
+          </tr>
+          <tr>
+            <td style="padding: 15px 20px;">
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <a href="#" style="font-size: 14px; font-weight: 600;">Book a demo</a>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">uat.schemora.ai &middot; 10 steps</span>
+              </div>
+            </td>
+            <td style="padding: 15px 16px;"><span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #F5F2EA; border: 1px solid #DED5BF; color: #8A5A0B; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #8A5A0B;"></span>Draft</span></td>
+            <td style="padding: 15px 16px; color: #55636F; font-size: 13px;">4 inputs, 0 secrets</td>
+            <td style="padding: 15px 16px; color: #8A96A1; font-size: 13px;">Never run</td>
+            <td style="padding: 15px 20px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #55636F;">v2</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p style="margin: 14px 0 0; font-size: 13px; color: #8A96A1;">A draft has been recorded but not yet reviewed and published. Publishing re-checks the definition and is required in each environment separately.</p>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

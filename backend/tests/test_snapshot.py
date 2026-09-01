@@ -34,7 +34,9 @@ def test_page_url_and_title_are_extracted(real: Snapshot):
 
 def test_parses_a_real_snapshot(real: Snapshot):
     assert len(real) > 50
-    assert all(node.ref for node in real), "every indexed node must carry a ref"
+    # Refs are optional now, so the assertion is that they were *read*, not
+    # that every node had one. See the next test for why.
+    assert len(real.by_ref) > 50
 
 
 def test_role_and_name_are_separated(real: Snapshot):
@@ -54,14 +56,34 @@ def test_attributes_on_both_sides_of_the_ref_are_captured(real: Snapshot):
     assert "ref" not in node.attrs, "ref is promoted to its own field"
 
 
-def test_nodes_without_a_ref_are_skipped(real: Snapshot):
-    # The fixture contains `- button "copy link"` with no ref -- nothing that
-    # can be acted on, so it must not appear.
-    assert all(n.name != "copy link" for n in real)
+def test_a_node_without_a_ref_is_still_a_node(real: Snapshot):
+    """Refs are optional, and that is what lets one parser serve two sources.
+
+    Playwright MCP stamps `[ref=eN]` on every node. Playwright's own
+    `locator.aria_snapshot()` emits the same YAML *without* refs, and the
+    engine reads that. Requiring a ref made every node of a real aria snapshot
+    invisible: the tree parsed cleanly and produced nothing, which is the most
+    expensive kind of wrong.
+
+    The fixture contains `- button "copy link"` with no ref, which is now
+    found by role and name like anything else.
+    """
+    node = real.locate("button", "copy link")
+    assert node is not None
+    assert node.ref == ""
+
+
+def test_refless_nodes_stay_out_of_the_ref_index(real: Snapshot):
+    """Otherwise they all collect under the empty string and `get("")`
+    returns an arbitrary element."""
+    assert all(ref for ref in real.by_ref)
+    assert real.get("") is None
 
 
 def test_property_lines_are_not_mistaken_for_nodes(real: Snapshot):
-    assert all(n.role not in {"text", "url"} for n in real)
+    """`- /url: ...` describes no element. It fails the role pattern, so it is
+    skipped on its own merits rather than because it lacks a ref."""
+    assert all(n.role != "url" for n in real)
 
 
 def test_trailing_text_content_is_captured(real: Snapshot):

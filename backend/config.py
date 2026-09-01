@@ -64,7 +64,6 @@ class Settings(BaseSettings):
     #: only offered through cross-region inference profiles, so the ID carries
     #: a region prefix ("us." / "eu." / "apac." / "global."). Naming the bare
     #: foundation model fails with "on-demand throughput isn't supported".
-    llm_model: str = "us.anthropic.claude-sonnet-5"
 
     #: The REPAIR model: self-healing mid-run, and repairing a failed use case
     #: afterwards. Both are one-shot judgement calls on a page the model has
@@ -77,7 +76,6 @@ class Settings(BaseSettings):
     #: case. Blank means "use the driver model". Split out because it is one
     #: call per use case rather than per step, so it can be pointed at a
     #: stronger model without materially changing cost.
-    llm_distill_model: str = ""
 
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
@@ -90,39 +88,11 @@ class Settings(BaseSettings):
     aws_profile: str | None = None
 
     # --- MCP ---------------------------------------------------------------
-    mcp_transport: Literal["stdio", "http"] = "stdio"
-    mcp_npx_package: str = "@playwright/mcp@latest"
-    mcp_browser: str = "chromium"
-    mcp_headless: bool = True
-    mcp_isolated: bool = True
-    mcp_storage_state: str | None = None
-    mcp_extra_args: str = ""
-    mcp_server_url: str = "http://localhost:8931/sse"
-    mcp_handshake_timeout: float = 45.0
-    mcp_tool_timeout: float = 60.0
 
     # --- Agent guardrails --------------------------------------------------
-    agent_max_steps: int = 30
-    agent_timeout_seconds: float = 300.0
-    #: NoDecode is required: without it pydantic-settings tries json.loads() on
-    #: the raw .env string before any validator runs, so a comma-separated
-    #: value raises SettingsError at import time. NoDecode hands the raw
-    #: string to the _csv validator below instead.
-    agent_allowed_domains: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["example.com", "*.example.com"]
-    )
-    agent_require_approval: bool = True
-    agent_approval_timeout_seconds: float = 300.0
-    agent_screenshot_every_step: bool = True
-    #: Whether the recording agent is offered the raw-JavaScript tools. Off by
-    #: default: see BrowserAgent._offered_tools for what a script step costs a
-    #: recording, and .env.example for the operator-facing version.
-    agent_allow_script_tool: bool = False
     # Tool results are fed back to the model verbatim; cap them so one enormous
     # accessibility snapshot cannot blow the context window.
-    agent_max_tool_result_chars: int = 20_000
     # Oldest tool results are trimmed once history exceeds this many messages.
-    agent_max_history_messages: int = 60
 
     # --- Credentials -------------------------------------------------------
     #: Fernet key encrypting stored credentials. Generate one with:
@@ -144,6 +114,25 @@ class Settings(BaseSettings):
     #: Per-step wall clock ceiling inside a replay.
     replay_step_timeout: float = 30.0
 
+    #: Values this deployment answers ``{{env.x}}`` with, as JSON:
+    #: ``USECASE_ENV={"base_url": "https://uat.example.com"}``.
+    #:
+    #: This is the seam a use case is promoted through. A recording made
+    #: against dev holds dev's URLs, and the same document has to run against
+    #: UAT and production without being edited -- so the parts that differ per
+    #: environment are named in the document and answered by the deployment.
+    #: An input cannot do this job: inputs are per row, and filling a base URL
+    #: from a spreadsheet column is how a UAT dataset ends up pointed at
+    #: production.
+    usecase_env: dict[str, str] = {}
+
+    #: What to call this deployment in the interface -- "Dev", "UAT",
+    #: "Production". Shown beside the product name, because a use case runs
+    #: against whatever `usecase_env` names and nobody should have to guess
+    #: which one they are about to start a batch against. Blank hides it,
+    #: which is right for a single-environment install.
+    environment: str = ""
+
     #: How much of an executed use case to photograph.
     #:
     #:   off        nothing at all
@@ -163,6 +152,65 @@ class Settings(BaseSettings):
     #: defence against a site redesign and also the easiest way to turn a free
     #: batch back into an expensive one. Only steps whose `on_failure` is
     #: "heal" are ever offered a repair, and the caps below bound a whole batch.
+    # --- Healing memory ----------------------------------------------------
+    #: Whether a confirmed fix is remembered and recalled. Off makes healing
+    #: behave exactly as it did before there was a memory, which is the point
+    #: of the flag: the memory is an optimisation, not a dependency.
+    healing_memory_enabled: bool = True
+    #: How a page is turned into a vector. "bedrock" is Titan; "hash" is the
+    #: deterministic stand-in, for a deployment with no Bedrock access and for
+    #: the tests -- similar text still scores closer than unrelated text, which
+    #: is the only property retrieval depends on.
+    embedding_backend: Literal["bedrock", "hash"] = "bedrock"
+    embedding_model: str = "amazon.titan-embed-text-v2:0"
+
+    # --- Browser -----------------------------------------------------------
+    #: The browser a replay drives. Playwright is called directly now, so this
+    #: is the engine name it knows: chromium, firefox or webkit.
+    browser_engine: Literal["chromium", "firefox", "webkit"] = "chromium"
+    #: Headless is the default because a batch runs unattended. A single-row
+    #: execution can ask for a window per request -- watching it work is the
+    #: fastest way to understand why a step fails.
+    browser_headless: bool = True
+    #: Write a Playwright trace per execution and keep it as an artifact. It
+    #: opens in Playwright's own viewer with a DOM snapshot per action, which
+    #: for a batch that failed on row 412 is the difference between a
+    #: screenshot and being able to look around the page. Off by default: a
+    #: trace is a few megabytes per run.
+    browser_trace: bool = False
+
+    # --- Recorder ----------------------------------------------------------
+    #: Whether this deployment can record. A codegen window needs a display, so
+    #: this is a local-development capability; an EKS pod runs replay workers
+    #: and answers 501 here rather than failing at spawn time with an X11 error.
+    recorder_enabled: bool = True
+    #: How codegen is invoked. Blank -- the default -- runs the Playwright
+    #: installed alongside this application, which is what keeps the recorder
+    #: and the replay engine on one version. Set it only to point at a
+    #: different install deliberately.
+    recorder_command: str = ""
+    recorder_browser: str = "chromium"
+    #: How long a window may stay open before it is closed for you. Generous:
+    #: a person working through a real form is slow, and losing their recording
+    #: to a timeout costs more than a stray browser process does.
+    recorder_timeout_seconds: float = 1800.0
+
+    # --- Job worker --------------------------------------------------------
+    #: Whether this process claims queued batches as well as serving HTTP. True
+    #: is what makes a single-machine install work with nothing else started.
+    #: An API pod that should only serve requests sets this false and leaves the
+    #: work to a worker Deployment.
+    worker_enabled: bool = True
+    #: How long the worker waits before asking for work again when the queue is
+    #: empty. Polling rather than LISTEN/NOTIFY because a notification can be
+    #: missed while the worker is busy, so a correct implementation polls as a
+    #: backstop anyway.
+    worker_poll_seconds: float = 2.0
+    #: Batches running at once **per workspace**. One is the old single-slot
+    #: behaviour, now a limit each tenant gets on its own rather than a global
+    #: lock, so one workspace cannot starve another.
+    worker_workspace_concurrency: int = 1
+
     replay_healing_enabled: bool = False
     replay_heal_max_attempts: int = 3
     replay_heal_max_tokens: int = 20_000
@@ -187,14 +235,9 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 5
     db_pool_timeout: float = 30.0
-    #: LangGraph's checkpointer, which is what lets a run in flight survive a
     #: restart. Off in tests, where an in-memory saver is correct and a second
     #: connection is waste. See checkpoints.py for why the backend differs by
     #: platform.
-    checkpoint_enabled: bool = True
-    checkpoint_path: str = "./data/checkpoints.sqlite"
-    #: Recycle below any proxy/firewall idle timeout, which is what turns a
-    #: pooled connection into a mystery 500 hours after it was opened.
     db_pool_recycle: int = 1800
     db_echo: bool = False
 
@@ -246,18 +289,18 @@ class Settings(BaseSettings):
     #: instance without needing a cron job to tidy up.
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 10
-    #: Same NoDecode reasoning as agent_allowed_domains above.
+    #: Comma-separated in the environment; see NoDecode above.
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["http://localhost:5173"]
     )
 
-    @field_validator("agent_allowed_domains", "cors_origins", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _csv(cls, value):  # noqa: ANN001 - pydantic hook
         return _split_csv(value)
 
     @field_validator(
-        "mcp_storage_state", "aws_region", "aws_profile", mode="before"
+        "aws_region", "aws_profile", mode="before"
     )
     @classmethod
     def _blank_to_none(cls, value):  # noqa: ANN001 - pydantic hook
@@ -277,24 +320,6 @@ class Settings(BaseSettings):
         if not path.is_absolute():
             path = REPO_ROOT / path
         return path
-
-    @property
-    def extra_mcp_args(self) -> list[str]:
-        return self.mcp_extra_args.split() if self.mcp_extra_args else []
-
-    @property
-    def distill_model(self) -> str:
-        """Model for the one distillation call. Falls back to the driver."""
-        return self.llm_distill_model.strip() or self.llm_model
-
-    @property
-    def models_in_use(self) -> dict[str, str]:
-        """Which model does what. Surfaced by /healthz and /api/config."""
-        return {
-            "driver": self.llm_model,
-            "distiller": self.distill_model,
-            "repair": self.llm_repair_model,
-        }
 
     def resolve_npx(self) -> str:
         """Absolute path to npx.

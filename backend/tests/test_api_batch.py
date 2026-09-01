@@ -1,8 +1,9 @@
 """Batch execution over HTTP: upload rows, watch progress, export results.
 
 Runs the real endpoints against a faked browser session, so the recovery
-contract and the single-slot lock are exercised the way the dashboard will hit
-them.
+contract and the queue hand-off are exercised the way the dashboard will hit
+them. The worker runs inside the app under test, which is also the default
+single-machine deployment -- so these cover the path an operator actually gets.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from credentials import generate_key
-from test_api import _fake_probe  # noqa: F401
 from test_api_execute import USE_CASE, ExplodingLLM, FakeReplaySession
 
 CSV = (
@@ -38,7 +38,7 @@ def client(db_settings, db_engine, tmp_path, monkeypatch):
         replay_row_delay_seconds=0.0,
     )
     with TestClient(app) as test_client:
-        test_client.app.state.manager._llm = ExplodingLLM()  # noqa: SLF001 - test seam
+        test_client.app.state.repair_model._client = ExplodingLLM()  # noqa: SLF001 - test seam
         yield authenticate(test_client)
 
 
@@ -183,17 +183,103 @@ async def test_a_draft_use_case_cannot_be_batched(client: TestClient):
 
 async def test_missing_credential_slots_are_refused(client: TestClient):
     usecase_id = await seed(client)
-    response = client.post(
-        f"/api/usecases/{usecase_id}/batch", json={"csv": CSV, "secrets": {"username": "u"}}
-    )
+    response = client.post(f"/api/usecases/{usecase_id}/batch", json={"csv": CSV})
     assert response.status_code == 422
     assert "password" in response.json()["detail"]
+
+
+async def test_a_batch_will_not_take_inline_secrets(client: TestClient):
+    """A batch is claimed by a worker that may be another process.
+
+    Inline values would have to be written into the job payload to survive that
+    hop, which puts a password in a table a batch listing reads. Saving the
+    login as a credential is the supported route, and refusing here is what
+    stops the unsupported one working by accident.
+    """
+    usecase_id = await seed(client)
+    response = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": CSV, "secrets": {"username": "u", "password": "p"}},
+    )
+    assert response.status_code == 422
+    assert "credential_id" in response.json()["detail"]
+
+
+# --- the queue hand-off ----------------------------------------------------
+
+
+async def test_a_batch_carries_its_rows_and_its_job(client: TestClient):
+    """The batch row, its rows and its job are written together.
+
+    Rows used to live only in the memory of the process that accepted the
+    upload, which is why nothing could run them but that process. Storing them
+    is what lets a worker elsewhere claim the work -- and what lets a resume
+    re-run rows that were never attempted.
+    """
+    from conftest import app_workspace
+
+    usecase_id = await seed(client)
+    started = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": CSV, "credential_id": credential(client)},
+    ).json()
+    batch_id = started["batch_id"]
+
+    data = await app_workspace(client.app)
+    rows = await data.get_batch_rows(batch_id)
+    assert [row["record_url"] for row in rows] == [
+        "https://example.com/record/1",
+        "https://example.com/record/2",
+        "https://example.com/record/3",
+    ]
+
+    batch = await data.get_batch(batch_id)
+    assert batch["job_id"], "a queued batch must name the job that will run it"
+
+    await wait_for_batch(client, batch_id)
+
+
+async def test_a_stored_row_never_holds_a_secret(client: TestClient):
+    """Only the credential id makes the trip.
+
+    The worker opens the credential itself. Putting the values in the batch
+    would write a password into a table that a batch listing reads, which is
+    the thing the vault exists to prevent.
+    """
+    from conftest import app_workspace
+
+    password = "distinctive-Example-Pw!"
+    credential_id = client.post(
+        "/api/credentials",
+        json={"name": "Distinctive", "values": {"username": "u", "password": password}},
+    ).json()["id"]
+
+    usecase_id = await seed(client)
+    started = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": CSV, "credential_id": credential_id},
+    ).json()
+
+    data = await app_workspace(client.app)
+    stored = repr(await data.get_batch_rows(started["batch_id"]))
+    assert password not in stored
+    assert repr(await data.get_batch(started["batch_id"])).count(password) == 0
+
+    await wait_for_batch(client, started["batch_id"])
 
 
 # --- one at a time ---------------------------------------------------------
 
 
-async def test_a_second_batch_is_refused_while_one_is_running(client: TestClient):
+async def test_a_second_batch_is_queued_rather_than_refused(client: TestClient):
+    """The single slot is gone; the queue holds the second one instead.
+
+    This used to be a 409 telling the caller to try again later, which made
+    "one at a time" the caller's problem. Per-workspace concurrency in the
+    queue gives the same one-at-a-time guarantee for one tenant, without asking
+    anyone to poll for a free slot -- and without one workspace's batch
+    stopping another workspace running anything at all.
+    """
     usecase_id = await seed(client)
     credential_id = credential(client)
     first = client.post(
@@ -204,10 +290,11 @@ async def test_a_second_batch_is_refused_while_one_is_running(client: TestClient
     second = client.post(
         f"/api/usecases/{usecase_id}/batch", json={"csv": CSV, "credential_id": credential_id}
     )
+    assert second.status_code == 202
+    assert second.json()["batch_id"] != first.json()["batch_id"]
 
-    if second.status_code == 409:
-        assert "already running" in second.json()["detail"]
-    await wait_for_batch(client, first.json()["batch_id"])
+    for batch_id in (first.json()["batch_id"], second.json()["batch_id"]):
+        await wait_for_batch(client, batch_id)
 
 
 async def test_the_active_slot_reports_the_batch(client: TestClient):
@@ -278,8 +365,28 @@ async def test_an_unknown_batch_is_a_404(client: TestClient):
     assert client.get("/api/batches/nope/results.csv").status_code == 404
 
 
-async def test_cancelling_a_batch_that_is_not_running_is_refused(client: TestClient):
-    assert client.post("/api/batches/nope/cancel").status_code == 409
+async def test_cancelling_a_batch_that_does_not_exist_is_a_404(client: TestClient):
+    """Ownership is established before liveness now.
+
+    Cancelling used to mean taking the in-process slot, so "no such batch" and
+    "that batch is idle" were the same answer. A queued batch lives in a table
+    a tenant either can or cannot see, so the scoped lookup is both the 404 and
+    the tenancy check, and it comes first.
+    """
+    assert client.post("/api/batches/nope/cancel").status_code == 404
+
+
+async def test_cancelling_a_finished_batch_is_refused(client: TestClient):
+    usecase_id = await seed(client)
+    started = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": CSV, "credential_id": credential(client)},
+    ).json()
+    await wait_for_batch(client, started["batch_id"])
+
+    response = client.post(f"/api/batches/{started['batch_id']}/cancel")
+    assert response.status_code == 409
+    assert "not running" in response.json()["detail"]
 
 
 async def test_batches_are_listed_for_a_use_case(client: TestClient):

@@ -24,79 +24,10 @@ os.environ.setdefault("DB_SCHEMA", os.environ.get("TEST_DB_SCHEMA", "browser_tes
 # The backend is a flat module tree, not an installed package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent import AgentSpec, RunOptions  # noqa: E402
 from config import Settings  # noqa: E402
 from events import AgentEvent  # noqa: E402
 from llm import LLMTurn, ToolCallRequest  # noqa: E402
-from mcp_client import MCPConfig, ToolOutcome  # noqa: E402
 from store import Store  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Fake MCP session
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FakeTool:
-    name: str
-    description: str = "a fake browser tool"
-    schema: dict[str, Any] = field(
-        default_factory=lambda: {"type": "object", "properties": {}}
-    )
-    #: Called with the tool arguments; returns a ToolOutcome or raises.
-    handler: Callable[[dict[str, Any]], ToolOutcome] | None = None
-
-
-class FakeMCPSession:
-    """Implements the slice of :class:`mcp_client.MCPBrowserSession` the agent uses."""
-
-    def __init__(self, tools: list[FakeTool] | None = None) -> None:
-        self.config = MCPConfig(tool_timeout=5.0)
-        self._tools = tools or [
-            FakeTool("browser_navigate"),
-            FakeTool("browser_snapshot"),
-            FakeTool("browser_click"),
-            FakeTool("browser_type"),
-            FakeTool("browser_take_screenshot"),
-        ]
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-
-    # -- discovery ------------------------------------------------------
-    @property
-    def tool_names(self) -> list[str]:
-        return [tool.name for tool in self._tools]
-
-    def anthropic_tools(self) -> list[dict[str, Any]]:
-        return [
-            {"name": t.name, "description": t.description, "input_schema": t.schema}
-            for t in self._tools
-        ]
-
-    def find_tool(self, *candidates: str, contains: tuple[str, ...] = ()) -> str | None:
-        names = self.tool_names
-        for candidate in candidates:
-            if candidate in names:
-                return candidate
-        for fragment in contains:
-            for name in names:
-                if fragment in name.lower():
-                    return name
-        return None
-
-    # -- invocation -----------------------------------------------------
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None = None, *, timeout: float | None = None
-    ) -> ToolOutcome:
-        self.calls.append((name, dict(arguments or {})))
-        tool = next((t for t in self._tools if t.name == name), None)
-        if tool is None:
-            return ToolOutcome(name=name, text=f"unknown tool {name}", is_error=True)
-        if tool.handler is not None:
-            return tool.handler(dict(arguments or {}))
-        if "screenshot" in name:
-            return ToolOutcome(name=name, images=[("image/png", b"\x89PNG-fake")], duration_ms=3)
-        return ToolOutcome(name=name, text=f"- Page URL: https://example.com\n- ok: {name}", duration_ms=5)
 
 
 # ---------------------------------------------------------------------------
@@ -234,30 +165,8 @@ class NeverApprovalGate:
 
 
 @pytest.fixture
-def options() -> RunOptions:
-    return RunOptions(
-        max_steps=6,
-        timeout_seconds=30.0,
-        allowed_domains=["example.com", "*.example.com"],
-        require_approval=True,
-        approval_timeout_seconds=2.0,
-        screenshot_every_step=False,
-    )
-
-
-@pytest.fixture
-def spec(options: RunOptions) -> AgentSpec:
-    return AgentSpec(run_id="run-test", task="Find the pricing page", options=options)
-
-
-@pytest.fixture
 def sink() -> RecordingSink:
     return RecordingSink()
-
-
-@pytest.fixture
-def mcp() -> FakeMCPSession:
-    return FakeMCPSession()
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +232,7 @@ async def db_engine(db_settings: Settings):
 
 @pytest.fixture(autouse=True)
 def _fast_replay_clocks(monkeypatch):
-    """Shrink replay's settle-waits for every test.
+    """Shrink the engine's ladder retries for every test.
 
     Resolution waits for the page to render, which is correct against a real
     browser and pure dead time against a fake that will never change its
@@ -331,10 +240,10 @@ def _fast_replay_clocks(monkeypatch):
     scoping this to one of them made a deliberate miss elsewhere wait the full
     production timeout, and the suite went from four minutes to ten.
     """
-    import replay as replay_module
+    import engine as engine_module
 
-    monkeypatch.setattr(replay_module, "POLL_INTERVAL", 0.05)
-    monkeypatch.setattr(replay_module, "ROLE_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(engine_module, "POLL_INTERVAL", 0.05)
+    monkeypatch.setattr(engine_module.UseCaseExecutor, "DEFAULT_STEP_TIMEOUT", 0.2)
 
 
 @pytest.fixture(autouse=True)
@@ -431,9 +340,6 @@ def api_settings(db_settings: Settings, tmp_path: Path, **overrides) -> Settings
         db_user=db_settings.db_user,
         db_password=db_settings.db_password,
         artifacts_dir=str(tmp_path / "artifacts"),
-        agent_allowed_domains=["example.com"],
-        agent_screenshot_every_step=False,
-        agent_max_steps=6,
         bootstrap_admin_email=TEST_ADMIN_EMAIL,
         bootstrap_admin_password=TEST_ADMIN_PASSWORD,
         # bcrypt's cost is the point in production and pure waste in a suite
@@ -540,12 +446,11 @@ def build_app(db_settings, tmp_path, monkeypatch, *, session_cls=None, **overrid
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
 
-    async def _fake_probe(config, timeout: float = 20.0):
-        return {"ok": True, "transport": "stdio", "tool_count": 5, "tools": ["browser_snapshot"]}
-
-    monkeypatch.setattr("routers.health.probe", _fake_probe)
-    monkeypatch.setattr(main, "probe", _fake_probe)
     if session_cls is not None:
-        monkeypatch.setattr(runner_module, "MCPBrowserSession", session_cls)
+        # The seam a test substitutes a browser through. It is the *engine's*
+        # session type now rather than the MCP one, but it is still one name
+        # patched in one place, which is why the swap did not ripple through
+        # every API test module.
+        monkeypatch.setattr(runner_module, "PlaywrightSession", session_cls)
 
     return main.create_app(api_settings(db_settings, tmp_path, **overrides))

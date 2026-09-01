@@ -367,14 +367,24 @@ def test_a_repair_that_breaks_the_schema_is_rejected():
 # --- when there is no page to look at --------------------------------------
 
 
-async def test_no_captured_page_refuses_before_spending_a_token():
-    """Every fix would be a guess, so do not pay for a refusal."""
+async def test_a_run_that_never_reached_a_step_says_so_rather_than_advising_a_retry():
+    """Two different refusals, because they need two different things done.
+
+    No events at all means the run died before any step was attempted -- the
+    browser would not start, or setup never finished. There was no page to
+    record, and telling the person to run it again just sends them round the
+    same loop; the useful thing is the error that actually stopped it.
+    """
     llm = ProposingLLM({"diagnosis": "d", "fixes": []})
     context = gather_context(use_case(), execution(), [])
 
-    with pytest.raises(RepairError, match="not recorded"):
+    with pytest.raises(RepairError) as caught:
         await UseCaseDoctor(llm).diagnose(context)
-    assert llm.calls == 0
+
+    message = str(caught.value)
+    assert "before any step" in message
+    assert "run it once more" not in message
+    assert llm.calls == 0, "every fix would be a guess, so do not pay for a refusal"
 
 
 async def test_a_snapshot_that_was_only_a_link_counts_as_no_page():

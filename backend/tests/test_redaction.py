@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from events import ErrorEvent, RunStarted, Thinking, ToolCall, ToolResult, dump_event
-from redaction import MIN_SECRET_LENGTH, NULL_REDACTOR, PLACEHOLDER, Redactor, secrets_from_mapping
+from redaction import MIN_SECRET_LENGTH, NULL_REDACTOR, PLACEHOLDER, Redactor
 
 PASSWORD = "s3cret-Example-Pw!"
 
@@ -167,17 +167,3 @@ def test_an_event_with_no_secrets_in_it_round_trips_unchanged(redactor: Redactor
 def test_a_redactor_with_no_secrets_returns_the_identical_object():
     event = ToolCall(run_id="r", seq=8, step=1, call_id="c1", name="browser_snapshot")
     assert Redactor().event(event) is event
-
-
-# --- helpers ---------------------------------------------------------------
-
-
-def test_secrets_from_mapping_takes_the_values():
-    assert sorted(secrets_from_mapping({"username": "nitin", "password": PASSWORD})) == sorted(
-        ["nitin", PASSWORD]
-    )
-
-
-def test_secrets_from_mapping_tolerates_none_and_non_strings():
-    assert secrets_from_mapping(None) == []
-    assert secrets_from_mapping({"a": None, "b": 5, "c": "keep"}) == ["keep"]

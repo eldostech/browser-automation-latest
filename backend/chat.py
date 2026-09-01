@@ -55,7 +55,7 @@ def chat_model(settings: Any, model: str | None = None, **overrides: Any):
     from langchain_aws import ChatBedrockConverse
 
     kwargs: dict[str, Any] = {
-        "model": model or settings.llm_model,
+        "model": model or settings.llm_repair_model,
         "max_tokens": settings.llm_max_tokens,
         "temperature": settings.llm_temperature,
         **overrides,

@@ -43,7 +43,7 @@ export function SignIn({ onSignedIn }: Props) {
   return (
     <div className="signin">
       <form className="signin-card" onSubmit={submit}>
-        <h1>Browser Agent</h1>
+        <h1>Understudy</h1>
         <p className="signin-sub">Sign in to record and run browser tasks.</p>
 
         <label htmlFor="signin-email">Email</label>

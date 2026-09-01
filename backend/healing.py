@@ -33,6 +33,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from memory import HealingMemory, as_prompt
 from prompt_loader import HEAL, HEAL_REQUEST, load, render
 from snapshot import Node, Snapshot
 from usecase import Locator, Step
@@ -68,6 +69,14 @@ CHOOSE_TOOL: dict[str, Any] = {
             },
             "confidence": {"enum": ["high", "medium", "low"]},
             "reason": {"type": "string", "description": "One sentence."},
+            "explanation": {
+                "type": "string",
+                "description": (
+                    "What changed on the page, in plain words, for somebody who "
+                    "was not watching and may not know the site. This is stored "
+                    "and shown the next time it breaks."
+                ),
+            },
         },
     },
 }
@@ -109,6 +118,15 @@ class Repair:
     reason: str = ""
     confidence: str = "medium"
     tokens: int = 0
+    #: Plain words for somebody who was not watching. Shown in the UI, stored
+    #: in healing memory, and put in front of the model next time.
+    explanation: str = ""
+    #: What it used to look for, kept so the memory can record the change
+    #: rather than just the destination.
+    old_locator: Locator | None = None
+    #: Whether this was recalled rather than worked out. A recalled fix costs
+    #: nothing and is worth counting separately from one that did.
+    recalled: bool = False
 
 
 @dataclass(slots=True)
@@ -123,6 +141,12 @@ class StepHealer:
     budget: HealingBudget = field(default_factory=HealingBudget)
     #: Every repair accepted this session, for the version bump afterwards.
     repairs: list[Repair] = field(default_factory=list)
+    #: What this workspace has learned. Left None, healing works exactly as it
+    #: did before there was a memory -- which is what makes the memory an
+    #: optimisation rather than a dependency.
+    memory: "HealingMemory | None" = None
+    #: Stamped onto anything remembered, so a fix can be traced to its recipe.
+    usecase_id: str | None = None
 
     @property
     def tokens_used(self) -> int:
@@ -169,6 +193,18 @@ class StepHealer:
         )
         wanted = step.locators[0].describe() if step.locators else "(no locator recorded)"
 
+        # What was done about this before, on this site. Evidence for the
+        # model, never an instruction: whatever it picks still has to be one of
+        # the candidates above.
+        past = []
+        if self.memory is not None:
+            past = await self.memory.recall(
+                step_summary=step.summary(),
+                wanted=wanted,
+                page_url=snapshot.page_url or "",
+                page=listing,
+            )
+
         try:
             turn = await self.llm.run_turn(
                 system=load(HEAL),
@@ -182,6 +218,7 @@ class StepHealer:
                             wanted=wanted,
                             page_url=snapshot.page_url or "(unknown)",
                             candidates=listing,
+                            past_fixes=as_prompt(past),
                         ),
                     }
                 ],
@@ -210,9 +247,28 @@ class StepHealer:
             locator=Locator(strategy="role", role=node.role, name=node.name or None),
             reason=str(call.input.get("reason") or ""),
             confidence=str(call.input.get("confidence") or "medium"),
+            explanation=str(call.input.get("explanation") or call.input.get("reason") or ""),
+            old_locator=step.locators[0] if step.locators else None,
             tokens=tokens,
         )
         self.repairs.append(repair)
+
+        # Remembered only when the model was sure. A low-confidence guess is
+        # exactly the answer not to give next time, and writing every attempt
+        # down would fill the table with the ones that were wrong.
+        if self.memory is not None and repair.confidence == "high":
+            await self.memory.remember(
+                usecase_id=self.usecase_id,
+                step_id=step.id,
+                page_url=snapshot.page_url or "",
+                page=listing,
+                step_summary=step.summary(),
+                wanted=wanted,
+                old_locator=repair.old_locator.model_dump() if repair.old_locator else None,
+                new_locator=repair.locator.model_dump(),
+                explanation=repair.explanation,
+                confirmed_by="model",
+            )
         log.info(
             "healed a step",
             extra={

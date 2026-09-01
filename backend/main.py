@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,16 +20,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from auth.service import AuthService
 from bus import build_bus
-from checkpoints import Checkpointer
 from config import Settings, get_settings
 from credentials import Vault
-from jobs import JobQueue
+from llm import RepairModel
+from jobs import JobQueue, Worker
 from logging_setup import configure_logging
-from mcp_client import MCPConfig, probe
+from recorder import Recorder
 from routers import ALL_ROUTERS
-from stash import SecretStash
 from storage import build_storage
-from runner import ReplayManager, RunManager
+from runner import ReplayManager
 from store import Store
 
 log = logging.getLogger(__name__)
@@ -63,9 +62,8 @@ async def lifespan(app: FastAPI):
     log.info(
         "starting backend",
         extra={
-            "models": settings.models_in_use,
-            "mcp_transport": settings.mcp_transport,
-            "allowed_domains": settings.agent_allowed_domains,
+            "browser": settings.browser_engine,
+            "headless": settings.browser_headless,
             "db_schema": settings.db_schema,
         },
     )
@@ -77,10 +75,6 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.auth = AuthService(store.sessions, settings)
     app.state.queue = JobQueue(store.sessions)
-    # Credentials a recording used, held only until the user decides whether
-    # to keep them. In memory, with a TTL, and never written down -- see
-    # stash.py for what that costs and why it is the right trade.
-    app.state.stash = SecretStash()
     app.state.storage = build_storage(settings)
     log.info(
         "artifact storage ready",
@@ -107,6 +101,12 @@ async def lifespan(app: FastAPI):
     reaped = await store.reap_orphaned_runs()
     if reaped:
         log.warning("marked interrupted runs as failed", extra={"count": reaped})
+    # Expired sessions are already refused by ``resolve``; this only stops the
+    # table growing without bound. Startup is the whole schedule -- a process
+    # that never restarts is a problem this sweep would not fix anyway.
+    expired = await app.state.auth.purge_expired_sessions()
+    if expired:
+        log.info("purged expired sessions", extra={"count": expired})
     reclaimed = await app.state.queue.reclaim_expired()
     if reclaimed:
         log.warning("requeued jobs from a stopped worker", extra={"count": reclaimed})
@@ -117,57 +117,87 @@ async def lifespan(app: FastAPI):
     )
     await app.state.bus.start()
 
-    # Opened before the manager, which hands the saver to every graph it
-    # compiles. Held for the life of the process.
-    checkpointer = Checkpointer(settings)
-    await checkpointer.__aenter__()
-    app.state.checkpointer = checkpointer
-    log.info("agent checkpointing", extra={"backend": checkpointer.backend})
-
-    app.state.manager = RunManager(
-        store, settings, bus=app.state.bus, checkpointer=checkpointer.saver
-    )
     app.state.vault = Vault(settings.credentials_key or None)
+    # One model, built on first use. It looks at a page when a step breaks, and
+    # that is the only thing left in this application that costs tokens per
+    # run. The driver and the distiller went with the agent.
+    app.state.repair_model = RepairModel(settings)
+
     # The healer is the only route from a replay to a model, and it is handed
     # over lazily and only when healing is switched on.
     app.state.replays = ReplayManager(
-        store, settings, bus=app.state.bus, llm_factory=lambda: app.state.manager.repair_llm
+        store,
+        settings,
+        bus=app.state.bus,
+        llm_factory=app.state.repair_model,
+        queue=app.state.queue,
+        vault=app.state.vault,
     )
+
+    # The worker that actually runs queued batches. In this process by default,
+    # which is what makes a single-machine install work with nothing else
+    # started; set WORKER_ENABLED=false on an API pod that should only serve
+    # HTTP and leave the batches to a worker Deployment.
+    app.state.worker = None
+    if settings.worker_enabled:
+        app.state.worker = Worker(
+            app.state.queue,
+            {"batch": app.state.replays.run_batch_job},
+            poll_interval=settings.worker_poll_seconds,
+            workspace_concurrency=settings.worker_workspace_concurrency,
+        )
+        await app.state.worker.start()
+        log.info(
+            "job worker started",
+            extra={
+                "worker_id": app.state.queue.worker_id,
+                "workspace_concurrency": settings.worker_workspace_concurrency,
+            },
+        )
     if not app.state.vault.available:
         log.warning(
             "credential storage is disabled: CREDENTIALS_KEY is not set. "
             "Use cases that need a login cannot be executed until it is."
         )
-    app.state.health = {"checked_at": 0.0, "result": None}
+    # Recording is a person in front of a browser window, so the sessions live
+    # in this process and are closed with it. See recorder.py.
+    app.state.recorder = Recorder(
+        enabled=settings.recorder_enabled,
+        command=settings.recorder_command,
+        browser=settings.recorder_browser,
+        timeout_seconds=settings.recorder_timeout_seconds,
+    )
+    ok, reason = app.state.recorder.available()
+    log.info("recorder", extra={"available": ok, "reason": reason or None})
 
-    # Probe MCP once at startup so the tool list is visible in the logs and
-    # /healthz can answer without spawning a browser on every request.
-    app.state.startup_probe = asyncio.create_task(_startup_probe(app, settings))
+    # Said at startup rather than when the first run fails. On Windows only a
+    # ProactorEventLoop can spawn the Playwright driver, and uvicorn picks the
+    # other one whenever --reload or --workers is set -- so the usual
+    # development command is the one that cannot replay. See browser.py.
+    if sys.platform == "win32" and not isinstance(
+        asyncio.get_running_loop(), asyncio.ProactorEventLoop
+    ):
+        log.warning(
+            "this event loop cannot start a browser, so replaying will fail. "
+            "uvicorn picks it whenever --reload or --workers is set; add "
+            "--loop none to the command.",
+            extra={"loop": type(asyncio.get_running_loop()).__name__},
+        )
 
     try:
         yield
     finally:
-        app.state.startup_probe.cancel()
-        await app.state.manager.shutdown()
+        # Stopped first: a job still in flight releases its lease on the way
+        # out and is picked straight back up, whereas one whose store has
+        # already closed fails for a reason that has nothing to do with it.
+        if app.state.worker is not None:
+            await app.state.worker.stop()
+        # Before the rest: a headed browser that outlives its backend is a
+        # window nobody owns, very possibly signed into something.
+        await app.state.recorder.shutdown()
         await app.state.bus.stop()
-        await checkpointer.__aexit__(None, None, None)
         await store.close()
         log.info("backend stopped")
-
-
-async def _startup_probe(app: FastAPI, settings: Settings) -> None:
-    try:
-        result = await probe(MCPConfig.from_settings(settings), timeout=90.0)
-    except asyncio.CancelledError:
-        return
-    app.state.health = {"checked_at": time.time(), "result": result}
-    if result.get("ok"):
-        log.info(
-            "MCP server reachable",
-            extra={"tool_count": result.get("tool_count"), "tools": result.get("tools")},
-        )
-    else:
-        log.error("MCP server unreachable at startup", extra={"error": result.get("error")})
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -181,11 +211,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
 
     application = FastAPI(
-        title="Browser Agent",
+        title="Understudy",
         version="1.0.0",
         description=(
-            "An LLM agent that drives a real browser through the Playwright MCP "
-            "server, and replays what it learned without further LLM calls."
+            "Record a browser workflow by doing it once, then replay it over a "
+            "spreadsheet without an LLM."
         ),
         lifespan=lifespan,
     )

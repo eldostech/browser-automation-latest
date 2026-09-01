@@ -32,9 +32,17 @@ a **ref**. That gives two lookups, and the whole replay design rests on them:
     Snapshots cost tokens only when they enter an LLM context, so a replay with
     no model in the loop can take one before every step for free.
 
-Only ref-bearing lines are indexed. That is not a limitation but a filter: it
-excludes the property lines (``- /url:``, ``- text:``) and the ``### Page``
-header, none of which describe an element you can act on.
+Refs are optional, and which source produced the tree decides whether they are
+there. Playwright MCP adds ``[ref=eN]`` to every node; Playwright's own
+``locator.aria_snapshot()`` emits the same YAML **without** them. Both are
+parsed, because both are used: MCP during the transition, and ``aria_snapshot``
+by the engine that replaced it.
+
+That is why the ref filter this parser used to apply is gone. Requiring a ref
+made every node of a real ``aria_snapshot`` invisible -- the tree parsed
+cleanly and yielded nothing, which is the most expensive kind of wrong. Lines
+that genuinely describe no element (``- /url: ...``) fail the role pattern and
+are skipped on their own merits.
 """
 
 from __future__ import annotations
@@ -115,14 +123,33 @@ class Snapshot:
     nodes: list[Node] = field(default_factory=list)
     page_url: str | None = None
     page_title: str | None = None
+    #: The text this was parsed from.
+    #:
+    #: Kept because a repair proposed later reads the page *as text* and parses
+    #: it again -- rebuilding it from the nodes loses the shape the parser
+    #: expects, and the repair then has nothing to match against.
+    raw: str = ""
 
     # -- lookups ------------------------------------------------------------
     @property
     def by_ref(self) -> dict[str, Node]:
-        return {node.ref: node for node in self.nodes}
+        """Ref-bearing nodes only.
+
+        Playwright's own ``aria_snapshot()`` emits no refs, so on that input
+        this is empty and every ref-based lookup correctly finds nothing --
+        rather than collecting the whole tree under the empty string.
+        """
+        return {node.ref: node for node in self.nodes if node.ref}
 
     def get(self, ref: str) -> Node | None:
-        """The node a ref points at, or ``None`` if this snapshot has no such ref."""
+        """The node a ref points at, or ``None`` if this snapshot has no such ref.
+
+        An empty ref matches nothing. Nodes parsed from an aria snapshot carry
+        no ref at all, and without this guard ``get("")`` would return the
+        first of them -- an arbitrary element, confidently.
+        """
+        if not ref:
+            return None
         for node in self.nodes:
             if node.ref == ref:
                 return node
@@ -177,6 +204,33 @@ class Snapshot:
             return None
         return pool[nth]
 
+    def by_name(self, name: str, nth: int = 0) -> "Node | None":
+        """The ``nth`` node whose accessible name matches, whatever its role.
+
+        A label, a placeholder and an image's alt text are all the same thing
+        once a page is rendered: they become the control's accessible name. So
+        a recorded ``get_by_label("Password")`` is answered here rather than by
+        guessing which ARIA role the control turned out to have -- guessing
+        wrong means falling through to a weaker rung for no reason.
+
+        Interactive nodes win over structural ones for the same reason
+        :meth:`locate` prefers them: a ``generic`` wrapper carrying the same
+        name as the input inside it must not shadow the input.
+        """
+        wanted = _normalise(name)
+        if not wanted:
+            return None
+
+        exact = [n for n in self.nodes if n.name == name]
+        loose = [n for n in self.nodes if _normalise(n.name) == wanted]
+        partial = [n for n in self.nodes if wanted in _normalise(n.name)]
+        pool = exact or loose or partial
+        interactive = [n for n in pool if n.interactive]
+        pool = interactive or pool
+        if nth < 0 or nth >= len(pool):
+            return None
+        return pool[nth]
+
     def roles(self) -> dict[str, int]:
         """Role histogram. Used in failure messages to say what *was* on the page."""
         counts: dict[str, int] = {}
@@ -199,7 +253,7 @@ def parse(text: str) -> Snapshot:
     to the next locator strategy, which is a far better failure than an
     exception taking down a 1,000-row batch.
     """
-    snapshot = Snapshot()
+    snapshot = Snapshot(raw=text or "")
     if not text:
         return snapshot
 
@@ -225,9 +279,6 @@ def parse(text: str) -> Snapshot:
             for m in _ATTR_RE.finditer(match.group("attrs") or "")
         }
         ref = attrs.pop("ref", "")
-        if not ref:
-            # Property lines and unreferenced decoration. Nothing to act on.
-            continue
 
         indent = match.group("indent") or ""
         snapshot.nodes.append(

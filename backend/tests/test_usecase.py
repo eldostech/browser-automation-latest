@@ -53,13 +53,6 @@ def test_a_locator_requires_the_field_its_strategy_uses():
         Locator(strategy="text")
 
 
-def test_brittle_rungs_are_flagged():
-    assert role().brittle is False
-    assert Locator(strategy="css", selector="#a").brittle is False
-    assert Locator(strategy="text", text="Sign in").brittle is True
-    assert Locator(strategy="nth", nth=2).brittle is True
-
-
 def test_locator_describes_itself_for_the_review_ui():
     assert role().describe() == 'role=textbox name="Username"'
     assert Locator(strategy="css", selector="#name").describe() == "css=#name"
@@ -323,16 +316,6 @@ def test_defaults_are_filled_in():
     assert use_case.with_defaults({"term": "given"}) == {"term": "given"}
 
 
-def test_brittle_steps_are_surfaced_for_review():
-    use_case = simple(
-        row_steps=[
-            Step(id="s1", action="click", locators=[Locator(strategy="text", text="Go")]),
-            Step(id="s2", action="click", locators=[role("Go", "button")]),
-        ]
-    )
-    assert [s.id for s in use_case.brittle_steps()] == ["s1"]
-
-
 def test_a_draft_is_not_runnable_until_published():
     use_case = simple()
     assert use_case.runnable is False
@@ -525,3 +508,26 @@ def test_a_sound_use_case_reports_no_impossible_assertions():
         ],
     )
     assert use_case.impossible_assertions() == []
+
+
+def test_the_env_namespace_answers_from_the_deployment():
+    """What makes one document runnable in dev, UAT and production.
+
+    A recording holds the URLs of the environment it was made against. An input
+    cannot carry the difference -- inputs are per row, and a base URL in a
+    spreadsheet column is how a UAT dataset ends up pointed at production -- so
+    the document names the part that varies and the deployment answers it.
+    """
+    rendered = render_template(
+        "{{env.base_url}}/orders?ref={{input.reference}}",
+        inputs={"reference": "A-1024"},
+        secrets={},
+        env={"base_url": "https://uat.example.com"},
+    )
+    assert rendered == "https://uat.example.com/orders?ref=A-1024"
+
+
+def test_an_unanswered_env_reference_stops_rather_than_rendering_nothing():
+    """Same strictness as an input: a blank URL is not a navigation."""
+    with pytest.raises(MissingValue):
+        render_template("{{env.base_url}}/orders", inputs={}, secrets={}, env={})

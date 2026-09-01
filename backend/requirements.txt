@@ -10,6 +10,9 @@
 # Web framework + server
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
+# Used by serve.py to restart the process on an edit. Comes with uvicorn's
+# [standard] extra, declared here because serve.py imports it by name.
+watchfiles>=0.21,<2
 python-multipart>=0.0.9,<0.1
 
 # Settings / validation
@@ -17,24 +20,32 @@ pydantic>=2.8,<3.0
 pydantic-settings>=2.4,<3.0
 python-dotenv>=1.0,<2.0
 
-# Model Context Protocol client (stdio + SSE + streamable HTTP transports)
-mcp>=1.9,<2.0
+# The browser. A replay drives Playwright directly: the MCP hop was a Node
+# process that then called this library, and it could not offer auto-waiting,
+# locator strictness or traces.
+#
+# Pinned to a minor range because `playwright codegen`'s output is the input
+# the recorder parses, and that output is not a stable contract. A golden-file
+# test per supported action makes an upgrade that changes it fail in CI rather
+# than in somebody's thousand-row batch.
+#
+# `python -m playwright install chromium` downloads the browser itself; `make
+# browsers` does it for you.
+playwright>=1.48,<2.0
 
-# Agent orchestration. LangGraph supplies the loop and, more usefully, the
-# checkpointer that lets a run survive a restart. langchain-aws supplies the
-# Bedrock wiring -- endpoints, auth, model IDs -- which is the part that rots.
-# Bedrock is the only provider, deliberately: a second one is a second code
-# path to keep working.
-langgraph>=1.2,<2.0
+# The model, for the one thing that still costs tokens: looking at a page when
+# a locator breaks. langchain-aws supplies the Bedrock wiring -- endpoints,
+# auth, model IDs -- which is the part that rots; langchain-core is the message
+# types it speaks. Bedrock is the only provider, deliberately: a second one is
+# a second code path to keep working.
+#
+# What used to be here and is not any more: langgraph, its two checkpoint
+# backends, and the MCP client. They served the agent that recorded workflows
+# by driving a browser itself. A workflow is recorded by watching a person do
+# it now, so there is no loop to orchestrate, no run to checkpoint, and no
+# MCP server to talk to.
 langchain-core>=1.6,<2.0
 langchain-aws>=1.7,<2.0
-
-# Checkpoint backends: what lets an interrupted recording resume rather than
-# be marked failed. Both are needed -- Postgres where its driver can run, a
-# SQLite file where it cannot. Imported as `langgraph.checkpoint.*`, so a
-# scan for top-level imports does not reveal them.
-langgraph-checkpoint-postgres>=3.1,<4.0
-langgraph-checkpoint-sqlite>=3.1,<4.0
 
 # botocore, for resolving and reporting AWS credentials in /healthz.
 botocore>=1.34,<2.0
@@ -46,14 +57,38 @@ botocore>=1.34,<2.0
 # for a few megabytes.
 boto3>=1.34,<2.0
 
-# Reading .xlsx batch input. openpyxl rather than pandas: this needs cell
-# values, not a dataframe, and pandas would pull in numpy for nothing.
+# Reading input files. pandas, and openpyxl as its Excel engine.
+#
+# The comment that used to sit here argued *against* pandas -- "this needs cell
+# values, not a dataframe, and pandas would pull in numpy for nothing" -- and
+# that was right for the job it described, which was reading rows and handing
+# them to a browser. It stopped being right when mapping arrived: the mapper
+# needs each column described as well as read (type, blanks, distinct count,
+# example values), plus delimiter sniffing and encoding fallbacks. Writing that
+# by hand is writing pandas badly.
+#
+# What pandas is deliberately NOT allowed to do is coerce types. Files are read
+# with dtype=str and Excel cells converted explicitly, because a reader that
+# helpfully turns 0071 into 71 produces a thousand wrong records and no error.
+# See ingest.py.
+pandas>=2.2,<3.0
 openpyxl>=3.1,<4.0
+
+# Comparing two screenshots of the same step. A downscaled per-pixel diff
+# answers "did this page change, roughly how much" in a few milliseconds;
+# SSIM and friends want numpy and model perceptual similarity, which is a
+# better answer to a question nobody here is asking. See imagediff.py.
+pillow>=10.0,<12.0
 
 # --- Storage ---------------------------------------------------------------
 # Postgres via SQLAlchemy 2.0, with Alembic owning the schema.
 sqlalchemy[asyncio]>=2.0,<3.0
 alembic>=1.13,<2.0
+
+# The vector column healing memory is built on. The extension lives on the
+# PostgreSQL server; this is the SQLAlchemy type that talks to it, and without
+# it the models cannot even be imported.
+pgvector>=0.3,<0.5
 
 # TWO drivers, for two jobs, and the split is not a matter of taste.
 #

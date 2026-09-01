@@ -82,6 +82,8 @@ class DeclaredField:
 
     name: str
     value: str
+    #: Which of the recording's typed values this names; see the payload model.
+    index: int | None = None
     secret: bool = False
     description: str = ""
     #: Free-form hint carried into the use case's input spec, so a later
@@ -96,11 +98,6 @@ class DeclaredField:
                 "underscores, starting with a letter -- it becomes a column header "
                 "and a template name."
             )
-
-    @property
-    def matchable(self) -> bool:
-        """Whether this value is distinctive enough to substitute by search."""
-        return len(self.value) >= MIN_MATCH_LENGTH
 
     @property
     def template(self) -> str:
@@ -120,9 +117,11 @@ class FieldSet:
         seen: set[str] = set()
         declared: list[DeclaredField] = []
         for item in raw or []:
+            position = item.get("index")
             entry = DeclaredField(
                 name=str(item.get("name", "")),
                 value=str(item.get("value", "")),
+                index=None if position is None else int(position),
                 secret=bool(item.get("secret", False)),
                 description=str(item.get("description", "") or ""),
                 example=str(item.get("example", "") or ""),

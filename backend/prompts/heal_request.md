@@ -10,5 +10,9 @@ Controls on the page now:
 
 $candidates
 
+Fixes already made on this site:
+
+$past_fixes
+
 Which index is the element this step should act on? Answer -1 if none of them
 is right.

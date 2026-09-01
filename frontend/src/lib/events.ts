@@ -210,16 +210,28 @@ export interface RunDetail extends RunSummary {
   artifacts: { id: string; kind: string; mime: string; url: string }[];
 }
 
+/** A name, and the address it means in this deployment. */
+export interface Target {
+  id: string;
+  name: string;
+  base_url: string;
+  description: string;
+  updated_at: string;
+  updated_by: string;
+}
+
 export interface ServerConfig {
   defaults: {
-    max_steps: number;
-    timeout_seconds: number;
-    allowed_domains: string[];
-    require_approval: boolean;
-    screenshot_every_step: boolean;
-    headless: boolean;
     browser: string;
+    headless: boolean;
+    trace: boolean;
+    screenshots: string;
+    healing: boolean;
   };
+  /** What to call this deployment: "Dev", "UAT", "Production". Blank on a
+   *  single-environment install, and then the badge is not shown. */
+  environment: string;
+  recorder: { enabled: boolean };
   model: string;
   /** Always "bedrock" — the only provider. */
   provider: string;
@@ -330,21 +342,6 @@ export interface UseCaseSummary {
   updated_at: string;
 }
 
-export interface DistillResult {
-  usecase_id: string;
-  version: number;
-  name: string;
-  /** What the model proposed. Editable before you move on. */
-  suggested_name: string;
-  status: UseCaseStatus;
-  warnings: string[];
-  setup_steps: number;
-  row_steps: number;
-  inputs: string[];
-  secrets: string[];
-  blocked_scripts: string[];
-}
-
 export interface ExecutionRecord {
   id: string;
   batch_id: string | null;
@@ -387,6 +384,157 @@ export interface BatchDetail {
   running: boolean;
   /** Rows never attempted — a stopped batch leaves these, and resume runs them. */
   pending: number;
+}
+
+/**
+ * What one column of an uploaded file holds, as far as the file can say.
+ *
+ * `kind` is inferred and never applied — the values themselves are always the
+ * text that will be typed into the page. It is here so the mapper can refuse
+ * to offer a date column for a number field, and so a person can see at a
+ * glance which column is which.
+ */
+/** One line of a recording that could not be represented as a step. */
+export interface UnsupportedLine {
+  line: number;
+  source: string;
+  reason: string;
+}
+
+export interface RecordedStep {
+  id: string;
+  action: string;
+  url: string | null;
+  value: string | null;
+  /** The first rung of the ladder, rendered for a human. */
+  locator: string;
+}
+
+/**
+ * A recording in progress, or one that has finished.
+ *
+ * `recording` means a browser window is open and the user is working in it.
+ * Everything below `status` is present only once it is `ready`.
+ */
+export interface RecordingDetail {
+  recording_id: string;
+  status: 'recording' | 'parsing' | 'ready' | 'failed' | 'cancelled';
+  name: string;
+  start_url: string;
+  started_at: number;
+  finished_at: number | null;
+  error: string | null;
+  owner_email: string;
+  summary?: string;
+  domains?: string[];
+  steps?: RecordedStep[];
+  /** Values typed during the recording, for the user to name and classify. */
+  typed?: string[];
+  /** The same values, each with the control it went into. `label` is what was
+   *  on screen; it is empty when the control had no accessible name, which is
+   *  common for a custom dropdown. */
+  values?: { value: string; action: string; label: string }[];
+  unsupported?: UnsupportedLine[];
+}
+
+/**
+ * One step of a finished run, read back as a row rather than as an event.
+ *
+ * `pixel_diff` is the fraction of the page that changed since the last run
+ * that worked. `null` means there was nothing to compare against — a first
+ * run, or a step that has never succeeded — which is a different thing from
+ * `0` meaning nothing moved.
+ */
+export interface RunStep {
+  id: string;
+  run_id: string;
+  seq: number;
+  step_id: string;
+  phase: string;
+  action: string;
+  locator: string;
+  /** Which rung of the ladder matched. Above zero means the recording is drifting. */
+  locator_rung: number | null;
+  /** Where the step happened; the domain scopes any fix recorded from it. */
+  page_url: string;
+  status: 'succeeded' | 'failed' | 'skipped' | 'healed';
+  duration_ms: number;
+  error: string | null;
+  row_index: number | null;
+  screenshot_id: string | null;
+  baseline_id: string | null;
+  pixel_diff: number | null;
+  /** The ratio in words, so nobody has to read four decimal places. */
+  diff: string;
+  screenshot_url: string | null;
+  baseline_url: string | null;
+  created_at: string;
+}
+
+/**
+ * A locator that broke, and what fixed it.
+ *
+ * `confirmed_by` is `"model"` when healing worked it out alone, or an email
+ * when a person did. That distinction is not decorative: a fix somebody looked
+ * at is ranked above a closer match nobody checked when these are put in front
+ * of the model.
+ */
+export interface RememberedFix {
+  id: string;
+  usecase_id: string | null;
+  domain: string;
+  step_id: string;
+  error_kind: string;
+  old_locator: { name?: string; selector?: string } | null;
+  new_locator: { name?: string; selector?: string } | null;
+  explanation: string;
+  confirmed_by: string;
+  created_at: string;
+}
+
+export interface ColumnProfile {
+  name: string;
+  kind: 'text' | 'integer' | 'number' | 'date' | 'boolean' | 'empty';
+  /** A recognised value shape, where every populated value has it. */
+  shape: 'email' | 'url' | 'phone' | 'date' | null;
+  non_null: number;
+  nulls: number;
+  distinct: number;
+  examples: string[];
+}
+
+export interface DatasetSummary {
+  id: string;
+  name: string;
+  filename: string;
+  source: string;
+  row_count: number;
+  columns: ColumnProfile[];
+  /** A preview, not the file. A listing returns none of these. */
+  sample: Record<string, string>[];
+  warnings: string[];
+  created_at: string;
+  owner_email: string;
+}
+
+/** One declared input, and what the dataset offers for it. */
+export interface MappingSuggestion {
+  field: string;
+  column: string | null;
+  score: number;
+  /** Above the confidence threshold — offered pre-selected rather than as a guess. */
+  confident: boolean;
+  reason: string;
+  alternatives: { column: string; score: number; reason: string }[];
+}
+
+export interface MappingResult {
+  usecase_id: string;
+  dataset_id: string;
+  suggestions: MappingSuggestion[];
+  /** Fields whose match is absent or too close to call. */
+  unresolved: string[];
+  columns: string[];
 }
 
 export interface CredentialSummary {

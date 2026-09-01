@@ -19,3 +19,7 @@ $steps
 ## Controls on the page when it failed
 
 $candidates
+
+## Fixes already made on this site
+
+$past_fixes

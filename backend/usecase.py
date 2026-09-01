@@ -86,6 +86,52 @@ def has_template(value: Any) -> bool:
     return bool(template_refs(value))
 
 
+
+class TargetMissing(ValueError):
+    """A use case named a target this deployment has no address for."""
+
+
+def resolve_base_url(
+    *,
+    target: str,
+    targets: dict[str, str],
+    recorded: str,
+    override: str = "",
+) -> str:
+    """Which site this run points at, in one place.
+
+    Three sources, most specific first:
+
+    1. **An override given when the run was started.** For a one-off against a
+       branch deployment or a customer's own tenant, where standing
+       configuration would be ceremony for a single run.
+    2. **The target this use case names**, looked up in this deployment's own
+       targets. The ordinary path: the definition says *which* site, the
+       deployment says *where* that site is, and promoting a use case moves no
+       address at all.
+    3. **The URL recorded into the definition.** What makes a single-environment
+       install work with nothing configured: record it, run it.
+
+    A named target with no address here is an error rather than a fallback.
+    Quietly dropping to the recorded URL would send a use case promoted to
+    production at whatever host it happened to be recorded against, which is
+    the exact accident this arrangement exists to prevent -- and it would do it
+    silently, on a run somebody had every reason to trust.
+    """
+    if override:
+        return override.rstrip("/")
+    if target:
+        found = targets.get(target)
+        if not found:
+            known = ", ".join(sorted(targets)) or "(none defined)"
+            raise TargetMissing(
+                f"This use case runs against the target {target!r}, and this "
+                f"deployment has no address for it. Targets defined here: {known}. "
+                f"Add one under Targets, or start the run with an explicit URL."
+            )
+        return found.rstrip("/")
+    return recorded.rstrip("/")
+
 class MissingValue(KeyError):
     """A template referenced an input or secret that was not supplied."""
 
@@ -193,17 +239,42 @@ def render_code(
 # ---------------------------------------------------------------------------
 
 
+#: Strategies that carry a single string in ``text`` rather than a field of
+#: their own. They exist because ``playwright codegen`` emits them, and each
+#: maps to exactly one Playwright call -- which is the point: a recorded rung
+#: should be a thing the browser knows how to find, not a thing this code has
+#: to reinterpret.
+STRING_STRATEGIES = frozenset({"text", "label", "placeholder", "test_id", "alt_text"})
+
+#: Rungs that describe an element by what it *means* rather than by where it
+#: sits or what it is called in the markup. These survive a redesign, so a
+#: ladder is built with them first.
+SEMANTIC_STRATEGIES = frozenset({"role", "label", "placeholder", "alt_text"})
+
+
 class Locator(BaseModel):
     """One rung of the locator ladder.
 
     ``role`` is resolved against a live snapshot at replay time and is the
     durable option; the rest are recorded fallbacks in decreasing order of how
     much site churn they survive.
+
+    ``label``, ``placeholder`` and ``alt_text`` are nearly as durable, because
+    all three *are* the element's accessible name as far as a page is
+    concerned -- which is why they resolve the same way ``role`` does. They
+    exist as separate strategies rather than being folded into ``role``
+    because ``playwright codegen`` emits them, and rewriting a recorded
+    ``get_by_label`` into a role guess would be this code inventing something
+    the recorder did not say.
+
+    ``test_id`` is a contract the site's own authors maintain, so it is stable
+    until they change it -- but it is markup, not meaning, and it is absent
+    from most pages.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    strategy: Literal["role", "css", "text", "nth"]
+    strategy: Literal["role", "label", "placeholder", "test_id", "alt_text", "css", "text", "nth"]
     #: strategy="role"
     role: str | None = None
     name: str | None = None
@@ -211,33 +282,36 @@ class Locator(BaseModel):
     nth: int = 0
     #: strategy="css"
     selector: str | None = None
-    #: strategy="text"
+    #: The string for every strategy in :data:`STRING_STRATEGIES`.
     text: str | None = None
 
     @model_validator(mode="after")
     def _requires_its_own_field(self) -> "Locator":
-        required = {"role": "role", "css": "selector", "text": "text", "nth": None}[self.strategy]
+        if self.strategy in STRING_STRATEGIES:
+            required = "text"
+        else:
+            required = {"role": "role", "css": "selector", "nth": None}[self.strategy]
         if required and not getattr(self, required):
             raise ValueError(f"locator strategy {self.strategy!r} requires {required!r}")
         if self.strategy == "nth" and self.nth < 0:
             raise ValueError("locator strategy 'nth' requires a non-negative nth")
         return self
 
+    @property
+    def semantic(self) -> bool:
+        """Whether this rung describes meaning rather than markup."""
+        return self.strategy in SEMANTIC_STRATEGIES
+
     def describe(self) -> str:
         if self.strategy == "role":
             base = f'role={self.role}' + (f' name="{self.name}"' if self.name else "")
         elif self.strategy == "css":
             base = f"css={self.selector}"
-        elif self.strategy == "text":
-            base = f"text={self.text!r}"
+        elif self.strategy in STRING_STRATEGIES:
+            base = f"{self.strategy}={self.text!r}"
         else:
             base = f"nth={self.nth}"
         return base if self.nth == 0 or self.strategy == "nth" else f"{base} [{self.nth}]"
-
-    @property
-    def brittle(self) -> bool:
-        """True for the rungs that break on cosmetic change; flagged in the UI."""
-        return self.strategy in {"text", "nth"}
 
 
 class Assertion(BaseModel):
@@ -493,6 +567,18 @@ class UseCase(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
     status: Status = "draft"
+    #: The origin this was recorded against -- scheme and host, no path. It is
+    #: what ``{{env.base_url}}`` falls back to when the deployment names no
+    #: value of its own, which is what lets one document run unchanged in dev,
+    #: UAT and production: dev needs no configuration at all, and the other two
+    #: each set ``USECASE_ENV`` once. Empty on anything recorded before this
+    #: existed, whose URLs are still literal and still work.
+    base_url: str = ""
+    #: The name of the target supplying this use case's base URL. The document
+    #: says *which* site; each deployment says where that site is, so promoting
+    #: a use case carries no address with it. Empty means "the URL recorded
+    #: into this definition", which is what a single-environment install needs.
+    target: str = ""
     version: int = 1
     source_run_id: str | None = None
 
@@ -714,10 +800,6 @@ class UseCase(BaseModel):
         merged = {s.name: s.default for s in self.inputs if s.default is not None}
         merged.update({k: v for k, v in values.items() if v is not None})
         return merged
-
-    def brittle_steps(self) -> list[Step]:
-        """Steps whose best locator is one of the fragile rungs. Flagged in review."""
-        return [s for s in self.all_steps if s.locators and s.locators[0].brittle]
 
     def bump(self) -> "UseCase":
         """A copy at the next version, stamped now. Versions are immutable."""

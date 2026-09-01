@@ -35,8 +35,12 @@ from config import Settings
 from db.base import iso, utcnow
 from db.engine import create_engine, create_session_factory, ensure_schema
 from db.models import (
+    Target,
     Artifact,
     AuditLogEntry,
+    Dataset,
+    HealingMemory,
+    RunStep,
     Batch,
     Credential,
     Event,
@@ -164,6 +168,67 @@ def _execution_dict(row: Execution) -> dict[str, Any]:
     }
 
 
+def _dataset_dict(row: Dataset, *, sample: int = 5) -> dict[str, Any]:
+    """A dataset without its rows.
+
+    The sample is deliberately small and the full rows are a separate call:
+    a listing that ships ten thousand rows to draw a preview table is a
+    mistake that only shows up once somebody uploads a real file.
+    """
+    return {
+        "id": row.id,
+        "name": row.name,
+        "filename": row.filename,
+        "source": row.source,
+        "row_count": row.row_count,
+        "columns": list(row.columns or []),
+        "sample": list(row.rows or [])[:sample],
+        "warnings": list(row.warnings or []),
+        "created_at": iso(row.created_at),
+        "owner_id": row.owner_id,
+        "owner_email": row.owner_email,
+    }
+
+
+def _fix_dict(row: HealingMemory) -> dict[str, Any]:
+    """A remembered fix. The embedding is not included: it is a thousand
+    floats nobody reads, and it is only ever used inside a query."""
+    return {
+        "id": row.id,
+        "usecase_id": row.usecase_id,
+        "domain": row.domain,
+        "step_id": row.step_id,
+        "error_kind": row.error_kind,
+        "old_locator": row.old_locator,
+        "new_locator": row.new_locator,
+        "explanation": row.explanation,
+        "confirmed_by": row.confirmed_by,
+        "created_at": iso(row.created_at),
+    }
+
+
+def _step_dict(row: RunStep) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "run_id": row.run_id,
+        "seq": row.seq,
+        "step_id": row.step_id,
+        "phase": row.phase,
+        "action": row.action,
+        "locator": row.locator,
+        "locator_rung": row.locator_rung,
+        "page_url": row.page_url,
+        "status": row.status,
+        "duration_ms": row.duration_ms,
+        "error": row.error,
+        "row_index": row.row_index,
+        "screenshot_id": row.screenshot_id,
+        "baseline_id": row.baseline_id,
+        "pixel_diff": row.pixel_diff,
+        "created_at": iso(row.created_at),
+    }
+
+
 def _batch_dict(row: Batch) -> dict[str, Any]:
     return {
         "id": row.id,
@@ -174,6 +239,9 @@ def _batch_dict(row: Batch) -> dict[str, Any]:
         "succeeded": row.succeeded,
         "failed": row.failed,
         "credential_id": row.credential_id,
+        "base_url": row.base_url,
+        "dataset_id": row.dataset_id,
+        "job_id": row.job_id,
         "error": row.error,
         "created_at": iso(row.created_at),
         "finished_at": iso(row.finished_at),
@@ -504,6 +572,95 @@ class WorkspaceStore:
             return int(highest or 0) + 1
 
     # -- use cases ----------------------------------------------------------
+
+    # -- targets ------------------------------------------------------------
+    async def list_targets(self) -> list[dict[str, Any]]:
+        """Every target this workspace can point a use case at."""
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(Target)
+                    .where(Target.workspace_id == self._ws)
+                    .order_by(Target.name)
+                )
+            ).scalars()
+            return [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "base_url": row.base_url,
+                    "description": row.description,
+                    "updated_at": iso(row.updated_at),
+                    "updated_by": row.updated_by,
+                }
+                for row in rows
+            ]
+
+    async def target_urls(self) -> dict[str, str]:
+        """``{name: base_url}``, which is what a run resolves against."""
+        return {row["name"]: row["base_url"] for row in await self.list_targets()}
+
+    async def save_target(
+        self, name: str, base_url: str, *, description: str = "", updated_by: str = ""
+    ) -> dict[str, Any]:
+        """Create or update one target by name.
+
+        Upsert rather than create-then-edit: a target is identified by what a
+        use case calls it, so saving "schemora" twice is one target with a new
+        address, never two rows racing to answer the same name.
+        """
+        now = utcnow()
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Target).where(
+                    Target.workspace_id == self._ws, Target.name == name
+                )
+            )
+            if row is None:
+                row = Target(
+                    workspace_id=self._ws,
+                    name=name,
+                    base_url=base_url,
+                    description=description,
+                    created_at=now,
+                    updated_at=now,
+                    updated_by=updated_by,
+                )
+                session.add(row)
+            else:
+                row.base_url = base_url
+                row.description = description
+                row.updated_at = now
+                row.updated_by = updated_by
+            await session.commit()
+            return {
+                "id": row.id,
+                "name": row.name,
+                "base_url": row.base_url,
+                "description": row.description,
+            }
+
+    async def delete_target(self, name: str) -> bool:
+        async with self._sessions() as session:
+            result = await session.execute(
+                delete(Target).where(
+                    Target.workspace_id == self._ws, Target.name == name
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    async def set_usecase_target(self, usecase_id: str, target: str) -> bool:
+        """Point a use case at a target by name. Empty means "as recorded"."""
+        async with self._sessions() as session:
+            result = await session.execute(
+                update(UseCase)
+                .where(UseCase.id == usecase_id, UseCase.workspace_id == self._ws)
+                .values(target=target, updated_at=utcnow())
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
     async def save_usecase(
         self,
         definition: dict[str, Any],
@@ -927,15 +1084,6 @@ class WorkspaceStore:
             )
             await session.commit()
 
-    async def get_execution(self, execution_id: str) -> dict[str, Any] | None:
-        async with self._sessions() as session:
-            row = await session.scalar(
-                select(Execution).where(
-                    Execution.id == execution_id, Execution.workspace_id == self._ws
-                )
-            )
-            return _execution_dict(row) if row else None
-
     async def list_executions(
         self, *, batch_id: str | None = None, usecase_id: str | None = None, limit: int = 500
     ) -> list[dict[str, Any]]:
@@ -951,6 +1099,205 @@ class WorkspaceStore:
             return [_execution_dict(row) for row in (await session.scalars(stmt)).all()]
 
     # -- batches ------------------------------------------------------------
+    # -- healing memory -----------------------------------------------------
+    async def similar_fixes(
+        self, *, domain: str, embedding: list[float], limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Past fixes on this domain, nearest first.
+
+        The domain is a hard filter and the vector only orders what survives
+        it. Nearest-neighbour over everything ever recorded would cheerfully
+        return a plausible button from an unrelated site, and a wrong precedent
+        in the prompt is worse than none.
+
+        Scoped, like every other read here: a tenant must not be shown another
+        tenant's selectors.
+        """
+        distance = HealingMemory.embedding.cosine_distance(embedding).label("distance")
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(HealingMemory, distance)
+                    .where(
+                        HealingMemory.workspace_id == self._ws,
+                        HealingMemory.domain == domain,
+                        HealingMemory.embedding.is_not(None),
+                    )
+                    .order_by(distance)
+                    .limit(limit)
+                )
+            ).all()
+        return [{**_fix_dict(row[0]), "distance": float(row[1])} for row in rows]
+
+    async def remember_fix(self, **fields: Any) -> str:
+        async with self._sessions() as session:
+            record = HealingMemory(workspace_id=self._ws, **fields)
+            session.add(record)
+            await session.commit()
+            return record.id
+
+    async def list_fixes(self, *, domain: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """What this workspace has learned, for the UI that shows it."""
+        async with self._sessions() as session:
+            stmt = select(HealingMemory).where(HealingMemory.workspace_id == self._ws)
+            if domain:
+                stmt = stmt.where(HealingMemory.domain == domain)
+            stmt = stmt.order_by(HealingMemory.created_at.desc()).limit(limit)
+            return [_fix_dict(row) for row in (await session.scalars(stmt)).all()]
+
+    async def forget_fix(self, fix_id: str) -> bool:
+        """Delete one remembered fix.
+
+        Worth having: a fix that was right last month and wrong now is exactly
+        the thing that makes healing confidently incorrect, and somebody has to
+        be able to take it back out.
+        """
+        async with self._sessions() as session:
+            result = await session.execute(
+                delete(HealingMemory).where(
+                    HealingMemory.id == fix_id, HealingMemory.workspace_id == self._ws
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    # -- run steps ----------------------------------------------------------
+    async def record_step(self, **fields: Any) -> None:
+        """Write one step of one execution.
+
+        Never raises. A step row is a record *about* work that already
+        happened, so losing one must not fail the row it describes -- the same
+        rule a screenshot follows.
+        """
+        try:
+            async with self._sessions() as session:
+                session.add(RunStep(workspace_id=self._ws, **fields))
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "failed to record a step",
+                extra={"run_id": fields.get("run_id"), "error": str(exc)},
+            )
+
+    async def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(RunStep)
+                    .where(RunStep.run_id == run_id, RunStep.workspace_id == self._ws)
+                    .order_by(RunStep.seq)
+                )
+            ).all()
+            return [_step_dict(row) for row in rows]
+
+    async def baseline_steps(
+        self, usecase_id: str, version: int, *, exclude_run: str | None = None
+    ) -> dict[str, str]:
+        """``{step_id: screenshot_id}`` from the last run of this version that
+        worked.
+
+        The baseline is the most recent *succeeded* step, per step id. A
+        recording made by codegen has no screenshots of its own -- codegen owns
+        that browser and we never see its pages -- so the first successful
+        replay is what a later one is compared against. That is arguably the
+        more useful question anyway: not "does this match the day it was
+        recorded" but "what changed since it last worked".
+        """
+        async with self._sessions() as session:
+            stmt = (
+                select(RunStep.step_id, RunStep.screenshot_id, RunStep.created_at)
+                .where(
+                    RunStep.workspace_id == self._ws,
+                    RunStep.usecase_id == usecase_id,
+                    RunStep.version == version,
+                    RunStep.status == "succeeded",
+                    RunStep.screenshot_id.is_not(None),
+                )
+                .order_by(RunStep.created_at.desc())
+            )
+            if exclude_run:
+                stmt = stmt.where(RunStep.run_id != exclude_run)
+
+            latest: dict[str, str] = {}
+            for step_id, screenshot_id, _ in (await session.execute(stmt)).all():
+                latest.setdefault(step_id, screenshot_id)
+            return latest
+
+    # -- datasets -----------------------------------------------------------
+    async def create_dataset(
+        self,
+        dataset_id: str,
+        *,
+        name: str,
+        filename: str,
+        source: str,
+        rows: list[dict[str, Any]],
+        columns: list[dict[str, Any]],
+        warnings: list[str] | None = None,
+        owner_id: str | None = None,
+        owner_email: str = "",
+    ) -> None:
+        async with self._sessions() as session:
+            session.add(
+                Dataset(
+                    id=dataset_id,
+                    workspace_id=self._ws,
+                    owner_id=owner_id,
+                    owner_email=owner_email,
+                    name=name,
+                    filename=filename,
+                    source=source,
+                    row_count=len(rows),
+                    columns=columns,
+                    rows=rows,
+                    warnings=list(warnings or []),
+                )
+            )
+            await session.commit()
+
+    async def get_dataset(self, dataset_id: str, *, sample: int = 5) -> dict[str, Any] | None:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(Dataset).where(
+                    Dataset.id == dataset_id, Dataset.workspace_id == self._ws
+                )
+            )
+            return _dataset_dict(row, sample=sample) if row else None
+
+    async def get_dataset_rows(self, dataset_id: str) -> list[dict[str, Any]] | None:
+        """The whole file. Separate from :meth:`get_dataset` for the same
+        reason ``get_batch_rows`` is separate: almost nothing wants it."""
+        async with self._sessions() as session:
+            rows = await session.scalar(
+                select(Dataset.rows).where(
+                    Dataset.id == dataset_id, Dataset.workspace_id == self._ws
+                )
+            )
+            return list(rows) if rows is not None else None
+
+    async def list_datasets(self, limit: int = 50) -> list[dict[str, Any]]:
+        async with self._sessions() as session:
+            stmt = (
+                select(Dataset)
+                .where(Dataset.workspace_id == self._ws)
+                .order_by(Dataset.created_at.desc())
+                .limit(limit)
+            )
+            return [
+                _dataset_dict(row, sample=0) for row in (await session.scalars(stmt)).all()
+            ]
+
+    async def delete_dataset(self, dataset_id: str) -> bool:
+        async with self._sessions() as session:
+            result = await session.execute(
+                delete(Dataset).where(
+                    Dataset.id == dataset_id, Dataset.workspace_id == self._ws
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    # -- batches ------------------------------------------------------------
     async def create_batch(
         self,
         batch_id: str,
@@ -958,25 +1305,57 @@ class WorkspaceStore:
         version: int,
         *,
         total: int,
+        rows: list[dict[str, Any]] | None = None,
+        job_id: str | None = None,
+        dataset_id: str | None = None,
         credential_id: str | None = None,
+        base_url: str = "",
         owner_id: str | None = None,
         owner_email: str = "",
+        session: AsyncSession | None = None,
     ) -> None:
+        """Write the batch row.
+
+        Pass ``session`` to enlist in a caller's transaction and leave the
+        commit to them. That is what makes "create the batch and queue its
+        work" one atomic act: without it there is a window in which the UI
+        shows a queued batch that no worker will ever claim.
+        """
+        row = Batch(
+            id=batch_id,
+            workspace_id=self._ws,
+            owner_id=owner_id,
+            owner_email=owner_email,
+            usecase_id=usecase_id,
+            version=version,
+            status="pending",
+            total=total,
+            input_rows=list(rows or []),
+            job_id=job_id,
+            dataset_id=dataset_id,
+            credential_id=credential_id,
+            base_url=base_url,
+        )
+        if session is not None:
+            session.add(row)
+            return
+        async with self._sessions() as own:
+            own.add(row)
+            await own.commit()
+
+    async def get_batch_rows(self, batch_id: str) -> list[dict[str, Any]] | None:
+        """The rows a batch was queued with.
+
+        Separate from :meth:`get_batch` because a listing renders dozens of
+        batches and none of them wants a thousand rows attached.
+        """
         async with self._sessions() as session:
-            session.add(
-                Batch(
-                    id=batch_id,
-                    workspace_id=self._ws,
-                    owner_id=owner_id,
-                    owner_email=owner_email,
-                    usecase_id=usecase_id,
-                    version=version,
-                    status="pending",
-                    total=total,
-                    credential_id=credential_id,
+            rows = await session.scalar(
+                select(Batch.input_rows).where(
+                    Batch.id == batch_id, Batch.workspace_id == self._ws
                 )
             )
-            await session.commit()
+            return list(rows) if rows is not None else None
 
     async def update_batch(
         self,

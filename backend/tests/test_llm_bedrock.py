@@ -64,7 +64,7 @@ def settings(**overrides) -> Settings:
 # --- defaults --------------------------------------------------------------
 
 
-@pytest.mark.parametrize("field", ["llm_model", "llm_repair_model"])
+@pytest.mark.parametrize("field", ["llm_repair_model"])
 def test_default_models_are_inference_profiles_not_bare_model_ids(field):
     """Current Claude models on Bedrock are cross-region-profile only.
 
@@ -196,69 +196,36 @@ def test_health_always_reports_bedrock():
 # --- one process, three models ---------------------------------------------
 
 
-def test_the_three_roles_have_their_own_models():
-    s = Settings(_env_file=None)
-    assert s.models_in_use == {
-        "driver": s.llm_model,
-        "distiller": s.llm_model,
-        "repair": s.llm_repair_model,
-    }
-    assert s.llm_model != s.llm_repair_model
-
-
-def test_the_distiller_follows_the_driver_unless_told_otherwise():
-    base = Settings(_env_file=None)
-    assert base.distill_model == base.llm_model
-
-    pinned = Settings(_env_file=None, llm_distill_model="us.anthropic.claude-opus-5")
-    assert pinned.distill_model == "us.anthropic.claude-opus-5"
-    assert pinned.llm_model != "us.anthropic.claude-opus-5", "the driver is unaffected"
-
-
-def test_a_blank_distill_model_falls_back_rather_than_being_used():
-    blank = Settings(_env_file=None, llm_distill_model="   ")
-    assert blank.distill_model == blank.llm_model
-
-
 def test_build_llm_takes_a_model_override():
-    assert build_llm(settings()).model == settings().llm_model
+    assert build_llm(settings()).model == settings().llm_repair_model
     assert build_llm(settings(), "us.anthropic.claude-opus-5").model == (
         "us.anthropic.claude-opus-5"
     )
 
 
-def test_health_reports_every_role():
-    health = llm_health(settings())
-    assert health["model"] == settings().llm_model, "unchanged for old consumers"
-    assert health["models"]["repair"] == settings().llm_repair_model
+def test_one_model_is_built_and_cached():
+    """There used to be three roles. Two of them went with the agent.
+
+    A workflow is recorded by watching someone do it, and a codegen script is
+    parsed rather than interpreted -- so neither the driver nor the distiller
+    has anything left to do. What remains is the model that looks at a page
+    when a step breaks.
+    """
+    from llm import RepairModel
+
+    model = RepairModel(settings())
+    assert model.client.model == settings().llm_repair_model
+    assert model.client is model.client, "built once and cached"
 
 
-def test_the_manager_builds_a_different_client_per_role(tmp_path):
-    from runner import EventBus, RunManager
-    from store import Store
-
-    config = settings()
-    manager = RunManager(Store(tmp_path / "x.db", tmp_path / "a"), config, EventBus())
-
-    assert manager.llm.model == config.llm_model
-    assert manager.repair_llm.model == config.llm_repair_model
-    assert manager.distill_llm.model == config.llm_model
-    assert manager.llm.model != manager.repair_llm.model
-    assert manager.repair_llm is manager.repair_llm, "built once and cached"
-
-
-def test_an_injected_client_serves_every_role(tmp_path):
-    """So a scripted model in a test still covers all three."""
-    from runner import EventBus, RunManager
-    from store import Store
+def test_an_injected_client_is_used_as_is():
+    """So a scripted model in a test is the one that gets called."""
+    from llm import RepairModel
 
     scripted = object()
-    manager = RunManager(
-        Store(tmp_path / "x.db", tmp_path / "a"), settings(), EventBus(), llm=scripted
-    )
-    assert manager.llm is scripted
-    assert manager.repair_llm is scripted
-    assert manager.distill_llm is scripted
+    model = RepairModel(settings(), client=scripted)
+    assert model.client is scripted
+    assert model() is scripted, "and it works as a zero-argument factory"
 
 
 # --- a model the account cannot use ----------------------------------------
@@ -277,7 +244,7 @@ class _Boom(Exception):
 
 
 def _client(model: str = "us.anthropic.claude-sonnet-5") -> LangChainLLM:
-    return build_llm(settings(llm_model=model))
+    return build_llm(settings(llm_repair_model=model))
 
 
 @pytest.mark.parametrize(
@@ -346,28 +313,6 @@ async def test_check_access_reports_success(monkeypatch):
 
     monkeypatch.setattr(type(client._model), "ainvoke", allow)  # noqa: SLF001
     assert (await client.check_access())["ok"] is True
-
-
-async def test_a_run_fails_cleanly_rather_than_crashing(spec, mcp, sink):
-    """The run must report a configuration problem, not 'agent run crashed'."""
-    from agent import BrowserAgent
-    from conftest import AutoApprovalGate
-
-    class DeniedLLM:
-        model = "us.anthropic.claude-sonnet-5"
-
-        async def run_turn(self, **kwargs):
-            raise LLMAccessError("this account cannot use 'us.anthropic.claude-sonnet-5'")
-
-    outcome = await BrowserAgent(spec, mcp, DeniedLLM(), sink, AutoApprovalGate()).run()
-
-    assert outcome.status == "failed"
-    assert "cannot use" in outcome.error
-    errors = sink.of_type("error")
-    assert errors and errors[-1].kind == "llm_unavailable", "not 'internal_error'"
-
-
-# --- the message bridge ----------------------------------------------------
 
 
 def test_history_converts_to_langchain_messages():

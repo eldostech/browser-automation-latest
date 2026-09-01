@@ -21,57 +21,44 @@ from fastapi.responses import JSONResponse
 from config import Settings
 from deps import CurrentUser, get_config
 from llm import PROVIDER, llm_health
-from mcp_client import MCPConfig, probe
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
-#: How long a cached MCP connectivity result is considered fresh.
-HEALTH_CACHE_TTL = 60.0
-
-
 @router.get("/healthz")
 async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONResponse:
     """Liveness plus dependency status.
 
-    The shallow check (default) reports the last known MCP state, refreshed at
-    startup and after every deep probe. ``?deep=1`` forces a live connect,
-    which spawns a real browser -- fine for a manual check, too heavy for a
-    container healthcheck loop.
+    There is no browser probe any more. The MCP server was a separate process
+    that could be down while everything else was up, so its reachability was
+    worth caching and reporting; Playwright is a library in this process, and
+    "can it launch a browser" is answered by launching one -- too heavy for a
+    healthcheck loop and answered anyway by the first execution.
+
+    ``?deep=1`` still checks the model can be called, because a model the
+    account lacks otherwise shows up one step into a run, as a 403.
     """
     app_state = request.app.state
     store = app_state.store
     settings: Settings = app_state.settings
-    cache = app_state.health
 
-    fresh = (time.time() - cache["checked_at"]) < HEALTH_CACHE_TTL
-    if deep or cache["result"] is None:
-        result = await probe(MCPConfig.from_settings(settings), timeout=60.0)
-        app_state.health = {"checked_at": time.time(), "result": result}
-        cache = app_state.health
-        fresh = True
-
-    mcp_result = cache["result"] or {"ok": None, "error": "not probed yet"}
     db_ok = await store.ping()
     llm = llm_health(settings)
 
     # A deep probe checks the models can actually be called. A model the
     # account lacks otherwise only shows up one step into a run, as a 403.
     if deep:
-        manager = app_state.manager
-        roles = {
-            "driver": manager.llm,
-            "distiller": manager.distill_llm,
-            "repair": manager.repair_llm,
-        }
-        checks = await asyncio.gather(*(client.check_access() for client in roles.values()))
-        llm = {**llm, "access": dict(zip(roles, checks))}
-        if any(not check["ok"] for check in checks):
+        # One role left. The driver and the distiller went with the agent: a
+        # workflow is recorded by watching someone do it, and a codegen script
+        # is parsed rather than interpreted.
+        check = await app_state.repair_model.client.check_access()
+        llm = {**llm, "access": {"repair": check}}
+        if not check["ok"]:
             llm = {**llm, "configured": False}
 
     queue = await app_state.queue.depth()
-    healthy = db_ok and llm["configured"] and mcp_result.get("ok") is not False
+    healthy = db_ok and llm["configured"]
     body = {
         "status": "ok" if healthy else "degraded",
         "database": {
@@ -82,17 +69,14 @@ async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONRe
             "schema": settings.db_schema,
         },
         "llm": llm,
-        "mcp": {
-            **mcp_result,
-            "checked_at": cache["checked_at"],
-            "stale": not fresh,
-            "command": MCPConfig.from_settings(settings).command_line()
-            if settings.mcp_transport == "stdio"
-            else settings.mcp_server_url,
+        "browser": {
+            "engine": settings.browser_engine,
+            "headless": settings.browser_headless,
+            "recorder": app_state.recorder.available()[0],
         },
         "queue": {"queued": queue.get("queued", 0), "running": queue.get("running", 0)},
         "events": {"cross_process": getattr(app_state.bus, "connected", False)},
-        "active_runs": len(app_state.manager._tasks),  # noqa: SLF001
+        "active_execution": app_state.replays.active,
     }
     return JSONResponse(body, status_code=200 if healthy else 503)
 
@@ -101,19 +85,23 @@ async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONRe
 async def get_config_endpoint(
     _: CurrentUser, settings: Annotated[Settings, Depends(get_config)]
 ) -> dict[str, Any]:
-    """Defaults the task composer pre-fills. Contains no secrets."""
+    """What the dashboard needs to know about this deployment. No secrets.
+
+    The task composer these defaults were for is gone with the agent. What a
+    client still asks is what kind of browser it will get, whether this
+    deployment can record at all, and which model is behind the one thing that
+    still costs tokens.
+    """
     return {
         "defaults": {
-            "max_steps": settings.agent_max_steps,
-            "timeout_seconds": settings.agent_timeout_seconds,
-            "allowed_domains": settings.agent_allowed_domains,
-            "require_approval": settings.agent_require_approval,
-            "screenshot_every_step": settings.agent_screenshot_every_step,
-            "headless": settings.mcp_headless,
-            "browser": settings.mcp_browser,
+            "browser": settings.browser_engine,
+            "headless": settings.browser_headless,
+            "trace": settings.browser_trace,
+            "screenshots": settings.replay_screenshots,
+            "healing": settings.replay_healing_enabled,
         },
-        "model": settings.llm_model,
-        "models": settings.models_in_use,
+        "environment": settings.environment,
+        "recorder": {"enabled": settings.recorder_enabled},
+        "model": settings.llm_repair_model,
         "provider": PROVIDER,
-        "transport": settings.mcp_transport,
     }

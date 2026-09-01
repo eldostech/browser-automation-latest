@@ -31,6 +31,36 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 PROVIDER = "bedrock"
 
 
+class RepairModel:
+    """The one model this application still uses, built once and cached.
+
+    There used to be three roles -- a driver for the agent loop, a distiller
+    for turning a recording into a use case, and this one. The first two went
+    with the agent: a workflow is recorded by watching someone do it now, and a
+    codegen script is parsed rather than interpreted.
+
+    What is left is the model that looks at a page when a step breaks. It is
+    held here rather than on a manager so that the thing which owns *runs* is
+    not also the thing which owns a model client -- that coupling is how the
+    replay path ended up one attribute away from an LLM.
+    """
+
+    def __init__(self, settings, client: "LLMClient | None" = None) -> None:
+        self._settings = settings
+        #: A test injects a scripted client here.
+        self._client = client
+
+    @property
+    def client(self) -> "LLMClient":
+        if self._client is None:
+            self._client = build_llm(self._settings, self._settings.llm_repair_model)
+        return self._client
+
+    def __call__(self) -> "LLMClient":
+        """So it can be passed anywhere a zero-argument factory is wanted."""
+        return self.client
+
+
 class LLMAccessError(RuntimeError):
     """The configured model cannot be used: no access, no such model, bad key.
 
@@ -284,10 +314,8 @@ def llm_health(settings: Any) -> dict[str, Any]:
     auth = bedrock_auth_status(settings.aws_profile)
     return {
         "provider": PROVIDER,
-        # `model` stays the driver, so existing consumers keep working.
-        "model": settings.llm_model,
-        # Which model does what -- three roles can differ.
-        "models": getattr(settings, "models_in_use", {"driver": settings.llm_model}),
+        # One role left. The driver and the distiller went with the agent.
+        "model": settings.llm_repair_model,
         "region": settings.aws_region or auth.get("region"),
         "configured": bool(auth.get("ok")),
         "auth": auth,
@@ -297,13 +325,12 @@ def llm_health(settings: Any) -> dict[str, Any]:
 def build_llm(settings: Any, model: str | None = None) -> LLMClient:
     """The configured model, wrapped in this codebase's client protocol.
 
-    ``model`` overrides ``settings.llm_model`` so one process can run several
-    at once -- a fast driver for the agent loop, a more capable one for the
-    rare repair calls -- without a second Settings object.
+    ``model`` overrides the configured one, which is what let a single process
+    run several at once when there were several roles to run.
     """
     from chat import chat_model
 
-    resolved = model or settings.llm_model
+    resolved = model or settings.llm_repair_model
 
     # The bearer token short-circuits SigV4 entirely, and boto3 rejects a
     # request carrying both. Catch it here with an actionable message rather

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
-import type { BatchDetail, CredentialSummary, UseCase } from '../lib/events';
+import type { BatchDetail, CredentialSummary, DatasetSummary, UseCase } from '../lib/events';
+import { DatasetMapper } from './DatasetMapper';
 import { formatDuration } from '../lib/format';
 import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -37,10 +38,6 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
 
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [credentialId, setCredentialId] = useState<string>('');
-  const [csv, setCsv] = useState('');
-  // A spreadsheet is sent as-is rather than converted here: re-saving one as
-  // CSV in the browser mangles leading zeros, dates and embedded commas.
-  const [workbook, setWorkbook] = useState<{ name: string; base64: string } | null>(null);
   // Watching the browser work is the fastest way to understand why a step
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
@@ -174,15 +171,16 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       setError(`Failed: ${result.error}`);
     });
 
-  const runBatch = () =>
+  const runBatch = (dataset: DatasetSummary, mapping: Record<string, string>) =>
     act(async () => {
       const started = await api.startBatch(usecaseId, {
-        ...(workbook ? { xlsx_base64: workbook.base64 } : { csv }),
+        dataset_id: dataset.id,
+        mapping,
         credential_id: credentialId || null,
         headless: !watch,
       });
       setBatch(await api.getBatch(started.batch_id));
-      setNotice(`Started ${started.total} rows on one shared browser session.`);
+      setNotice(`Queued ${started.total} rows. They run on one shared browser session.`);
     });
 
   const resume = () =>
@@ -655,53 +653,23 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         <div className="card">
           <h3>Run a file</h3>
           <p className="hint">
-            One header row naming the inputs ({useCase.inputs.map((i) => i.name).join(', ') || 'none'}
-            ), then one line per record. Every row is checked before the browser opens. Rows run in
-            sequence on one shared session, signing in once.
+            Upload your records, check that each field is reading the right column, then start.
+            Every row is validated before the browser opens, and rows run in sequence on one
+            shared session so the workflow signs in once.
           </p>
-          <textarea
-            rows={8}
-            value={csv}
-            spellCheck={false}
-            placeholder={`${useCase.inputs.map((i) => i.name).join(',')}\n...`}
-            onChange={(e) => setCsv(e.target.value)}
+
+          <DatasetMapper
+            useCase={useCase}
+            usecaseId={usecaseId}
+            busy={busy}
+            disabled={missingSlots.length > 0}
+            disabledReason={
+              missingSlots.length > 0
+                ? `This workflow signs in. Choose a credential providing: ${missingSlots.join(', ')}.`
+                : undefined
+            }
+            onReady={runBatch}
           />
-          <input
-            type="file"
-            accept=".csv,.xlsx,text/csv"
-            onChange={async (event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-              if (file.name.toLowerCase().endsWith('.xlsx')) {
-                const bytes = new Uint8Array(await file.arrayBuffer());
-                let binary = '';
-                bytes.forEach((byte) => {
-                  binary += String.fromCharCode(byte);
-                });
-                setWorkbook({ name: file.name, base64: btoa(binary) });
-                setCsv('');
-                return;
-              }
-              setWorkbook(null);
-              setCsv(await file.text());
-            }}
-          />
-          {workbook && (
-            <p className="hint">
-              Using <strong>{workbook.name}</strong> — the first sheet, header row first.{' '}
-              <button type="button" className="link" onClick={() => setWorkbook(null)}>
-                use the text box instead
-              </button>
-            </p>
-          )}
-          <button
-            type="button"
-            className="primary"
-            onClick={runBatch}
-            disabled={busy || (!csv.trim() && !workbook) || missingSlots.length > 0}
-          >
-            {busy ? 'Starting...' : 'Start batch'}
-          </button>
 
           {batch && <BatchProgressPanel batch={batch} onOpenRun={onOpenRun} onResume={resume} />}
         </div>

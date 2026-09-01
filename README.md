@@ -1,974 +1,607 @@
-# Browser Agent
+# Browser Automation
 
-An LLM agent that drives a **real browser** through the [Playwright MCP](https://github.com/microsoft/playwright-mcp)
-server, and a React dashboard that shows you every step as it happens — the
-model's reasoning, each tool call and its result, a screenshot per step — and
-lets you pause, cancel, or approve sensitive actions.
+Record a browser workflow by doing it **once**, map a spreadsheet onto it, and
+replay it over a thousand rows — **without an LLM in the loop**.
 
-You give it a task in plain English:
+> Sign in to the supplier portal, open each order in this spreadsheet, and mark
+> it dispatched.
 
-> Open the demo store, find wireless headphones under $50, and export the top 5
-> results as JSON with name, price, rating and URL.
+You do that task by hand, in a real browser, one time. The software watches,
+turns what you did into a reviewable list of steps, and from then on runs it
+deterministically. A model is asked exactly two questions in the whole
+lifecycle: *which column fills which field* when you upload a file, and *where
+did this button go* when a site redesign breaks a step. Everything else costs
+nothing.
 
-It plans, acts, observes, and repeats until the task is done or a budget runs
-out. Everything is persisted, so you can come back and replay a run later.
-
-Built as a foundation for **internal QA automation and data collection**, so
-the code favours being obvious over being clever.
+Built as a foundation for internal data entry and QA automation, so the code
+favours being obvious over being clever.
 
 ---
 
 ## Contents
 
+- [Why it is built this way](#why-it-is-built-this-way)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
 - [Running it](#running-it)
-- [Walkthrough: one task, start to finish](#walkthrough-one-task-start-to-finish)
+- [The workflow, end to end](#the-workflow-end-to-end)
+- [Signing in and roles](#signing-in-and-roles)
 - [Environment variables](#environment-variables)
-- [The event schema](#the-event-schema)
+- [The API](#the-api)
 - [Guardrails](#guardrails)
-- [Customising the prompts](#customising-the-prompts)
-- [Prompt injection from web pages](#prompt-injection-from-web-pages)
-- [Design decisions and trade-offs](#design-decisions-and-trade-offs)
 - [Tests](#tests)
+- [Deployment](#deployment)
 - [Troubleshooting](#troubleshooting)
-- [Responsible use](#responsible-use)
 - [Project layout](#project-layout)
+
+---
+
+## Why it is built this way
+
+This project used to record workflows with an **LLM agent**: you described a
+task in English and a model drove the browser until it worked. That is the
+right design for *figuring out* how to do something and the wrong one for doing
+the same thing a thousand times.
+
+The cost was measurable, from this repository's own data. One recorded workflow
+— 35 steps — consumed roughly **247,000 input tokens**, because the agent
+re-sends its history every turn and 87% of that history is accessibility
+snapshots. It also failed 13 of its 34 browser actions on the way to succeeding.
+
+The observation that replaced it: **the user already knows how to do the task.**
+They do it every day. They do not need a model to discover it; they need the
+software to watch them do it once.
+
+So recording is now `playwright codegen` — a real browser, your hands, zero
+tokens — and the resulting script is *parsed*, not interpreted. What remains of
+the old design is the part that was always right: a use case is a durable,
+parameterised list of steps that replays with no model at all.
+
+If you want the full reasoning, including the three things the design document
+asserted that turned out to be wrong, read
+[`docs/design/deterministic-automation-platform.md`](docs/design/deterministic-automation-platform.md).
 
 ---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Browser["Your browser"]
-        UI["React + TypeScript dashboard<br/>(Vite)"]
+flowchart TB
+    subgraph FE["React + Tailwind dashboard"]
+        REC["Record"]
+        MAP["Upload + map columns"]
+        TRAIL["Timeline + visual diff"]
+        LEARN["What it has learned"]
     end
 
-    subgraph Backend["FastAPI backend (Python 3.11+)"]
-        API["HTTP + WebSocket API<br/>main.py"]
-        RUN["RunManager<br/>runner.py"]
-        AG["Agent loop<br/>agent.py"]
-        POL["Policy<br/>policy.py"]
-        MC["MCP client<br/>mcp_client.py"]
-        DB[("SQLite<br/>runs, events, artifacts")]
+    subgraph API["FastAPI"]
+        RECORDER["recorder.py<br/>codegen subprocess"]
+        CODEGEN["codegen.py<br/>AST parser"]
+        INGEST["ingest.py + mapping.py<br/>pandas"]
+        QUEUE["jobs.py<br/>Postgres work queue"]
     end
 
-    LLM["Amazon Bedrock<br/>Claude Haiku 4.5"]
-    MCP["Playwright MCP server<br/>npx @playwright/mcp"]
-    WEB["Chromium -> the web"]
+    subgraph RUN["Execution — no LLM"]
+        ENGINE["engine.py"]
+        BROWSER["browser.py<br/>async Playwright"]
+    end
 
-    UI -- "POST /api/runs" --> API
-    UI <-. "WS /api/runs/:id/stream" .-> API
-    UI -- "POST .../approve, .../cancel" --> API
-    API --> RUN
-    RUN --> AG
-    AG -- "tools + history" --> LLM
-    LLM -- "tool call or answer" --> AG
-    AG -- "classify action" --> POL
-    AG -- "call_tool" --> MC
-    MC -- "JSON-RPC over stdio or HTTP" --> MCP
-    MCP --> WEB
-    RUN --> DB
-    API --> DB
+    subgraph HEAL["Only on failure"]
+        HEALER["healing.py"]
+        MEM["memory.py<br/>pgvector recall"]
+    end
+
+    DB[("PostgreSQL + pgvector")]
+    ART[("Artifacts<br/>disk or S3")]
+
+    REC --> RECORDER --> CODEGEN --> DB
+    MAP --> INGEST --> DB
+    QUEUE --> ENGINE --> BROWSER
+    ENGINE --> ART
+    ENGINE -->|"a locator broke"| HEALER
+    HEALER <--> MEM <--> DB
+    DB --> TRAIL
+    DB --> LEARN
 ```
 
-**One run = one browser session.** `RunManager` spawns an `asyncio.Task`, which
-opens an MCP session, hands it to `BrowserAgent`, and guarantees teardown in a
-`finally` block that also runs on cancellation.
+**Three phases, and only one of them can spend money.**
 
-**The agent loop** (`agent.py`) does, per iteration:
+| Phase | What happens | Model cost |
+|---|---|---|
+| **Record** | `playwright codegen` captures your session; `codegen.py` parses it | none |
+| **Map** | Column names matched to fields by string handling and value shape | none, usually |
+| **Replay** | `engine.py` drives Playwright directly, row after row | **none, ever** |
+| **Heal** | Only when a locator stops matching, and only if enabled | one call, budgeted |
 
-1. Send history + tool schema to the LLM (streamed, so prose appears live).
-2. Get back a tool call or a final answer.
-3. Classify the tool call (`policy.py`) — sensitive actions pause for approval.
-4. Execute it through MCP, with retries and backoff on transient failures.
-5. Emit structured events; append the result to history; repeat.
-
-**Every event has a sequence number.** That number is the resume token: a
-dashboard that reconnects sends the highest `seq` it saw, and the backend
-replays exactly what was missed. No server-side session state, no lost steps.
-
-**All browser control goes through MCP.** There is deliberately no raw
-Playwright-Python in the backend. The agent and a human debugging a run see the
-same tool surface — that is the whole point of the architecture.
+**The zero-token guarantee is structural, not a promise.** `engine.py` does not
+import `llm`, `UseCaseExecutor` has no parameter that could accept a model
+client, and a test asserts both. A healer is *injected*; with none passed there
+is no code path to a model at all.
 
 ---
 
 ## Prerequisites
 
+**This runs on your machine.** Two processes — a Python API and a Vite dev
+server — against a PostgreSQL you already have. No Docker is involved anywhere
+in this section; there is a compose file, but it is an alternative for people
+who would rather not install Postgres, not the intended path.
+
 | Requirement | Version | Why |
 |---|---|---|
-| **Python** | 3.11+ (3.11–3.13 tested) | Backend. Uses `X \| Y` unions and `asyncio.timeout`. |
-| **Node.js** | 20+ | Runs the Playwright MCP server via `npx`, and builds the frontend. |
-| **npm** | 10+ | Ships with Node 20. |
-| **Chromium** | installed by Playwright | The browser the MCP server drives. |
-| **PostgreSQL** | 14+ (18 tested) | Runs, use cases, credentials, the job queue, and the event fan-out. |
-| **AWS credentials** | — | Claude runs on Amazon Bedrock. No API key needed. |
+| **Python** | 3.11+ (3.11–3.13 tested) | The backend. Uses `X \| Y` unions and `asyncio.timeout`. |
+| **Node.js** | 20+ | Builds the frontend. **Not** needed to record — Playwright's Python package ships its own codegen. |
+| **PostgreSQL** | 14+ (17/18 tested) | Everything: runs, use cases, credentials, the job queue, the event fan-out, and healing memory. |
+| **pgvector** | any recent | The `vector` extension, for healing memory. Optional if you turn that off. |
+| **AWS credentials** | — | Claude on Bedrock, for mapping and healing. No API key. |
 
 Check what you have:
 
 ```bash
-python --version && node --version && npm --version && psql --version
+python --version && node --version && psql --version
 ```
 
-**PostgreSQL** — the application keeps its tables in a named schema (`browser`
-by default), so it can share a database with other systems without colliding.
-Point `DB_*` in `.env` at any reachable Postgres; `make db-upgrade` creates the
-schema and everything in it. If you would rather not install one,
-`docker compose up` brings its own.
+**pgvector** — the extension must be available *on the server*:
 
-**AWS access** — the backend authenticates with the standard credential chain,
-so anything that already works with the AWS CLI works here:
+```bash
+psql -c "SELECT * FROM pg_available_extensions WHERE name = 'vector'"
+```
+
+If that returns a row, you are set — the migration runs `CREATE EXTENSION` for
+you. If it returns nothing, pgvector is not installed server-side: on Windows
+it comes with the EDB installer's StackBuilder, on macOS with
+`brew install pgvector`, on Debian with `apt install postgresql-17-pgvector`.
+
+You can also just skip it. Set `HEALING_MEMORY_ENABLED=false` and everything
+works except recalling past fixes.
+
+**AWS access** — the standard credential chain, so anything that works with the
+AWS CLI works here:
 
 ```bash
 aws sts get-caller-identity
 ```
 
-Any of these is enough, in the order the SDK tries them:
-
-1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
-2. `~/.aws/credentials` and `~/.aws/config`, including SSO (`aws sso login`)
-3. The IAM role attached to the EC2 instance, ECS task, EKS pod, or Lambda
-
-The identity needs `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`
-on the model, and **Claude Haiku 4.5 must be enabled** in the Bedrock console
-under *Model access* for your region.
-
-Docker alternative: `docker compose up --build` builds an image that already
-contains Node, Python and the browsers. See
-[docker-compose.yml](docker-compose.yml).
+The identity needs `bedrock:InvokeModel` on the repair model and, if healing
+memory is on, on the Titan embedding model.
 
 ---
 
 ## Setup
 
+Written out longhand, for a local PostgreSQL you already have. There is a
+`Makefile` with the same commands if you have `make`, but nothing here depends
+on it.
+
+Paths below are Windows (`.venv/Scripts/...`). On macOS or Linux that is
+`.venv/bin/...` throughout.
+
+### 1. A database to point at
+
+The application keeps its tables in a **named schema**, so it can share a
+database with anything else you have without colliding. It creates the schema
+itself; it does not create the database.
+
+If your existing `postgres` database is fine, there is nothing to do here — pick
+a schema name and put it in `DB_SCHEMA` at the next step. To keep it separate:
+
 ```bash
-git clone <your-fork> browser-agent && cd browser-agent
+psql -U postgres -c "CREATE DATABASE browser_automation"
+```
+
+> Use a schema name nothing else has migrated. If you point this at a schema
+> that another branch or project has already stamped, Alembic will refuse with
+> `Can't locate revision identified by ...` — see Troubleshooting.
+
+### 2. Configuration
+
+```bash
 cp .env.example .env
 ```
 
-The defaults in `.env.example` already point at Claude Haiku 4.5 on Bedrock, so
-there is no key to paste. Confirm the model ID is one your account has:
-
-```bash
-aws bedrock list-inference-profiles --region us-east-1 --query "inferenceProfileSummaries[?contains(inferenceProfileId,'haiku')].inferenceProfileId"
-```
-
-Then install the three pieces. Run these from the **repository root**.
-
-### 1. Database
-
-Set the connection in `.env`:
+Then edit `.env`. For a local Postgres the whole of what you need is:
 
 ```ini
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=postgres
+DB_NAME=postgres            # or browser_automation, if you made one
 DB_USER=postgres
 DB_PASSWORD=your-password
-DB_SCHEMA=browser
+DB_SCHEMA=automation        # any name nothing else has migrated
+CREDENTIALS_KEY=            # generated below
 ```
 
-Supplied in parts rather than as one URL on purpose: a password containing `@`,
-`:` or `/` cannot be safely pasted into a connection string, and the code
-escapes each part itself.
-
-Then create the schema:
+Generate the key:
 
 ```bash
-make db-upgrade
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-### 2. Python backend
+`CREDENTIALS_KEY` encrypts every stored site login. **Losing it makes every
+saved credential unreadable; leaking it makes them all readable.**
 
-**Windows (PowerShell)**
+### 3. Python
 
-```powershell
+```bash
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r backend\requirements.txt
 ```
-
-If PowerShell blocks the activation script, allow it for this session only:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-**macOS / Linux**
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
+.venv/Scripts/python -m pip install -r backend/requirements.txt
 ```
 
-### 3. Frontend
+**Use the venv.** Installing these into a system Python will fight with whatever
+else lives there — these pin `langchain-core`, `pydantic` and `boto3`, and pip
+will happily upgrade them out from under your other projects.
+
+### 4. The browser
+
+Playwright's Python package wants a Chromium it registered itself, at a revision
+that matches the installed version. A Chromium you already have — the browser,
+or one installed for the Node packages — is not that:
 
 ```bash
-cd frontend
-npm install
-cd ..
+.venv/Scripts/python -m playwright install chromium
 ```
 
-### 4. Browser
+It is a few hundred MB and it is idempotent, so running it when you already have
+the right build costs nothing. One browser then serves both recording and
+replay: codegen's output is what the parser reads, so the recorder and the
+engine being the same Playwright is the point.
 
-The browser revision must match the Playwright version bundled *inside*
-`@playwright/mcp`, which is **not** necessarily `playwright@latest`. Installing
-the MCP package first makes `npx playwright` resolve to that exact version.
-
-> Write the `package.json` by hand rather than running `npm init -y`. That
-> command derives the package name from the directory, and `.tools` is an
-> invalid npm name (names cannot begin with a dot), so it fails with
-> `Invalid name: ".tools"`. **And without a `package.json`, `npm install`
-> silently installs nothing** — it prints `up to date` and creates no
-> `node_modules`, which then makes the browser download resolve against the
-> wrong Playwright version.
-
-**Windows (PowerShell)**
-
-```powershell
-mkdir .tools -Force
-cd .tools
-Set-Content -Path package.json -Encoding ascii -Value '{ "name": "playwright-tools", "private": true }'
-npm install @playwright/mcp@latest
-npx playwright install chromium
-cd ..
-```
-
-**macOS / Linux**
+### 5. Create the tables
 
 ```bash
-mkdir -p .tools && cd .tools
-echo '{ "name": "playwright-tools", "private": true }' > package.json
-npm install @playwright/mcp@latest
-npx playwright install chromium
-cd ..
+cd backend && ../.venv/Scripts/python -m alembic upgrade head
 ```
 
-Confirm it installed locally rather than no-opping:
+Run it **from `backend/`** — that is where `alembic.ini` lives. It creates the
+schema named by `DB_SCHEMA`, every table in it, and the `vector` extension.
+
+You should see seven migrations apply, ending with
+`a step records where it happened`.
+
+### 6. Frontend
 
 ```bash
-node -p "require('./node_modules/playwright/package.json').version"
+cd frontend && npm install
 ```
-
-> **On dependency pinning:** `backend/requirements.txt` and
-> `frontend/package.json` use bounded ranges (a lower bound for the APIs this
-> code uses, an upper bound at the next major) rather than exact pins, so a
-> fresh clone installs cleanly today. For a reproducible deploy, freeze the
-> exact versions after installing and commit `frontend/package-lock.json`:
->
-> ```powershell
-> .venv\Scripts\pip.exe freeze > backend\requirements.lock.txt
-> ```
-
----
-
-## Signing in
-
-The application requires an account. On the backend's **first start**, if the
-database holds no users at all, it creates an administrator and prints a
-one-time password to the log:
-
-```
-========================================================================
-Created the first administrator: admin@localhost
-One-time password: 8Kd2mQv...
-Sign in and change it. This will not be shown again.
-========================================================================
-```
-
-Only the bcrypt hash is stored, so that line is the only time the password
-exists in readable form. If it scrolls past, reset it:
-
-```bash
-.venv/Scripts/python backend/scripts/manage.py reset-password admin@localhost
-```
-
-Other account management, before the admin UI is convenient:
-
-```bash
-python backend/scripts/manage.py users                       # who exists
-python backend/scripts/manage.py add-user sam@example.com --role author
-python backend/scripts/manage.py set-role sam@example.com admin
-```
-
-Passwords are never taken as command arguments — an argument lands in shell
-history and in the process list. Omit `--password` and one is generated and
-printed, or pass `--ask` to be prompted without echo.
-
-### Roles
-
-| Role | Can |
-|---|---|
-| `viewer` | See runs, use cases, batches and credential *names*. |
-| `operator` | The above, plus start runs, approve steps, run batches, save credentials. |
-| `author` | The above, plus create, edit, publish, repair and delete use cases. |
-| `admin` | Everything, plus manage accounts, read the audit log, and permit script steps. |
-
-Two authorities are deliberately admin-only. **Managing accounts** is obvious.
-**Permitting script steps** is less so: a `script` step runs arbitrary
-JavaScript inside a browser session that may be signed in with someone else's
-credentials, so the authority to write a use case and the authority to let it
-execute code are kept separate — an author cannot grant themselves the second
-by editing `allow_scripts` in the definition.
-
-Everything a role may do is enforced server-side. The frontend uses the same
-list only to decide which buttons to draw.
 
 ---
 
 ## Running it
 
-You need **two terminals**, both started from the repository root.
+Two terminals, both on your machine.
 
-### Terminal 1 — backend
-
-The backend is a flat module tree, so it must be started **from inside
-`backend/`** (that is what puts `main.py` on the import path).
-
-**Windows (PowerShell)**
-
-```powershell
-cd backend
-..\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
-
-**macOS / Linux**
+**Terminal 1 — the API**, from `backend/`:
 
 ```bash
-cd backend
-../.venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+../.venv/Scripts/python serve.py
 ```
 
-If you activated the virtualenv first (`.venv\Scripts\Activate.ps1` or
-`source .venv/bin/activate`), the shorter form works on either platform:
+That is uvicorn, port 8000, with reloading -- and with two Windows constraints
+resolved that cannot be resolved on the uvicorn command line at all.
+
+Playwright launches its driver as a subprocess through asyncio, and on Windows
+only a `ProactorEventLoop` can do that. uvicorn switches to a
+`SelectorEventLoop` whenever `--reload` is set, so `uvicorn main:app --reload` is
+the one command under which nothing can be recorded or replayed. But `--loop
+none` alone trades that for something worse: uvicorn's reloader binds the
+listening socket in the parent and hands it to the child, and on Windows an
+inherited socket cannot be registered with the child's IOCP. Every accept then
+fails with `[WinError 87] The parameter is incorrect` -- *after* "Application
+startup complete", so the server looks up and answers nothing.
+
+`serve.py` reloads a level up instead: `watchfiles` restarts the whole process,
+and each new process binds its own socket in the loop that will use it. Nothing
+is inherited and both constraints hold.
+
+`HOST`, `PORT` and `RELOAD` override the defaults:
 
 ```bash
-cd backend
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+PORT=8002 RELOAD=false ../.venv/Scripts/python serve.py
 ```
 
-Watch for these two lines in the JSON startup log — they mean the model and the
-browser are both wired up:
+If you do start uvicorn by hand, add `--loop none`. The API warns at startup when
+the loop cannot launch a browser, and says the same thing again in the error, so
+this is not a silent failure -- but it is an avoidable one.
 
-```json
-{"level":"INFO","message":"starting backend","llm_provider":"bedrock", ...}
-{"level":"INFO","message":"MCP server reachable","tool_count":24, ...}
-```
-
-### Terminal 2 — frontend
+Wait for `Application startup complete`. Check it:
 
 ```bash
-cd frontend
+curl http://127.0.0.1:8000/healthz
+```
+
+`"status": "ok"` means the database is reachable and Bedrock credentials
+resolved. `"degraded"` with a 503 tells you which of the two is unhappy.
+
+**Terminal 2 — the dashboard**, from `frontend/`:
+
+```bash
 npm run dev
 ```
 
-Then open **http://localhost:5173**.
+Then open <http://localhost:5173>.
 
-The Vite dev server proxies `/api` and `/healthz` (including the WebSocket
-upgrade) to the backend, so the frontend is same-origin and needs no API base
-URL, no CORS setup, and — importantly — holds no credentials of any kind.
+The dev server proxies `/api` and `/healthz` — WebSocket upgrade included — to
+the backend, so the two are same-origin from the browser's point of view and
+CORS never enters into it.
 
-Check the backend came up cleanly:
+It reads the **same `.env` the backend does**, so the port lives in one place. To
+move the API to 8002, set `PORT=8002` in `.env` and both follow; run uvicorn with
+`--port 8002` to match. `FRONTEND_PORT` moves the dashboard the same way.
 
-```bash
-curl http://localhost:8000/healthz
-```
+The API's first start prints a **one-time administrator password**. It is shown
+once and never again — only its bcrypt hash is stored. Sign in with it, then
+change it under your account.
 
-On PowerShell, `curl` is an alias for `Invoke-WebRequest`, which formats the
-output differently — use this instead:
+### Batches, and the worker
 
-```powershell
-Invoke-RestMethod http://localhost:8000/healthz | ConvertTo-Json -Depth 5
-```
+Batches run on a durable Postgres queue rather than in the request that started
+them, so a restart does not lose them. By default the API process also claims
+that work (`WORKER_ENABLED=true`), which is what makes a single-machine install
+work with nothing else running.
 
-`/healthz` reports the database, how Bedrock will authenticate (method, source,
-region — resolved locally, without calling AWS), and MCP connectivity from the
-probe run at startup. Add `?deep=1` to force a fresh
-connect (that spawns a real browser, so it is a manual check, not something to
-put in a healthcheck loop).
-
-### Running the MCP server yourself
-
-By default the backend spawns `npx @playwright/mcp@latest` per run over stdio.
-To run one shared server instead:
+To separate them, set `WORKER_ENABLED=false` on the API and run, from `backend/`:
 
 ```bash
-npx -y @playwright/mcp@latest --port 8931 --headless --isolated
-```
-
-and set in `.env`:
-
-```bash
-MCP_TRANSPORT=http
-MCP_SERVER_URL=http://localhost:8931/sse
+../.venv/Scripts/python -m worker
 ```
 
 ---
 
-## Writing a task: instruction and values
+## The workflow, end to end
 
-A run is described in two parts, and keeping them apart is what makes the
-recording reusable afterwards.
+### 1. Record
 
-**The instruction** says what to do, in words, and names no values:
+**Record** → give a starting URL → a real browser window opens.
 
-> Open the contact form, fill in every field from the values provided, and
-> submit it. Confirm the page shows a success message.
+Do the task once, by hand. Sign in, fill the form, submit it. Then **close the
+window** — that is how you finish. Nothing is sent to a model; your actions are
+captured directly.
 
-**The values** are named rows beneath it:
+### 2. Say what you typed
 
-| Name | Value | Secret |
-|---|---|---|
-| `full_name` | Nitin Asati | |
-| `work_email` | nitin@example.com | |
-| `password` | ●●●●●●●● | ✓ |
+The recording comes back with the values you typed. Name each one, and mark the
+login as a **credential**:
 
-### Why not just write it all in the prose
+- an **input** becomes a spreadsheet column — a different value per row;
+- a **credential** is stored encrypted, entered once per session rather than
+  once per row, and never written into the workflow itself.
 
-Because three things become impossible once the values are embedded in a
-sentence:
+That answer also decides the **setup/row split**: everything up to and including
+the last step that types a credential is per-session sign-in; the rest is
+per-row work. That is not pattern-matching on the word "login" — a credential is
+by definition the value a person supplies once.
 
-* **The password is in clear text.** The task string is stored on the run and
-  shown in the timeline. A credential pasted into it is a credential written
-  down.
-* **Nothing knows which words are parameters.** When the recording is turned
-  into a reusable use case, something has to decide that `Nitin Asati` varies
-  per record but `Submit` does not. Guessing is the wrong mechanism for
-  something you already know.
-* **You find out what the parameters are afterwards**, from whatever was
-  guessed, rather than declaring them.
+### 3. Review and publish
 
-Naming them fixes all three at once. `full_name` becomes the CSV column
-`full_name` — deterministically, by matching the value you supplied, with no
-model judgement involved.
+You get a **draft**. The split is a heuristic, the parameterisation is derived,
+and the assertions are whatever you happened to record — so a person publishes
+it. Drafts cannot run.
 
-### What "secret" changes
+The draft carries warnings worth reading. The loudest: *nothing verifies that a
+row succeeded*. Without an assertion, a batch of a thousand rows can fail
+silently on row 12 and report success on all of them.
 
-Marking a row secret changes its handling in three places:
+Lines the parser could not represent are listed rather than guessed at — a
+chained locator, an iframe, a file upload. It refuses instead of approximating,
+because the alternative is a step that clicks something *adjacent* on row one.
 
-1. **The model never sees the value.** It is shown `«secret:password»` and
-   types that; the real credential is substituted at the moment the tool call
-   reaches the browser. This matters more than redaction does, because the
-   message history is replayed to the model on every turn — a secret that
-   enters the conversation cannot be taken back out of it later.
-2. **Nothing persists it.** Not the task, not the run options, not an event.
-   The recording contains the placeholder, so the use case can still be
-   parameterised without the value ever being stored.
-3. **The use case gets a credential slot**, not an input column — so the
-   operator running a thousand records binds one stored login instead of
-   putting a password in a spreadsheet.
+### 4. Upload data and confirm the mapping
 
-Redaction still runs as a second line of defence: the model is never given the
-credential, but a *page* can echo one back into a tool result, and that path
-still needs cleaning.
+Upload a CSV, Excel file or delimited text. It is parsed with pandas, profiled
+(type, blanks, distinct values, examples) and stored.
 
-### Screenshots, and what gets photographed when
+Then confirm which column fills which field. Most of this is not a language
+problem — exact names, token overlap, type compatibility, value shape — so a
+well-named file maps for **zero tokens**, and the model is a fallback for what
+stays ambiguous rather than the mechanism.
 
-Two different things, often confused:
+You confirm every mapping regardless. A mapping that is wrong and unreviewed
+does not fail; it succeeds a thousand times into the wrong fields.
 
-* **Recording** a use case screenshots every step, controlled by
-  `AGENT_SCREENSHOT_EVERY_STEP`. This is what fills the timeline while you
-  watch the agent work.
-* **Running** a use case is separate, and controlled by `REPLAY_SCREENSHOTS`.
-  It used to capture nothing unless a step failed, which meant a *successful*
-  batch — the overwhelming majority — left no visual record at all.
+Values are never coerced on the way in. `0071` stays `0071`, a date stays the
+text you wrote — a reader that helpfully parses those produces a thousand wrong
+records and no error.
 
-| `REPLAY_SCREENSHOTS` | Captures | Use it when |
-|---|---|---|
-| `off` | nothing | throughput matters more than evidence |
-| `failure` | only where a step failed | the old behaviour |
-| `final` *(default)* | one per row, showing the end state | you want to audit what happened |
-| `every_step` | everything | troubleshooting one broken use case |
+### 5. Run it
 
-`final` is the default because it answers "what actually happened to record
-700" at one image per row. `every_step` multiplies that by the step count,
-which over a thousand rows is gigabytes — point `STORAGE_BACKEND` at S3 before
-choosing it for a large batch.
+One row, or the whole file. Rows run in sequence on **one shared browser
+session**, so the workflow signs in once. The recovery rules:
 
-**Headless makes no difference.** Screenshots work identically with no visible
-window; nothing in the capture path consults the setting. If images are
-missing, it is the mode above, not headless.
+1. A failed row never aborts the batch by itself.
+2. `row_reset` runs before every row.
+3. If the session looks logged out between rows, setup re-runs **once**.
+4. If that fails, stop. Remaining rows stay `pending`, never `failed` — they
+   were not attempted, and saying otherwise would corrupt the results file.
+5. Abort after N consecutive failures. Ten minutes of a broken selector failing
+   400 rows is worse than stopping and telling someone.
 
-### What happens to the credentials afterwards
+### 6. Look at what happened
 
-They are held in the backend's memory for the life of the recording, and
-nowhere else. When you press **Record as use case** you are asked once:
+**Timeline** streams the run live. **Compare with last run** is the finished
+article: every step as a row, with this run's screenshot beside the one from the
+last run that worked, and a pixel-difference ratio.
 
-* **Save them as …** — sealed into the encrypted vault under a name, reusable
-  by any use case in the workspace needing the same slots.
-* **Discard them** — forgotten immediately.
+It opens on the **first divergence** — the first step that failed or moved more
+than a couple of percent — because "scroll until something looks wrong" is not a
+workflow when a batch produces tens of thousands of steps.
 
-There is no third option, and doing nothing is discarding: a restart, or half
-an hour's inactivity, drops them. That is deliberate. The common case is a
-recording you throw away, and the alternative design — writing them down and
-deleting them if unwanted — puts a password in durable storage every time you
-experiment.
+The ratio is shown in words, and is not a verdict: a rendered clock changes a
+few pixels and means nothing; a form that silently failed to submit can change
+very few and mean everything.
+
+> The baseline is the last **successful** run, not the recording. Codegen owns
+> the browser during recording and we never see its pages, so there are no
+> screenshots from that moment. "What changed since it last worked" is the more
+> useful question anyway.
+
+### 7. When a site changes
+
+Sites get redesigned and locators stop matching. If healing is on
+(`REPLAY_HEALING_ENABLED=true`), the model is shown the controls that are on the
+page **now** and asked which one the step meant — it picks by index, so it
+cannot invent a selector. A confident repair is applied, the row continues, and
+the fix is written back as a new use case version.
+
+Confirmed fixes are remembered against that site. The next time something breaks
+there, past fixes go into the prompt as evidence — so one redesign costs one
+model call across every workflow that hits it, rather than one per workflow.
+
+When the model is not confident enough, the step fails and the trail offers a
+box: *do you know what changed?* One sentence from you is stored as a
+human-confirmed fix, and it outranks anything the model worked out alone.
+
+**Learned** shows everything remembered, and lets you forget any of it. That
+matters: a fix that was right last month and wrong now does not fail loudly — it
+gets recalled as precedent and quietly makes the next repair worse.
 
 ---
 
-## Walkthrough: one task, start to finish
+## Signing in and roles
 
-The example below uses `example.com` because it is in the default allowlist and
-safe to hit. Swap in your own QA environment for something more interesting.
+Local accounts with bcrypt hashes and bearer tokens. No SSO, by decision;
+`auth/rbac.py` is free of HTTP and storage, so an OIDC provider would replace
+how identity is *established* without touching what it *permits*.
 
-**1. Compose the task.** In the dashboard, fill in:
-
-| Field | Value |
+| Role | Can |
 |---|---|
-| Task | `Report the page heading and the destination of every link on the page. Return the links as JSON with fields "text" and "href".` |
-| Starting URL | `https://example.com` |
-| Allowed domains | `example.com, *.example.com` |
-| Max steps | `10` |
-| Require approval | checked |
+| **viewer** | Read runs, use cases and results. Change nothing. |
+| **operator** | Run things: execute, batch, cancel, save credentials. |
+| **author** | All that, plus record, publish, repair and delete use cases. |
+| **admin** | Everything, plus managing accounts, reading the audit log, and enabling script steps. |
 
-Or over the API:
+Script execution is deliberately not an author's to grant. A `script` step runs
+arbitrary JavaScript in a session that may be signed in, so the authority to
+*write* a use case and the authority to let it *run code* are different
+authorities.
 
-```bash
-curl -X POST http://localhost:8000/api/runs \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "task": "Report the page heading and the destination of every link on the page. Return the links as JSON with fields \"text\" and \"href\".",
-        "start_url": "https://example.com",
-        "allowed_domains": ["example.com", "*.example.com"],
-        "max_steps": 10
-      }'
-```
-
-```json
-{ "run_id": "9f2c1a7e4b6d40f1a2c3d4e5f60718293", "status": "pending" }
-```
-
-**2. Watch it run.** The dashboard switches to the live view. On the left, a
-step-by-step timeline; on the right, the current screenshot and the result
-panel. You will see roughly this sequence of events:
-
-```
-seq 1  run_started      42 tools discovered from the MCP server
-seq 2  tool_call        browser_navigate  url=https://example.com
-seq 3  tool_result      ok  (312ms)
-seq 4  screenshot       step 0
-seq 5  thinking         "I have the page open. Let me take a snapshot to read
-                         the heading and enumerate the links..."   (streams in)
-seq 6  tool_call        browser_snapshot
-seq 7  tool_result      ok  (88ms)   - heading "Example Domain", link "More information..."
-seq 8  screenshot       step 1
-seq 9  thinking         "The page has one heading and one link. I have what I need."
-seq 10 run_finished     succeeded  2 steps / 6.4s
-```
-
-**3. Read the result.** The result panel shows the prose answer and, when the
-task asked for structured data, the JSON block the agent produced:
-
-```json
-{
-  "heading": "Example Domain",
-  "links": [
-    { "text": "More information...", "href": "https://www.iana.org/domains/example" }
-  ]
-}
-```
-
-The **Copy JSON** button puts exactly that on your clipboard.
-
-**4. Come back later.** Open **History**, filter by status, and click any run to
-replay its events step by step — including every screenshot. History survives a
-backend restart because runs, events and artifacts are all in SQLite.
-
-### What an approval looks like
-
-If the agent proposes something sensitive — submitting a form, typing into a
-password field, clicking "Place order", or navigating off the allowlist — the
-loop **pauses** and an approval bar appears at the top of the run view with the
-exact tool name and arguments:
-
-```
-Approval required before the agent continues
-the action appears to submit a form; the arguments mention payment or checkout
-
-browser_click
-{ "element": "Place order button", "ref": "e42" }
-
-[ Approve and continue ]  [ Reject ]        auto-rejects in 4m 51s
-```
-
-It is a blocking bar, not a modal, on purpose: a dialog that can be dismissed
-by a stray click is the wrong affordance for something holding a browser
-session open. Nothing happens until you answer or the timer expires — an
-expired request is treated as a rejection, and the agent is told so and asked
-to continue another way.
+Every workspace is a hard tenant boundary. Scoped operations live on
+`WorkspaceStore`, not `Store`: forgetting the tenant filter is not possible,
+because the scoped object has no method that can reach another tenant's row.
 
 ---
 
 ## Environment variables
 
-All of these live in `.env` and are read **by the backend only**. See
-[.env.example](.env.example) for the annotated version.
+Every setting is documented in [`.env.example`](.env.example), which is checked
+against the settings model by a test — so it cannot drift. The ones you are most
+likely to touch:
 
-### LLM
-
-| Variable | Default | Notes |
-|---|---|---|
-| `LLM_PROVIDER` | `bedrock` | `bedrock` (AWS credentials) or `anthropic` (API key). |
-| `LLM_MODEL` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | See the model-ID note below — the prefix is not optional. |
-| `LLM_MAX_TOKENS` | `4096` | Per turn. |
-| `LLM_TEMPERATURE` | `0.0` | Deterministic tool selection is what you want here. |
-| `ANTHROPIC_API_KEY` | — | Only when `LLM_PROVIDER=anthropic`. Never sent to the frontend. |
-
-### Amazon Bedrock
+### The model
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BEDROCK_API` | `invoke` | `invoke` = `bedrock-runtime`, version-suffixed IDs. `mantle` = newer Messages-API endpoint, short `anthropic.claude-haiku-4-5` IDs. |
-| `AWS_REGION` | unset | Optional. Unset, the AWS SDK resolves it (env → `~/.aws/config` → instance metadata). |
-| `AWS_PROFILE` | unset | Optional. Unset, the default credential chain is used. |
+| `LLM_REPAIR_MODEL` | a Claude inference profile | The only model role left. |
+| `AWS_REGION`, `AWS_PROFILE` | unset | Usually best left to the credential chain. |
 
-**Model IDs on Bedrock are not the plain aliases.** Current Claude models are
-offered only through *cross-region inference profiles*, so the ID carries a
-region prefix. Invoking the bare foundation-model ID fails:
-
-```
-Invocation of model ID anthropic.claude-haiku-4-5-20251001-v1:0 with
-on-demand throughput isn't supported. Retry your request with the ID or ARN
-of an inference profile that contains this model.
-```
-
-| Scope | Model ID |
-|---|---|
-| US | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| EU | `eu.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| APAC | `apac.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| Global | `global.anthropic.claude-haiku-4-5-20251001-v1:0` |
-
-List what your own account actually has enabled:
-
-```bash
-aws bedrock list-inference-profiles --region us-east-1
-```
-
-With `BEDROCK_API=mantle` the short form is used instead
-(`LLM_MODEL=anthropic.claude-haiku-4-5`) — that endpoint resolves the profile
-itself.
-
-> **`AWS_BEARER_TOKEN_BEDROCK` silently wins.** If that variable is set, the SDK
-> authenticates with it (a Bedrock API key) *instead of* your IAM identity, and
-> hard-fails if `AWS_PROFILE` is also set:
-> `ValueError: Cannot specify both `api_key` and AWS credentials`. `/healthz`
-> shows which method is actually in use; unset the variable to force IAM.
-
-### Playwright MCP
+### Browser and recording
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | `stdio` (backend spawns it) or `http`. |
-| `MCP_NPX_PACKAGE` | `@playwright/mcp@latest` | Pin a version for reproducibility. |
-| `MCP_BROWSER` | `chromium` | Also `firefox`, `webkit`, `msedge`. |
-| `MCP_HEADLESS` | `true` | Per-run overridable from the composer. |
-| `MCP_ISOLATED` | `true` | Fresh profile per session; no state leaks between runs. |
-| `MCP_STORAGE_STATE` | unset | Path to a saved cookies/localStorage JSON, for pre-authenticated runs. |
-| `MCP_EXTRA_ARGS` | unset | Raw flags passed through, e.g. `--viewport-size=1280,800`. |
-| `MCP_SERVER_URL` | `http://localhost:8931/sse` | Used when `MCP_TRANSPORT=http`. |
-| `MCP_HANDSHAKE_TIMEOUT` | `45` | Seconds to wait for `initialize`. Raise on a cold npm cache. |
-| `MCP_TOOL_TIMEOUT` | `60` | Seconds any one browser tool call may take. |
+| `BROWSER_ENGINE` | `chromium` | `firefox` and `webkit` also work. |
+| `BROWSER_HEADLESS` | `true` | A single run can ask for a window per request. |
+| `BROWSER_TRACE` | `false` | A Playwright trace per execution, kept as an artifact. |
+| `RECORDER_ENABLED` | `true` | Set `false` where there is no display. |
+| `RECORDER_COMMAND` | blank | Blank runs the Playwright installed here. |
 
-### Agent guardrails
+### Replay and healing
 
 | Variable | Default | Notes |
 |---|---|---|
-| `AGENT_MAX_STEPS` | `30` | Hard ceiling on loop iterations. |
-| `AGENT_TIMEOUT_SECONDS` | `300` | Wall clock, covering LLM and tool calls. |
-| `AGENT_ALLOWED_DOMAINS` | `example.com,*.example.com` | Comma separated. `*` disables the check — see [Responsible use](#responsible-use). |
-| `AGENT_REQUIRE_APPROVAL` | `true` | Human-in-the-loop for sensitive actions. |
-| `AGENT_APPROVAL_TIMEOUT_SECONDS` | `300` | Unanswered requests auto-reject. |
-| `AGENT_SCREENSHOT_EVERY_STEP` | `true` | Dashboard only; screenshots never reach the model. |
+| `REPLAY_SCREENSHOTS` | `final` | `off`, `failure`, `final`, `every_step`. |
+| `REPLAY_FAILURE_STREAK_LIMIT` | `5` | Consecutive failures before the batch stops. |
+| `REPLAY_HEALING_ENABLED` | `false` | **Off by default: this is the one thing that spends tokens.** |
+| `HEALING_MEMORY_ENABLED` | `true` | Needs pgvector. |
+| `EMBEDDING_BACKEND` | `bedrock` | `hash` is a deterministic stand-in with no AWS. |
 
-### Database
+### Everything else
 
-| Variable | Default | Notes |
-|---|---|---|
-| `DB_HOST` / `DB_PORT` | `localhost` / `5432` | |
-| `DB_NAME` / `DB_USER` / `DB_PASSWORD` | `postgres` / `postgres` / — | Separate parts, not a URL: a password containing `@`, `:` or `/` cannot be safely interpolated into one. |
-| `DB_SCHEMA` | `browser` | A named schema, so this app can share a database. Read when the models are imported, so it must be set in the environment rather than passed at runtime. |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `5` | Keep `(size + overflow) × workers` under the server's `max_connections`. |
-| `DB_POOL_RECYCLE` | `1800` | Below any proxy idle timeout, or a pooled connection becomes a mystery 500 hours later. |
-| `CHECKPOINT_ENABLED` | `true` | LangGraph state, so a run in flight survives a restart. |
-| `CHECKPOINT_PATH` | `./data/checkpoints.sqlite` | Only used where the Postgres checkpointer cannot run — see `backend/checkpoints.py`. |
+`DB_*` (note **`DB_SCHEMA`**, below), `WORKER_*`, `STORAGE_BACKEND` and `S3_*`,
+`AUTH_*`, `BOOTSTRAP_*`, `LOG_*`, `CORS_ORIGINS`.
 
-### Authentication
-
-| Variable | Default | Notes |
-|---|---|---|
-| `AUTH_SESSION_TTL_HOURS` | `12` | Sessions are opaque tokens hashed at rest; there is no signing secret. |
-| `AUTH_BCRYPT_ROUNDS` | `12` | ~250 ms per login. Lower only in tests. |
-| `BOOTSTRAP_ADMIN_EMAIL` | `admin@localhost` | Created only when the database holds no users at all. |
-| `BOOTSTRAP_ADMIN_PASSWORD` | unset | Blank generates one and prints it once to the log. |
-| `BOOTSTRAP_WORKSPACE_NAME` | `Default` | |
-
-### Server
-
-| Variable | Default |
-|---|---|
-| `HOST` / `PORT` | `0.0.0.0` / `8000` |
-| `ARTIFACTS_DIR` | `./artifacts` |
-| `LOG_LEVEL` | `INFO` |
-| `CORS_ORIGINS` | `http://localhost:5173` |
-| `VITE_API_BASE` | unset (same-origin via proxy) — frontend build-time only, contains no secrets |
+> **`DB_SCHEMA` is special.** SQLAlchemy binds the schema into the model
+> metadata when the model classes are imported, before any settings object
+> exists. It is read from the environment first and `.env` second, and the
+> application refuses to start if the two disagree — because the alternative
+> failure is silent and awful: tables created in one schema while queries read
+> another.
 
 ---
 
-## The event schema
+## The API
 
-One discriminated union, defined once in [`backend/events.py`](backend/events.py)
-and mirrored in [`frontend/src/lib/events.ts`](frontend/src/lib/events.ts).
-`tests/test_events.py` fails if the two drift apart.
+Bearer token on every route except `/healthz` and `/api/auth/login`.
 
-| `type` | Meaning |
+| Area | Endpoints |
 |---|---|
-| `run_started` | Run began; carries the tool list discovered from the MCP server. |
-| `thinking` | Assistant prose. Streams: the same `seq` is re-sent as text grows. |
-| `tool_call` | A tool is about to be invoked, with its arguments and sensitivity. |
-| `tool_result` | Its outcome — ok/error, duration, output text, retry count. |
-| `screenshot` | An image artifact was captured for the dashboard. |
-| `approval_required` | The loop is paused, waiting for a human. |
-| `approval_resolved` | Approved, rejected, or timed out. |
-| `error` | Something failed. `recoverable` says whether the run continued. |
-| `run_finished` | Terminal. Carries status, steps, duration, and the result. |
+| **Recording** | `POST /api/recordings`, `GET /api/recordings/{id}`, `POST /api/recordings/{id}/save`, `/cancel`, `DELETE` |
+| **Use cases** | `GET/PUT/PATCH/DELETE /api/usecases/{id}`, `/publish`, `/repair`, `/scripts`, `/activity` |
+| **Data** | `POST /api/datasets` (multipart), `GET /api/datasets`, `POST /api/usecases/{id}/mapping` |
+| **Running** | `POST /api/usecases/{id}/execute`, `/batch`, `GET /api/batches/{id}`, `/resume`, `/cancel`, `/results.csv` |
+| **Watching** | `GET /api/runs/{id}`, `/events`, `/steps`, `WS /api/runs/{id}/stream`, `GET /api/artifacts/{id}` |
+| **Learning** | `GET/POST /api/memory`, `DELETE /api/memory/{id}` |
+| **Admin** | `/api/auth/*`, `/api/admin/users`, `/api/admin/audit`, `/api/credentials` |
 
-Two details worth knowing:
+**Every event has a sequence number**, and that number is the resume token: a
+dashboard that reconnects sends the highest `seq` it saw and the backend replays
+exactly what was missed. No server-side session state, no lost steps.
 
-- **`thinking` events are upserted on `seq`.** A streaming prose block occupies
-  exactly one sequence number no matter how many deltas arrive, so the timeline
-  grows in place instead of appending a bubble per token, and a replay after
-  reconnect yields one complete block.
-- **The WebSocket also carries heartbeat frames** (`{"type": "__heartbeat__"}`)
-  to keep idle proxies from closing the socket. Anything whose `type` starts
-  with `__` is a transport frame, not an agent event; the client drops them.
-
-### API
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/runs` | Start a run. |
-| `GET` | `/api/runs` | History, `?status=&limit=&offset=`. |
-| `GET` | `/api/runs/{id}` | Detail, including any pending approval. |
-| `GET` | `/api/runs/{id}/events` | Full event history, `?after_seq=`. |
-| `POST` | `/api/runs/{id}/cancel` | Cancel an in-flight run. |
-| `POST` | `/api/runs/{id}/approve` | `{"decision": "approve"\|"reject", "approval_id": "..."}`. |
-| `WS` | `/api/runs/{id}/stream` | Live events, `?after_seq=` to resume. |
-| `GET` | `/api/artifacts/{id}` | A screenshot. |
-| `GET` | `/healthz` | Liveness + MCP connectivity. |
-| `GET` | `/api/config` | Defaults for the composer. No secrets. |
-
-Interactive docs at **http://localhost:8000/docs**.
+Interactive docs at <http://localhost:8000/docs>.
 
 ---
 
 ## Guardrails
 
-Enforced in the loop, not left to the model's judgement:
+**The domain allowlist applies to every navigation.** A use case carries the
+domains its recording visited, and a row whose input URL leaves them is refused.
+This matters more than it sounds: a workflow whose input is a URL column takes
+that URL from a spreadsheet, and a spreadsheet is untrusted input.
 
-- **Step ceiling** — a hard cap on iterations.
-- **Wall-clock deadline** — covers LLM calls and tool calls; the remaining
-  budget is passed down as each call's timeout.
-- **Domain allowlist** — checked before *every* tool call, not just navigation
-  tools, by scanning all arguments for anything URL-shaped. Deny by default: an
-  empty list blocks everything. `*.example.com` matches subdomains **and** the
-  apex; `example.com` matches only the exact host.
-- **Loop breaking** — three identical consecutive actions get a nudge fed back
-  as a tool error; five aborts the run.
-- **Retries with backoff** — transient browser failures are retried up to three
-  times. Three consecutive transport failures are treated as a dead MCP server:
-  the run is failed cleanly rather than hanging.
-- **Context bounds** — tool output is truncated before it reaches the model, and
-  old history is trimmed in whole assistant/tool-result pairs so no `tool_use`
-  block is ever orphaned.
-- **Human approval** — see below.
+**Secrets never reach the event log.** Values are registered with a redactor
+before anything is emitted, so a credential cannot leak even if a page echoes it
+back. Batches take a stored credential id, never inline values — the worker that
+runs them may be a different process, and carrying values would mean writing a
+password into a table that a batch listing reads.
 
-### Sensitivity policy
+**A recorded script is data, never code.** Codegen output is parsed with `ast`
+and never executed, `eval`'d or imported.
 
-All classification lives in [`backend/policy.py`](backend/policy.py) — regexes
-and tool-name fragments at the top of the file. Tune it there; the agent loop
-never needs to change. Actions are flagged when they involve:
+**Script steps are refused twice over.** A `script` step runs arbitrary
+JavaScript in a session that may be signed in, so both the use case's own
+`allow_scripts` *and* a separate admin-only flag on the resource must agree. An
+author cannot grant themselves code execution by editing JSON.
 
-`form_submit` · `credentials` · `payment` · `destructive` · `off_allowlist` ·
-`code_execution` · `file_upload` · `dialog`
-
-The allowlist and the approval gate interact deliberately: with approvals
-**enabled**, off-allowlist navigation becomes an approval request a human can
-override — that is what human-in-the-loop is for. With approvals **disabled**,
-it is a hard refusal with no way around it.
-
----
-
-## Customising the prompts
-
-**Every string sent to the model lives in `backend/prompts/` as a Markdown
-file**, not inline in Python. Prompt wording is the part of an agent that gets
-tuned most often, so it is kept where it can be read and edited without
-touching the loop, and where a change shows up in review as a prose diff.
-
-| File | Sent when |
-|---|---|
-| `system.md` | Every turn, as the system prompt. Contains the injection defence. |
-| `task.md` | The first user turn: the operator's task, allowlist, and budgets. |
-| `loop_nudge.md` | The agent repeated an identical action three times. |
-| `approval_rejected.md` | A human rejected a sensitive action (or let it time out). |
-| `navigation_blocked.md` | A tool call tried to leave the domain allowlist. |
-| `empty_tool_result.md` | A tool returned no output at all. |
-
-Placeholders use `$name` (`string.Template`), **not** `{name}`, because prompts
-routinely contain `{` and `}` in JSON examples that `str.format` would try to
-interpret. A literal `$` in a prompt must be written `$$`.
-
-Substitution is strict — a placeholder with no supplied value raises rather
-than sending a raw `$task` to the model. Values are inserted verbatim and never
-re-scanned, so a `$` inside an operator's task text cannot reach back into the
-template.
-
-Editing is just editing the file; nothing needs recompiling:
-
-```bash
-# edit backend/prompts/system.md, then:
-cd backend
-../.venv/bin/python -m pytest tests/test_prompts.py -q
-```
-
-`tests/test_prompts.py` guards the parts that must not drift: that every prompt
-the code asks for exists, that each file's `$placeholders` match what the code
-actually supplies, and that the prompt-injection rules are still present in
-`system.md`. If you rename or add a prompt, update `REQUIRED_PROMPTS` in
-[`backend/prompt_loader.py`](backend/prompt_loader.py).
-
----
-
-## Prompt injection from web pages
-
-**Page content is data, never instructions.** A page the agent visits can
-contain text aimed at the model — in visible copy, alt text, hidden elements,
-HTML comments, URLs, or search results — telling it to ignore its task, visit
-another site, reveal its prompt, or enter credentials.
-
-Three layers of defence, because none of them is sufficient alone:
-
-1. **System prompt.** An explicit, prominent rule that page text is untrusted
-   data, that no page content can change the task or grant permission, and that
-   a suspected injection should be named in the agent's reasoning and then
-   ignored. See the SECURITY section of
-   [`backend/prompts/system.md`](backend/prompts/system.md) — and note that
-   `tests/test_prompts.py` fails if those rules are edited out.
-2. **The domain allowlist.** Enforced in code, before the call reaches the
-   browser. Even a fully compromised model cannot navigate somewhere the
-   operator did not allow.
-3. **Human approval.** The actions an injection would most want — submitting
-   forms, entering credentials, payments, deletions — are exactly the ones that
-   pause for a person.
-
-`backend/tests/fixtures/index.html` contains a real injection payload, and
-`test_page_content_cannot_send_the_agent_off_the_allowlist` proves layer 2
-holds even when the model is scripted to obey it.
-
-This is defence in depth, not a guarantee. Do not point this at untrusted sites
-while logged into anything that matters.
-
----
-
-## Design decisions and trade-offs
-
-Each of these could reasonably have gone the other way:
-
-- **stdio transport by default, HTTP optional.** stdio makes the browser a
-  child process of the backend, so its lifetime is bounded by ours and a
-  crashed backend cannot leak a browser. HTTP/SSE is there for when the browser
-  must live elsewhere — then lifetime management becomes your problem.
-- **SQLite, not Postgres.** A single-node control plane with modest write
-  volume and history that must survive a restart. No extra service to run, so
-  clone-to-first-run stays short. `Store` is small enough that a Postgres
-  implementation is a drop-in when you want replicas sharing history.
-- **Snapshot-first observation, screenshots second.** The accessibility tree is
-  far cheaper than an image and its element refs are stable enough to click
-  reliably. Screenshots are captured for the human and are never appended to
-  the model's history. Vision-first would cost more per step and hand the model
-  coordinates it cannot act on.
-- **Tools discovered at runtime, never hardcoded.** The LLM tool schema is
-  generated from the MCP server's own `list_tools()` response, so a new
-  Playwright MCP release that adds or renames tools needs no code change. The
-  few tools the runner calls itself (navigate, screenshot) are looked up by
-  name with substring fallback and degrade to a no-op if absent.
-- **One MCP session per run.** Simple lifetimes and no cross-run state leakage,
-  at the cost of browser startup per run. A pooled session would be faster and
-  much harder to reason about when a run is cancelled mid-click.
-- **Sequence numbers over server-side subscriptions.** Reconnection is lossless
-  with no session state to manage, and the same code path replays a finished
-  run as streams a live one.
-- **An in-memory event bus.** One backend process. Swap `EventBus` for Redis
-  pub/sub when you scale out.
-- **Bedrock by default, behind a protocol.** `LLMClient` in
-  [`backend/llm.py`](backend/llm.py) is a `Protocol`, and the two providers
-  share one streaming implementation — they differ only in how the client is
-  built and authenticated. Bedrock is the default because it needs no API key:
-  the same build runs on a laptop with `~/.aws` and under an IAM role in
-  production, which is what makes this deployable inside an existing AWS
-  account without a new secret to distribute.
-- **Credentials resolved by the AWS chain, never passed explicitly.** The code
-  passes region and profile only when they are configured. Passing nothing lets
-  the SDK do its own resolution, which is precisely what makes instance and
-  task roles work with zero configuration — hardcoding a profile would break
-  exactly the production path you want.
-- **`invoke` over `mantle` as the default endpoint.** `bedrock-runtime` is what
-  this account's inference profiles are published for and what was verified
-  end to end; `mantle` is the newer Messages-API endpoint and is one setting
-  away when you want it.
+**The model cannot invent a locator.** Healing and repair both present a
+numbered list of controls actually on the page and take back an index. A
+hallucinated selector has no route into something that runs unattended.
 
 ---
 
 ## Tests
 
-**Windows (PowerShell)**
-
-```powershell
-cd backend
-..\.venv\Scripts\python.exe -m pytest -q
+```bash
+cd backend && ../.venv/Scripts/python -m pytest -q
 ```
 
-**macOS / Linux**
+**655 tests: 644 run by default, 11 are skipped** because they need a real
+browser (below). They want a running PostgreSQL and use their own schema
+(`browser_test`), so they never touch your development data. Nothing in the
+default run calls AWS or opens a browser.
+
+The real-browser tests are opt-in, because they launch Chromium:
 
 ```bash
-cd backend
-../.venv/bin/python -m pytest -q
+cd backend && RUN_E2E=1 ../.venv/Scripts/python -m pytest -q -m e2e
 ```
 
-154 tests, no browser, no network, no model calls:
-
-| File | Covers |
-|---|---|
-| `test_agent_loop.py` | The loop against a fake MCP session and a scripted LLM: happy path, step and time budgets, loop detection, approvals (approve/reject/timeout), retries, dead-session handling, truncation, history trimming, cancellation. |
-| `test_events.py` | Every event type round-trips through JSON, and the TypeScript mirror is in sync. |
-| `test_policy.py` | Allowlist matching (including look-alike hosts and non-http schemes) and sensitivity classification. |
-| `test_store.py` | Persistence, replay by `seq`, `thinking` upserts, artifacts, restart recovery. |
-| `test_prompts.py` | The prompt files: all present, no orphans, placeholders match the call sites, strict substitution, user text not re-scanned, and the injection defence still in `system.md`. |
-| `test_llm_bedrock.py` | Provider wiring: AWS credential resolution (offline), the bearer-token/profile conflict, endpoint and region selection, model-ID shape, and that no secret leaks into health output. |
-| `test_api.py` | The real FastAPI app end to end (lifespan included) against a fake MCP session: run lifecycle, event replay by `seq`, WebSocket resume, approval approve/reject/conflict, cancellation, artifact serving. |
-
-The end-to-end test spawns a real MCP server and a real Chromium against a
-static page served by the harness, and is opt-in:
-
-**Windows (PowerShell)**
-
-```powershell
-cd backend
-$env:RUN_E2E = "1"
-..\.venv\Scripts\python.exe -m pytest -q -m e2e
-```
-
-**macOS / Linux**
-
-```bash
-cd backend
-RUN_E2E=1 ../.venv/bin/python -m pytest -q -m e2e
-```
+Those eleven are worth knowing about. They serve a two-page site from a temp
+directory, record a codegen script against it, parse it, and replay it — nothing
+stubbed. They check parameterisation per row, the setup/row split, locator
+drift, assertions, extraction, screenshots, traces and the allowlist. Writing
+them found three things the design document had asserted and should not have.
 
 Frontend:
 
@@ -978,274 +611,137 @@ cd frontend && npm run typecheck && npm run build
 
 ---
 
-## Troubleshooting
+## Deployment
 
-### `npm error Invalid name: ".tools"`
+Nothing above needs any of this — the local setup is the whole product, and a
+single machine runs batches perfectly well.
 
-`npm init -y` names the package after the current directory, and npm package
-names cannot start with a dot. Skip `npm init` and write the file directly:
+**Docker**, if you would rather not install Postgres: `docker compose up --build`
+brings up Postgres-with-pgvector, the backend and the dashboard together.
+Recording does not work there — a codegen window needs a display and a container
+has none.
 
-```powershell
-Set-Content -Path package.json -Encoding ascii -Value '{ "name": "playwright-tools", "private": true }'
-```
-```bash
-echo '{ "name": "playwright-tools", "private": true }' > package.json
-```
+For EKS, see [`deploy/README.md`](deploy/README.md): the API behind an ALB,
+workers scaled from zero by KEDA on queue depth, Aurora with pgvector, artifacts
+in S3. **Recording is disabled there** — a codegen window needs a display, so
+workflows are recorded on a laptop and run anywhere.
 
-Do not simply skip the `package.json` — with none present, `npm install`
-reports `up to date`, creates no `node_modules`, and installs nothing. A
-following `npx playwright --version` can still print a plausible version from
-the npx cache, so the failure looks like success. Verify with
-`node -p "require('./node_modules/playwright/package.json').version"`.
-
-### `Browser "chrome-for-testing" is not installed` / `Executable doesn't exist at ...`
-
-The MCP server started fine, but the browser binary it wants is not on disk.
-Every tool call comes back as an error like:
-
-```
-### Error
-Error: Browser "chrome-for-testing" is not installed; expected executable at ...
-```
-
-The trap: **`npx playwright@latest install chromium` is not necessarily the
-right command.** `@playwright/mcp` bundles its own Playwright, which can be a
-newer (or older) version than `playwright@latest` resolves to, and it looks for
-a different browser revision — sometimes under a different name. Installing
-"the latest chromium" leaves you with a directory full of browsers and a server
-that still cannot find one.
-
-Install the MCP package first, so `npx playwright` resolves to *its* Playwright:
-
-```bash
-mkdir -p .tools && cd .tools && npm init -y && npm install @playwright/mcp@latest
-npx playwright install chromium
-```
-
-Check which version you are about to use with `npx playwright --version` from
-inside `.tools` — it should match the Playwright bundled in `@playwright/mcp`,
-not whatever `playwright@latest` currently resolves to.
-
-On Linux you may also need the system libraries:
-
-```bash
-npx playwright install --with-deps chromium
-```
-
-Pinning `MCP_NPX_PACKAGE=@playwright/mcp@<version>` instead of `@latest` makes
-this stop moving underneath you.
-
-### `MCP handshake timeout` / `Timed out waiting for the MCP initialize handshake`
-
-The error message includes the MCP server's stderr — read it first, it usually
-says exactly what went wrong. Common causes:
-
-- **Cold npm cache.** The very first run downloads `@playwright/mcp`, which can
-  exceed the 45-second default. Pre-warm it, or raise the timeout:
-  ```bash
-  npx -y @playwright/mcp@latest --help
-  ```
-  ```bash
-  MCP_HANDSHAKE_TIMEOUT=120
-  ```
-- **`npx` not on PATH for the backend process.** The backend resolves `npx` with
-  `shutil.which`; if it comes up empty on Windows it falls back to a bare `npx`,
-  which `CreateProcess` cannot find. Check `GET /healthz` — it shows the exact
-  argv being spawned.
-- **A bad flag in `MCP_EXTRA_ARGS`.** The server exits immediately; its stderr
-  will say which flag.
-- **`MCP_TRANSPORT=http` with nothing listening.** Start the server yourself
-  with `npx -y @playwright/mcp@latest --port 8931 --headless --isolated`, and
-  remember the SSE endpoint needs the `/sse` suffix.
-
-### Node version mismatch
-
-`@playwright/mcp` needs Node 18+, and Vite 5 needs Node 20+. Symptoms are
-`SyntaxError: Unexpected token '??='`, `ERR_UNSUPPORTED_ESM_URL_SCHEME`, or npm
-refusing to install with `EBADENGINE`.
-
-```bash
-node --version    # must be >= 20
-```
-
-Use [nvm](https://github.com/nvm-sh/nvm) or
-[nvm-windows](https://github.com/coreybutler/nvm-windows) to switch. If you run
-the backend from a GUI launcher or a service manager, check that *it* sees the
-same Node as your shell — a per-user nvm shim usually will not be on a service's
-PATH.
-
-### The run starts and immediately fails with an allowlist error
-
-The default allowlist is `example.com,*.example.com`. Add the host you actually
-want in the composer's **Allowed domains** field or in `AGENT_ALLOWED_DOMAINS`.
-Note that `example.com` does **not** match `www.example.com` — use
-`*.example.com` for subdomains.
-
-### `on-demand throughput isn't supported` (Bedrock)
-
-```
-Invocation of model ID anthropic.claude-haiku-4-5-20251001-v1:0 with
-on-demand throughput isn't supported. Retry your request with the ID or ARN
-of an inference profile that contains this model.
-```
-
-`LLM_MODEL` is a bare foundation-model ID. Current Claude models need a
-cross-region **inference profile** — add the region prefix:
-
-```bash
-LLM_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
-```
-
-### `AccessDeniedException` on the model (Bedrock)
-
-Two separate causes, both common:
-
-- **Model access not granted.** Enable Claude Haiku 4.5 in the Bedrock console
-  under *Model access*, per region. Verify with:
-  ```bash
-  aws bedrock list-foundation-models --by-provider anthropic --region us-east-1
-  ```
-- **IAM policy too narrow.** The identity needs `bedrock:InvokeModel` and
-  `bedrock:InvokeModelWithResponseStream`. With a cross-region profile the
-  resource is the profile *and* the underlying model in each backing region —
-  a policy scoped to one region's model ARN fails once a request is routed
-  elsewhere.
-
-### `Cannot specify both api_key and AWS credentials`
-
-`AWS_BEARER_TOKEN_BEDROCK` and `AWS_PROFILE` are both set. The SDK accepts one
-or the other. Pick:
-
-```bash
-unset AWS_BEARER_TOKEN_BEDROCK      # authenticate with the IAM profile / role
-```
-```bash
-unset AWS_PROFILE                   # authenticate with the Bedrock API key
-```
-
-`/healthz` reports which method is live under `llm.auth.method`.
-
-### `No AWS credentials found`
-
-The credential chain came up empty. Whichever applies:
-
-```bash
-aws configure                # static keys into ~/.aws/credentials
-aws sso login --profile X    # refresh an expired SSO session
-```
-
-On EC2/ECS/EKS/Lambda, confirm a role is actually attached — `aws sts
-get-caller-identity` from the same shell the backend runs in is the fastest
-check. Note SSO sessions expire; an agent that worked yesterday and fails today
-with a credential error usually just needs another `aws sso login`.
-
-### `ANTHROPIC_API_KEY is not set`
-
-Only relevant when `LLM_PROVIDER=anthropic`. `.env` must be at the **repository
-root**, not in `backend/`. `/healthz` reports `llm.configured: false` when the
-key is missing.
-
-> If `ANTHROPIC_BASE_URL` is set but **empty** in your shell, the first-party
-> client can pick up the empty string as its base URL and fail to connect.
-> Unset it rather than leaving it blank.
-
-### The dashboard says "backend unreachable"
-
-The backend is not running, or is on a different port than the Vite proxy
-expects. Start it (see [Running it](#running-it)), or point the proxy
-elsewhere:
-
-```bash
-BACKEND_ORIGIN=http://localhost:9000 npm run dev
-```
-
-### The WebSocket keeps reconnecting
-
-Expected while the backend restarts — the client backs off and resumes from its
-last `seq`, so no events are lost. If it persists, check that whatever sits
-between the browser and the backend forwards WebSocket upgrades (the bundled
-nginx config does).
-
-### Chromium crashes in Docker
-
-Give it more shared memory than Docker's 64MB default; `docker-compose.yml`
-already sets `shm_size: 1gb`.
-
-### A run is stuck in "running" after a backend crash
-
-It will not be: on startup the backend reaps runs left mid-flight, marks them
-failed, and emits a terminal `run_finished` event so any watching dashboard
-stops spinning.
+> Those manifests are validated YAML with conventional shapes, but they have not
+> been run on a cluster. The ARNs and endpoints are placeholders.
 
 ---
 
-## Responsible use
+## Troubleshooting
 
-This drives a real browser against real websites. Before you point it at
-something you do not own:
+### `Configured db_schema is 'x' but the models were built for 'y'`
 
-- **Respect `robots.txt` and the site's terms of service.** Automated access is
-  often restricted or prohibited outright. Check first; "the agent did it" is
-  not a defence.
-- **Keep the domain allowlist on.** It defaults to a narrow list for a reason.
-  Setting `AGENT_ALLOWED_DOMAINS=*` removes the one guardrail that holds even
-  when the model is confused or manipulated — the dashboard warns you when you
-  do it.
-- **Rate-limit yourself.** The step and time budgets bound a single run, not
-  your aggregate traffic. If you are collecting data at volume, add delays and
-  keep concurrency low. A headless browser can hammer a small site badly.
-- **Don't automate around access controls.** No CAPTCHA solving, no
-  authentication you are not authorised to perform, no scraping of personal
-  data without a lawful basis.
-- **Prefer environments you control.** For QA work, point it at your own
-  staging site. That is what it is built for.
-- **Treat credentials carefully.** If you use `MCP_STORAGE_STATE` to run
-  pre-authenticated, that file is a live session — keep it out of version
-  control and off shared machines.
+`DB_SCHEMA` is read when the model classes are imported — environment variable
+first, `.env` second. This means the two disagree. Either a stray `DB_SCHEMA` in
+your shell is overriding the file, or a `Settings` was constructed with a
+different schema than the file says.
+
+### `Can't locate revision identified by '...'`
+
+The schema was migrated by a **different branch** whose migration chain this one
+does not contain. Alembic is not confused; the two histories genuinely diverge.
+Point `DB_SCHEMA` at a fresh schema, or merge the lineages deliberately.
+
+### `The 'vector' extension is not available on this PostgreSQL server`
+
+pgvector is not installed server-side. Install it, use the `pgvector/pgvector`
+image, or set `HEALING_MEMORY_ENABLED=false`.
+
+### `Executable doesn't exist at ...` when a run starts
+
+The browser binary is missing or is the wrong revision:
+
+```bash
+.venv/Scripts/python -m playwright install chromium
+```
+
+If it persists after a `playwright` upgrade, the pin in `requirements.txt` moved
+and the browser did not — run that command again.
+
+### Recording answers 501
+
+`RECORDER_ENABLED=false`, which is correct anywhere without a display. Record
+locally.
+
+### The recording window opens but nothing is captured
+
+Close the window to finish — that is the signal. Closing it immediately, or
+killing the process, leaves nothing to parse and the recording reports that it
+wrote nothing.
+
+### A batch is queued and nothing runs it
+
+Nothing is claiming work. Either `WORKER_ENABLED=false` with no separate worker
+running, or the worker cannot reach the database. `GET /healthz` reports queue
+depth.
+
+### `AccessDeniedException` on the model
+
+The account lacks that model. Request access in the Bedrock console — note the
+error names the ID with its region prefix **stripped**, so it looks like an ID
+you never configured. `GET /healthz?deep=1` checks it directly.
+
+### A run is stuck in `running` after a crash
+
+Startup reaps orphaned runs and reclaims expired job leases, so restarting the
+backend fixes it. A worker that dies mid-batch releases its lease and another
+picks the work up.
 
 ---
 
 ## Project layout
 
 ```
-.
-├── backend/
-│   ├── main.py            FastAPI app: REST + WebSocket, health, artifacts
-│   ├── runner.py          Run lifecycle, event bus, approval rendezvous
-│   ├── agent.py           The agentic loop and its guardrails
-│   ├── mcp_client.py      MCP session: stdio/HTTP, discovery, tool calls
-│   ├── policy.py          Allowlist + sensitive-action classification
-│   ├── llm.py             LLMClient protocol + Bedrock and Anthropic providers
-│   ├── prompt_loader.py   Loads and renders the prompt templates
-│   ├── prompts/           Every model-facing string, as editable Markdown
-│   │                      system, task, loop_nudge, approval_rejected,
-│   │                      navigation_blocked, empty_tool_result
-│   ├── events.py          The event schema (source of truth)
-│   ├── store.py           SQLite persistence
-│   ├── config.py          Settings from .env
-│   ├── logging_setup.py   JSON logs with run_id attached
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── tests/
-├── frontend/
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── components/    TaskComposer, RunView, Timeline, ScreenshotPane,
-│   │   │                  ResultPanel, ApprovalBar, RunHistory, StatusBadge
-│   │   └── lib/           events.ts (schema mirror), api.ts, useRunStream.ts
-│   ├── package.json
-│   └── vite.config.ts
-├── .env.example
-├── docker-compose.yml
-├── Makefile              optional shortcuts; every command is in this README
-└── README.md
+backend/
+  main.py            FastAPI assembly — wiring, nothing else
+  routers/           One module per resource
+  recorder.py        The codegen subprocess
+  codegen.py         Parses what it writes. Never executes it.
+  ingest.py          CSV/Excel/text → rows + column profiles (pandas)
+  mapping.py         Columns → declared fields, heuristics first
+  usecase.py         The UseCase schema — the contract between phases
+  engine.py          Executes a use case. No LLM, ever.
+  browser.py         Playwright: one browser, one context, one page
+  batch.py           Rows in sequence, and the recovery rules
+  jobs.py            Durable work queue on Postgres
+  worker.py          A batch worker with no HTTP attached
+  healing.py         Repairs one locator, budgeted, off by default
+  memory.py          What broke before and what fixed it (pgvector)
+  embeddings.py      Titan, or a deterministic stand-in
+  imagediff.py       How much two screenshots differ
+  repair.py          Post-mortem repair of a failed use case
+  store.py           Persistence. Tenancy enforced by construction.
+  policy.py          The domain allowlist
+  redaction.py       Secrets never reach the event log
+  migrations/        Alembic
+  tests/             655 tests, 11 of them opt-in
+frontend/src/
+  components/        RecordWorkflow, DatasetMapper, StepTrail, HealingMemory…
+  lib/               API client, event types, run stream
+deploy/              EKS manifests and their reasoning
+docs/design/         Why it is shaped this way
 ```
 
 ### Logs
 
-Every log line is one JSON object with the `run_id` attached, so a run can be
-reconstructed from a log aggregator with nothing but a filter:
+Structured JSON on stdout, with `run_id` bound to every line inside a run. Set
+`LOG_TO_FILE=true` for a rotating file as well; leave it off in a container,
+where logs belong to the collector rather than to a disk that disappears.
 
-```json
-{"ts":"2026-08-22T09:14:02.881Z","level":"INFO","logger":"agent","message":"tool call failed, retrying","run_id":"9f2c1a7e...","tool":"browser_click","attempt":1,"delay":0.5}
-```
+---
+
+## Responsible use
+
+This drives a real browser as a real user. Automating a site you are not
+authorised to automate is your responsibility, not the tool's. The domain
+allowlist exists to make the boundary explicit and enforceable; it is not a
+substitute for having permission.
+
+Credentials are encrypted at rest with a key you supply. It is a static key with
+no rotation story — moving to KMS envelope encryption is the outstanding item
+**A4** in [`TODO.md`](TODO.md), and worth doing before this holds anything you
+would mind losing.
