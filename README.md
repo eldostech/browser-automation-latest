@@ -22,6 +22,7 @@ favours being obvious over being clever.
 
 - [Why it is built this way](#why-it-is-built-this-way)
 - [Architecture](#architecture)
+- [The data model](#the-data-model)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
 - [Running it](#running-it)
@@ -57,6 +58,9 @@ So recording is now `playwright codegen` — a real browser, your hands, zero
 tokens — and the resulting script is *parsed*, not interpreted. What remains of
 the old design is the part that was always right: a use case is a durable,
 parameterised list of steps that replays with no model at all.
+
+For what is stored where -- every table, what it holds and why -- see
+[`docs/design/data-model.md`](docs/design/data-model.md).
 
 If you want the full reasoning, including the three things the design document
 asserted that turned out to be wrong, read
@@ -118,6 +122,30 @@ flowchart TB
 import `llm`, `UseCaseExecutor` has no parameter that could accept a model
 client, and a test asserts both. A healer is *injected*; with none passed there
 is no code path to a model at all.
+
+---
+
+## The data model
+
+Seventeen tables in one PostgreSQL schema, named by `DB_SCHEMA`. In brief:
+
+| Group | Tables |
+|---|---|
+| Tenancy and identity | `workspaces`, `users`, `user_sessions`, `audit_log` |
+| Authoring | `usecases`, `usecase_versions`, `targets`, `credentials` |
+| Input data | `datasets` |
+| Execution | `jobs`, `batches`, `executions`, `runs`, `events`, `run_steps`, `artifacts` |
+| Learning | `healing_memory` |
+
+The distinction worth knowing before you read any of it: **a batch is one press
+of "run this against these rows", an execution is one row of it, and a run is
+the live view of an execution.** One batch of 500 rows is 1 batch row, 500
+executions and 500 runs.
+
+[`docs/design/data-model.md`](docs/design/data-model.md) has the entity diagram,
+every column that carries meaning, and the rules that apply across all of them
+-- workspace scoping, which references deliberately have no foreign key, and
+what is never stored.
 
 ---
 
@@ -723,7 +751,7 @@ frontend/src/
   components/        RecordWorkflow, DatasetMapper, StepTrail, HealingMemory…
   lib/               API client, event types, run stream
 deploy/              EKS manifests and their reasoning
-docs/design/         Why it is shaped this way
+docs/design/         Why it is shaped this way, and the data model
 ```
 
 ### Logs
