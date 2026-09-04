@@ -27,6 +27,7 @@ favours being obvious over being clever.
 - [Setup](#setup)
 - [Running it](#running-it)
 - [The workflow, end to end](#the-workflow-end-to-end)
+- [Extracting from a site you do not own](#extracting-from-a-site-you-do-not-own)
 - [Signing in and roles](#signing-in-and-roles)
 - [Environment variables](#environment-variables)
 - [The API](#the-api)
@@ -485,6 +486,42 @@ human-confirmed fix, and it outranks anything the model worked out alone.
 **Learned** shows everything remembered, and lets you forget any of it. That
 matters: a fix that was right last month and wrong now does not fail loudly — it
 gets recalled as precedent and quietly makes the next repair worse.
+
+---
+
+## Extracting from a site you do not own
+
+For a migration off a vendor who will not open their back end, the list page
+*is* the index. Two passes:
+
+**1. Discovery.** Record a workflow that reaches the vendor's list page and add
+an `extract_rows` step. It takes a locator matching the rows and a column per
+field to read out of each one:
+
+| | |
+|---|---|
+| `selector` | CSS, scoped **inside** the row (`td:nth-child(2)`). A list page is structural, so the locator for a column is too. |
+| `attribute` | Read an attribute instead of the text. Usually `href` -- the identifier you need is in the link, not in the words. |
+
+Run it, and the screen shows what it found with a **Save as a dataset** button.
+
+**2. Detail.** Record a second workflow against one record, declare the
+identifier as an input, and run it against that dataset. One row per record.
+
+This is two use cases on purpose. The discovery output is auditable before you
+commit to four thousand detail runs, and a detail pass that fails at record
+3,000 resumes at 3,000 rather than starting over.
+
+### Pace
+
+Each use case carries its own **seconds between rows**, on the use case screen.
+Politeness belongs to the site, not to the installation: one vendor tolerates a
+request a second and another starts refusing after three. Left empty it uses
+`REPLAY_ROW_DELAY_SECONDS`.
+
+A long extraction that reads as an attack gets the account blocked, and
+automating a site you do not own can breach its terms even when the data is
+yours. Worth checking the contract before a four-thousand-record run.
 
 ---
 

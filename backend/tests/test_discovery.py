@@ -1,0 +1,195 @@
+"""Two-pass discovery: read a list page into rows, then run on those rows.
+
+The row-driven model everything else uses assumes you already know the four
+thousand account numbers. Against a vendor who will not open their back end,
+you do not -- the list page *is* the index. These tests pin the pass that turns
+it into one, and the join that makes its output runnable.
+"""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from credentials import generate_key
+from usecase import Step, UseCase
+from test_api_execute import FakeReplaySession
+
+pytestmark = pytest.mark.anyio
+
+
+# --- the schema ------------------------------------------------------------
+
+
+def test_a_discovery_step_must_say_what_to_read_out_of_each_row():
+    """Rows with no columns would find them and read nothing."""
+    with pytest.raises(ValueError) as caught:
+        Step(
+            id="d1",
+            action="extract_rows",
+            output="accounts",
+            locators=[{"strategy": "css", "selector": "table tbody tr"}],
+        )
+    assert "at least one column" in str(caught.value)
+
+
+def test_a_discovery_step_must_name_where_its_rows_land():
+    with pytest.raises(ValueError) as caught:
+        Step(
+            id="d1",
+            action="extract_rows",
+            locators=[{"strategy": "css", "selector": "tr"}],
+            columns=[{"name": "id", "selector": "td"}],
+        )
+    assert "output name" in str(caught.value)
+
+
+def test_a_discovery_output_counts_as_produced():
+    """Declaring an output that only extract_rows produces must validate."""
+    use_case = UseCase(
+        name="Discover accounts",
+        status="ready",
+        allowed_domains=["vendor.test"],
+        outputs=["accounts"],
+        row_steps=[
+            Step(
+                id="d1",
+                action="extract_rows",
+                output="accounts",
+                locators=[{"strategy": "css", "selector": "table tbody tr"}],
+                columns=[{"name": "account_id", "selector": "td a", "attribute": "href"}],
+            )
+        ],
+    )
+    assert use_case.outputs == ["accounts"]
+
+
+# --- politeness, per use case ---------------------------------------------
+
+
+def test_the_delay_between_rows_belongs_to_the_use_case():
+    """One vendor tolerates a request a second; another refuses after three.
+
+    A single number in the environment cannot be right for both, and the person
+    who recorded the workflow is the one who knows which site it is.
+    """
+    polite = UseCase(name="Slow vendor", row_delay_seconds=5.0)
+    assert polite.row_delay_seconds == 5.0
+    assert UseCase(name="Unset").row_delay_seconds is None, "None means use the default"
+
+    with pytest.raises(ValueError):
+        UseCase(name="Negative", row_delay_seconds=-1)
+
+
+# --- through the API -------------------------------------------------------
+
+
+@pytest.fixture
+def client(db_settings, db_engine, tmp_path, monkeypatch):
+    from conftest import authenticate, build_app
+
+    app = build_app(
+        db_settings, tmp_path, monkeypatch,
+        session_cls=FakeReplaySession, credentials_key=generate_key(),
+    )
+    with TestClient(app) as test_client:
+        yield authenticate(test_client)
+
+
+async def seed_discovery(client: TestClient, rows: list[dict[str, str]]) -> str:
+    """An execution whose outputs hold what a discovery pass found."""
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
+    usecase_id, _ = await store.save_usecase(
+        {
+            "id": "disc0000000000000000000000000000",
+            "name": "Discover accounts",
+            "status": "ready",
+            "allowed_domains": ["vendor.test"],
+            "outputs": ["accounts"],
+            "row_steps": [
+                {
+                    "id": "d1",
+                    "action": "extract_rows",
+                    "output": "accounts",
+                    "locators": [{"strategy": "css", "selector": "tr"}],
+                    "columns": [{"name": "account_id", "selector": "td"}],
+                }
+            ],
+        }
+    )
+    import uuid
+
+    execution_id = uuid.uuid4().hex
+    await store.create_execution(execution_id, usecase_id, 1, inputs={})
+    await store.finish_execution(execution_id, status="succeeded", outputs={"accounts": rows})
+    return execution_id
+
+
+async def test_what_discovery_found_becomes_a_dataset(client: TestClient):
+    """The join between the two passes.
+
+    Without it the first pass produces a list nobody can act on.
+    """
+    execution_id = await seed_discovery(
+        client,
+        [
+            {"account_id": "A-1001", "name": "Ada Lovelace"},
+            {"account_id": "A-1002", "name": "Grace Hopper"},
+        ],
+    )
+
+    response = client.post(
+        "/api/datasets/from-run",
+        json={"execution_id": execution_id, "output": "accounts", "name": "Vendor accounts"},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["row_count"] == 2
+    assert [c["name"] for c in body["columns"]] == ["account_id", "name"]
+    assert body["sample"][0]["account_id"] == "A-1001"
+    assert body["filename"].startswith("run:"), "it records the crawl it came from"
+
+
+async def test_naming_an_output_that_was_never_extracted_says_what_there_was(
+    client: TestClient,
+):
+    execution_id = await seed_discovery(client, [{"account_id": "A-1"}])
+
+    response = client.post(
+        "/api/datasets/from-run",
+        json={"execution_id": execution_id, "output": "invoices"},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "'invoices'" in detail
+    assert "accounts" in detail, "it lists what the run did produce"
+
+
+async def test_a_discovery_that_found_nothing_is_refused_rather_than_stored(
+    client: TestClient,
+):
+    """An empty dataset would send a second pass over nothing and look fine."""
+    execution_id = await seed_discovery(client, [])
+
+    response = client.post(
+        "/api/datasets/from-run",
+        json={"execution_id": execution_id, "output": "accounts"},
+    )
+
+    assert response.status_code == 422
+    assert "no rows" in response.json()["detail"].lower()
+
+
+async def test_exactly_one_source_must_be_named(client: TestClient):
+    both = client.post(
+        "/api/datasets/from-run",
+        json={"execution_id": "a", "batch_id": "b", "output": "accounts"},
+    )
+    neither = client.post("/api/datasets/from-run", json={"output": "accounts"})
+
+    assert both.status_code == 422
+    assert neither.status_code == 422

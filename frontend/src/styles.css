@@ -1496,3 +1496,30 @@ table.mapping .examples {
   width: 100%;
   margin: 8px 0;
 }
+
+/* --- discovery: what a first pass found ----------------------------------
+   Rows are the output of a crawl, so the panel has to make "how many" and
+   "what do they look like" answerable at a glance -- a table cell full of
+   JSON is what this replaces. */
+.card.discovery {
+  border-left: 3px solid var(--accent-ink);
+}
+.discovery-output {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.discovery-output:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+.discovery-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+.discovery-output table {
+  width: 100%;
+}

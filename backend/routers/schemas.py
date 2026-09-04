@@ -213,6 +213,18 @@ class CredentialRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class DatasetFromRunRequest(BaseModel):
+    """Make a dataset out of what a discovery run extracted."""
+
+    #: Exactly one of these. A batch, because discovery is often itself a batch
+    #: -- one row per page of a paginated list -- and their rows are one list.
+    execution_id: str = ""
+    batch_id: str = ""
+    #: The name the ``extract_rows`` step landed its rows under.
+    output: str = Field(min_length=1, max_length=64)
+    name: str = Field(default="", max_length=200)
+
+
 class TargetRequest(BaseModel):
     """The address this deployment gives one target."""
 

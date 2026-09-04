@@ -810,7 +810,16 @@ async def _drive_batch(
                 executor,
                 rows,
                 failure_streak_limit=manager.settings.replay_failure_streak_limit,
-                row_delay=manager.settings.replay_row_delay_seconds,
+                # The use case wins when it names one. Politeness belongs to
+                # the site, not the installation: one vendor tolerates a
+                # request a second and another starts refusing after three,
+                # and the person who recorded the workflow knows which is
+                # which. See UseCase.row_delay_seconds.
+                row_delay=(
+                    usecase.row_delay_seconds
+                    if usecase.row_delay_seconds is not None
+                    else manager.settings.replay_row_delay_seconds
+                ),
                 sleep=asyncio.sleep,
                 indices=indices,
             )

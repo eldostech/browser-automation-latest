@@ -43,7 +43,7 @@ TEMPLATE_RE = re.compile(r"\{\{\s*(input|secret|env)\.([A-Za-z_][A-Za-z0-9_]*)\s
 
 Action = Literal[
     "navigate", "click", "fill", "fill_form", "select", "press",
-    "hover", "upload", "wait", "assert", "extract", "script",
+    "hover", "upload", "wait", "assert", "extract", "extract_rows", "script",
 ]
 
 #: Actions that cannot be performed without knowing which element to act on.
@@ -54,7 +54,7 @@ Action = Literal[
 #: ever recorded with a target. Requiring one made a recording containing an
 #: Enter keypress impossible to distil at all.
 ELEMENT_ACTIONS: frozenset[str] = frozenset(
-    {"click", "fill", "select", "hover", "extract"}
+    {"click", "fill", "select", "hover", "extract", "extract_rows"}
 )
 
 #: Actions that may carry a locator but work fine without one.
@@ -410,6 +410,30 @@ class WaitFor(BaseModel):
     timeout_ms: int = Field(default=15_000, ge=0, le=300_000)
 
 
+
+class ExtractColumn(BaseModel):
+    """One field to read out of each row of a list.
+
+    ``selector`` is CSS, scoped **inside** the row, and that is deliberate
+    rather than a shortcut. The semantic locators the rest of this schema
+    prefers -- role, label, placeholder -- identify one element on a page; they
+    do not address "the third cell of this row". A list page is structural, so
+    the locator for a column is structural too. The row locator above it can
+    still be semantic, and usually should be.
+
+    ``attribute`` reads an attribute instead of the text. This is what makes
+    discovery work at all: the identifier you need is almost never the visible
+    label, it is the ``href`` of the link wrapping it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    selector: str = Field(min_length=1, max_length=500)
+    #: Empty reads the element's text.
+    attribute: str = Field(default="", max_length=64)
+
+
 class FormField(BaseModel):
     """One field of a ``fill_form`` batch."""
 
@@ -462,6 +486,12 @@ class Step(BaseModel):
     value: str | None = None
     #: fill_form
     fields: list[FormField] = Field(default_factory=list)
+    #: extract_rows -- what to read out of each row the locator matches.
+    columns: list[ExtractColumn] = Field(default_factory=list)
+    #: extract -- read this attribute rather than the element's text. An href
+    #: is the usual reason: the identifier a later pass needs is in the link,
+    #: not in the words a person sees.
+    attribute: str = ""
     #: extract -- the key this step's value lands under in the row's outputs.
     output: str | None = None
     #: script -- raw JavaScript. Refused unless the use case opts in.
@@ -492,6 +522,15 @@ class Step(BaseModel):
             raise ValueError(f"step {self.id!r}: 'script' requires code")
         if self.action == "fill_form" and not self.fields:
             raise ValueError(f"step {self.id!r}: 'fill_form' requires at least one field")
+        if self.action == "extract_rows" and not self.columns:
+            raise ValueError(
+                f"step {self.id!r}: 'extract_rows' requires at least one column. "
+                "Without one it would find the rows and read nothing out of them."
+            )
+        if self.action == "extract_rows" and not self.output:
+            raise ValueError(
+                f"step {self.id!r}: 'extract_rows' requires an output name to land under"
+            )
         if self.action == "wait" and self.wait_for is None:
             raise ValueError(f"step {self.id!r}: 'wait' requires wait_for")
         if self.action == "press" and not self.value:
@@ -600,6 +639,14 @@ class UseCase(BaseModel):
     teardown_steps: list[Step] = Field(default_factory=list)
 
     outputs: list[str] = Field(default_factory=list)
+    #: Seconds to wait between rows, overriding the deployment default.
+    #:
+    #: Politeness is a property of the site, not of the installation. One
+    #: vendor tolerates a request a second and another starts refusing after
+    #: three; a single number in the environment cannot be right for both, and
+    #: the person who recorded the workflow is the one who knows which site
+    #: this is. None means "use REPLAY_ROW_DELAY_SECONDS".
+    row_delay_seconds: float | None = Field(default=None, ge=0, le=600)
     warnings: list[str] = Field(default_factory=list)
     #: Recorded calls that did NOT become steps, and why. A recording keeps
     #: only what succeeded, so this is how a reviewer checks that nothing they
@@ -771,7 +818,11 @@ class UseCase(BaseModel):
 
     @model_validator(mode="after")
     def _declared_outputs_match_extract_steps(self) -> "UseCase":
-        produced = {s.output for s in self.all_steps if s.action == "extract" and s.output}
+        produced = {
+            s.output
+            for s in self.all_steps
+            if s.action in {"extract", "extract_rows"} and s.output
+        }
         declared = set(self.outputs)
         if declared - produced:
             raise ValueError(

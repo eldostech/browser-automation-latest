@@ -87,6 +87,20 @@ ORDERS = """<!doctype html>
 """
 
 
+#: A vendor's list page: the index a migration has to read before it can do
+#: anything, and the identifier is in the href rather than in the visible text.
+ACCOUNTS = """<!doctype html>
+<html><head><title>Accounts</title></head><body>
+  <h1>Accounts</h1>
+  <table><tbody>
+    <tr><td><a href="/account/A-1001">Ada Lovelace</a></td><td>Active</td></tr>
+    <tr><td><a href="/account/A-1002">Grace Hopper</a></td><td>Closed</td></tr>
+    <tr><td><a href="/account/A-1003">Karen Sparck Jones</a></td><td>Active</td></tr>
+  </tbody></table>
+</body></html>
+"""
+
+
 #: Renders nothing for seven seconds, then puts the control on the page. This
 #: is a slow site reduced to the one property that matters: the element the
 #: recording asks for is not there when the step starts, and is there later.
@@ -110,6 +124,7 @@ def site(tmp_path_factory):
     root = tmp_path_factory.mktemp("site")
     (root / "index.html").write_text(SIGN_IN, encoding="utf-8")
     (root / "late.html").write_text(LATE, encoding="utf-8")
+    (root / "accounts.html").write_text(ACCOUNTS, encoding="utf-8")
     (root / "orders.html").write_text(ORDERS, encoding="utf-8")
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
@@ -500,3 +515,75 @@ async def test_one_document_runs_against_two_different_addresses(site):
         )
         assert (await as_promoted.run_row({})).ok
         assert browser.url.startswith(promoted_to)
+
+
+async def test_a_list_page_becomes_rows(site):
+    """The first pass of a migration, against a real page.
+
+    A vendor who will not open their back end still has a list page, and that
+    page is the index. This reads it into rows -- including the identifier out
+    of the href, which is the part that is never in the visible text.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="discover",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        outputs=["accounts"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/accounts.html"),
+            Step(
+                id="s2",
+                action="extract_rows",
+                output="accounts",
+                locators=[Locator(strategy="css", selector="table tbody tr")],
+                columns=[
+                    {"name": "account_id", "selector": "td a", "attribute": "href"},
+                    {"name": "customer", "selector": "td a"},
+                    {"name": "status", "selector": "td:nth-child(2)"},
+                ],
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}])
+
+    assert results[0].ok, results[0].error
+    found = results[0].outputs["accounts"]
+    assert found == [
+        {"account_id": "/account/A-1001", "customer": "Ada Lovelace", "status": "Active"},
+        {"account_id": "/account/A-1002", "customer": "Grace Hopper", "status": "Closed"},
+        {
+            "account_id": "/account/A-1003",
+            "customer": "Karen Sparck Jones",
+            "status": "Active",
+        },
+    ]
+
+
+async def test_a_list_page_with_no_rows_is_not_a_failure(site):
+    """The last page of a paginated crawl is legitimately empty."""
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="discover nothing",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        outputs=["accounts"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/accounts.html"),
+            Step(
+                id="s2",
+                action="extract_rows",
+                output="accounts",
+                locators=[Locator(strategy="css", selector="table tbody tr.missing")],
+                columns=[{"name": "account_id", "selector": "td"}],
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}])
+
+    assert results[0].ok, "an empty page must not break the crawl at its final step"
+    assert results[0].outputs["accounts"] == []

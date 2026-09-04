@@ -357,6 +357,24 @@ export const api = {
       { method: 'POST', body: JSON.stringify(definition) },
     ),
 
+  /**
+   * Turn what a discovery run extracted into a dataset the next pass can run on.
+   *
+   * The join between the two passes of a migration: the first walks the
+   * vendor's list pages, this makes those rows runnable, the second pulls the
+   * detail one row at a time.
+   */
+  datasetFromRun: (body: {
+    execution_id?: string;
+    batch_id?: string;
+    output: string;
+    name?: string;
+  }) =>
+    request<{ dataset_id: string; row_count: number; columns: { name: string }[] }>(
+      '/api/datasets/from-run',
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
   // --- targets ---------------------------------------------------------------
 
   listTargets: () => request<{ targets: Target[] }>('/api/targets'),

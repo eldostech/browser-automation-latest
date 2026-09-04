@@ -324,6 +324,10 @@ export interface UseCase {
   row_steps: UseCaseStep[];
   teardown_steps: UseCaseStep[];
   outputs: string[];
+  /** Seconds between rows; null uses the deployment default. */
+  row_delay_seconds: number | null;
+  /** Which target supplies the base URL; "" means the recorded one. */
+  target: string;
   warnings: string[];
   /** Recorded calls that did NOT become steps, and why. */
   dropped: string[];

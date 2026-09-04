@@ -514,6 +514,8 @@ class UseCaseExecutor:
             return await self._do_fill_form(step, values)
         if step.action == "extract":
             return await self._do_extract(step, outputs)
+        if step.action == "extract_rows":
+            return await self._do_extract_rows(step, outputs)
         if step.action == "script":
             return await self._do_script(step, values)
         return await self._do_element_action(step, values)
@@ -679,6 +681,63 @@ class UseCaseExecutor:
             f"{check.describe()} -- {'held' if ok else 'did not hold'}{detail}",
         )
 
+    async def _do_extract_rows(
+        self, step: Step, outputs: dict[str, Any]
+    ) -> StepOutcome:
+        """Read a list page into many rows -- the first pass of a migration.
+
+        The row-driven model everything else uses assumes you already know the
+        four thousand account numbers. Against a vendor who will not open their
+        back end, you do not: the list page *is* the index, and this is how it
+        becomes a dataset the detail pass can run against.
+
+        Unlike every other step, matching more than one element is the point,
+        so the strictness that protects the others is deliberately not applied
+        here. Matching none is not an error either -- the last page of a
+        paginated list is legitimately empty, and failing on it would break
+        every crawl at its final step.
+        """
+        resolved = await self._resolve(step.locators, step.id, single=False)
+        if resolved is None:
+            # The rows may simply not be there yet, or there may be none. Both
+            # are ordinary; an empty list says so without stopping the run.
+            outputs[step.output or step.id] = []
+            return StepOutcome(step.id, True, 0, "no rows matched")
+        locator, rung, described = resolved
+
+        try:
+            rows = await locator.all()
+        except Exception as exc:  # noqa: BLE001
+            return StepOutcome(step.id, False, 0, _reason(exc))
+
+        collected: list[dict[str, str]] = []
+        for row in rows:
+            record: dict[str, str] = {}
+            for column in step.columns:
+                try:
+                    cell = row.locator(column.selector)
+                    if column.attribute:
+                        value = await cell.first.get_attribute(column.attribute)
+                    else:
+                        value = await cell.first.inner_text()
+                    record[column.name] = (value or "").strip()
+                except Exception:  # noqa: BLE001
+                    # One missing cell must not lose the other columns of the
+                    # row, nor the rest of the page. A blank is the honest
+                    # answer and shows up in the dataset as one.
+                    record[column.name] = ""
+            collected.append(record)
+
+        outputs[step.output or step.id] = collected
+        return StepOutcome(
+            step.id,
+            True,
+            0,
+            f"extracted {len(collected)} row(s)",
+            matched_locator=described,
+            locator_rung=rung,
+        )
+
     async def _do_extract(self, step: Step, outputs: dict[str, Any]) -> StepOutcome:
         resolved = await self._resolve(step.locators, step.id)
         if resolved is None:
@@ -689,7 +748,17 @@ class UseCaseExecutor:
         # name the snapshot happened to record for it, which is what the MCP
         # path had to settle for.
         try:
-            value = (await locator.inner_text(timeout=int(self.step_timeout * 1000))).strip()
+            if step.attribute:
+                # The identifier a later pass needs is usually in the link
+                # rather than in the words a person sees.
+                raw = await locator.get_attribute(
+                    step.attribute, timeout=int(self.step_timeout * 1000)
+                )
+                value = (raw or "").strip()
+            else:
+                value = (
+                    await locator.inner_text(timeout=int(self.step_timeout * 1000))
+                ).strip()
         except Exception as exc:  # noqa: BLE001
             return StepOutcome(step.id, False, 0, _reason(exc))
 
@@ -724,7 +793,9 @@ class UseCaseExecutor:
             ) from exc
 
     # -- locator ladder -----------------------------------------------------
-    async def _resolve(self, locators: list[Locator], step_id: str):
+    async def _resolve(
+        self, locators: list[Locator], step_id: str, *, single: bool = True
+    ):
         """Walk the ladder and return ``(locator, rung, description)``.
 
         Semantic rungs lead, because ``role``/``label``/``placeholder``/
@@ -757,7 +828,12 @@ class UseCaseExecutor:
                     if await locator.count() >= 1:
                         if rung > 0:
                             self._note_drift(step_id, rung)
-                        return locator.first if spec.nth == 0 else locator, rung, spec.describe()
+                        # Collapsed to the first match for an action that acts
+                        # on one element. `extract_rows` passes single=False,
+                        # because matching many is the whole point there.
+                        if single and spec.nth == 0:
+                            return locator.first, rung, spec.describe()
+                        return locator, rung, spec.describe()
                 except Exception:  # noqa: BLE001 - mid-navigation; try again
                     continue
 

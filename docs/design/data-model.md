@@ -152,6 +152,17 @@ Keeping the file as a resource is what makes the mapping step possible: upload,
 look at what is in it, agree how its columns line up, and only then run
 anything.
 
+`source` records where the rows came from — an upload, or `discovery` when they
+were extracted by a first-pass crawl rather than uploaded. A discovery dataset's
+`filename` is `run:<id>#<output>` rather than a file name, so its rows trace
+back to the crawl that produced them.
+
+> **Column order.** JSONB does not preserve key order — Postgres sorts keys by
+> length — so rows read back out of `executions.outputs` arrive in an order
+> nobody chose. `/api/datasets/from-run` puts the columns back in the order the
+> `extract_rows` step declared them, because that is the order the person who
+> wrote it expects to see.
+
 ---
 
 ## Execution

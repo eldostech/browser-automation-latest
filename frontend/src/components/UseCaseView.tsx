@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
 import type { BatchDetail, CredentialSummary, DatasetSummary, UseCase } from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
+import { DiscoveryResult, summariseOutputs } from './DiscoveryResult';
 import { formatDuration } from '../lib/format';
 import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -42,6 +43,13 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
   const [batch, setBatch] = useState<BatchDetail | null>(null);
+  // A run that found rows stays on screen, because the useful thing to do next
+  // -- turn them into a dataset -- is here rather than in the run view.
+  const [lastDiscovery, setLastDiscovery] = useState<{
+    execution_id: string;
+    outputs: Record<string, unknown>;
+  } | null>(null);
+  const [rowDelay, setRowDelay] = useState('');
   const [lastFailure, setLastFailure] = useState<{ execution_id: string; error: string } | null>(
     null,
   );
@@ -53,6 +61,12 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         api.listCredentials(),
       ]);
       setUseCase(detail.definition);
+      setRowDelay(
+        detail.definition.row_delay_seconds === null ||
+          detail.definition.row_delay_seconds === undefined
+          ? ''
+          : String(detail.definition.row_delay_seconds),
+      );
       setScriptsEnabled(Boolean(detail.meta?.scripts_enabled));
       setCredentials(creds.credentials);
       setVaultAvailable(creds.vault_available);
@@ -150,6 +164,29 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     });
 
+  // Saved on blur rather than behind a button: it is one number, and a
+  // "Save" next to a single field is ceremony. A new version is written, as
+  // for any other edit, so the change is versioned and auditable.
+  const saveRowDelay = async () => {
+    if (!useCase) return;
+    const trimmed = rowDelay.trim();
+    const next = trimmed === '' ? null : Number(trimmed);
+    if (next !== null && (Number.isNaN(next) || next < 0)) {
+      setError('Seconds between rows must be a number, or empty to use the default.');
+      return;
+    }
+    if (next === (useCase.row_delay_seconds ?? null)) return;
+    await act(async () => {
+      await api.updateUseCase(usecaseId, { ...useCase, row_delay_seconds: next } as UseCase);
+      setNotice(
+        next === null
+          ? 'Pace cleared; this use case uses the deployment default.'
+          : `Pace set to ${next}s between rows. Saved as a new version.`,
+      );
+      await load();
+    });
+  };
+
   const runOnce = () =>
     act(async () => {
       const result = await api.executeUseCase(usecaseId, {
@@ -159,10 +196,22 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       });
       if (result.status === 'succeeded') {
         setLastFailure(null);
+        const outputs = (result.outputs ?? {}) as Record<string, unknown>;
+        const foundRows = Object.values(outputs).some(
+          (v) => Array.isArray(v) && v.length > 0,
+        );
         setNotice(
           `Succeeded using ${result.llm_tokens} LLM tokens. ` +
-            `Outputs: ${JSON.stringify(result.outputs)}`,
+            `Outputs: ${summariseOutputs(outputs) || '(none)'}`,
         );
+        // Rows are the first pass of a two-pass migration and the next step is
+        // on this screen, so stay here. Anything else goes to the run view as
+        // before.
+        if (foundRows) {
+          setLastDiscovery({ execution_id: result.execution_id, outputs });
+          return;
+        }
+        setLastDiscovery(null);
         onOpenRun(result.run_id);
         return;
       }
@@ -588,6 +637,35 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           )}
 
           <div className="card">
+            <h3>Pace</h3>
+            <p className="hint">
+              How long to wait between rows. Politeness is a property of the site rather
+              than of this installation: one vendor tolerates a request a second, another
+              starts refusing after three, and a long extraction that reads as an attack
+              gets the account blocked. The person who recorded this knows which site it is.
+            </p>
+            <label className="field" style={{ maxWidth: 260 }}>
+              <span>Seconds between rows</span>
+              <input
+                type="number"
+                min={0}
+                max={600}
+                step={0.1}
+                value={rowDelay}
+                placeholder="server default"
+                disabled={!session.can('usecase:create')}
+                onChange={(e) => setRowDelay(e.target.value)}
+                onBlur={() => void saveRowDelay()}
+              />
+            </label>
+            <p className="hint">
+              {useCase.row_delay_seconds === null || useCase.row_delay_seconds === undefined
+                ? 'Empty uses the deployment default (REPLAY_ROW_DELAY_SECONDS).'
+                : `This use case waits ${useCase.row_delay_seconds}s between rows.`}
+            </p>
+          </div>
+
+          <div className="card">
             <h3>Browser</h3>
             <label className="checkbox">
               <input
@@ -651,6 +729,14 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
 
       {mode === 'batch' && (
         <div className="card">
+          {lastDiscovery && (
+            <DiscoveryResult
+              executionId={lastDiscovery.execution_id}
+              outputs={lastDiscovery.outputs}
+              onSaved={() => setNotice('Saved. It is now under Run a file, below.')}
+            />
+          )}
+
           <h3>Run a file</h3>
           <p className="hint">
             Upload your records, check that each field is reading the right column, then start.
@@ -754,7 +840,9 @@ function BatchProgressPanel({
                     .join(', ')}
                 </td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
-                  {execution.outputs ? JSON.stringify(execution.outputs) : ''}
+                  {/* A discovery run's output is hundreds of rows; the count
+                      is the readable thing in a cell this size. */}
+                  {summariseOutputs(execution.outputs as Record<string, unknown>)}
                 </td>
                 <td style={{ fontSize: 12 }}>
                   {execution.owner_email || <span className="hint">—</span>}
