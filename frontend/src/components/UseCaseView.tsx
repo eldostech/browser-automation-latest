@@ -5,6 +5,7 @@ import type {
   BatchSummary,
   CredentialSummary,
   DatasetSummary,
+  Target,
   UseCase,
 } from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
@@ -66,6 +67,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
     outputs: Record<string, unknown>;
   } | null>(null);
   const [rowDelay, setRowDelay] = useState('');
+  // Which sites this deployment knows about, so the target can be chosen from
+  // a list rather than typed from memory.
+  const [targets, setTargets] = useState<Target[]>([]);
   const [lastFailure, setLastFailure] = useState<{ execution_id: string; error: string } | null>(
     null,
   );
@@ -79,6 +83,10 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       setUseCase(detail.definition);
       // Best effort: a use case that has never run has none, and failing to
       // list them must not stop the screen loading.
+      api
+        .listTargets()
+        .then((body) => setTargets(body.targets))
+        .catch(() => setTargets([]));
       api
         .listBatches(usecaseId)
         .then((body) => setPastBatches(body.batches))
@@ -208,6 +216,21 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     });
   };
+
+  // The target lives in the definition, because promotion carries the document
+  // and each deployment answers the name for itself. Changing it is therefore
+  // an ordinary edit: a new version, versioned and audited like any other.
+  const saveTarget = (next: string) =>
+    act(async () => {
+      if (!useCase) return;
+      await api.updateUseCase(usecaseId, { ...useCase, target: next } as UseCase);
+      setNotice(
+        next
+          ? `This use case now runs against ${next}. Saved as a new version.`
+          : 'Cleared. It runs against the address it was recorded on.',
+      );
+      await load();
+    });
 
   const runOnce = () =>
     act(async () => {
@@ -659,6 +682,52 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               )}
             </div>
           )}
+
+          <div className="card">
+            <h3>Where it runs</h3>
+            <p className="hint">
+              A use case names a target; this deployment says what address that target has.
+              That is what lets the same use case run in dev, UAT and production without the
+              definition changing.
+            </p>
+            <label className="field" style={{ maxWidth: 380 }}>
+              <span>Target</span>
+              <select
+                value={useCase.target ?? ''}
+                disabled={!session.can('usecase:create')}
+                onChange={(e) => void saveTarget(e.target.value)}
+              >
+                <option value="">
+                  (none — run against the address it was recorded on)
+                </option>
+                {targets.map((target) => (
+                  <option key={target.name} value={target.name}>
+                    {target.name} — {target.base_url}
+                  </option>
+                ))}
+                {/* A target the definition names but this deployment has no
+                    address for. Showing it is what makes the run-time refusal
+                    legible: you can see what it is asking for, and change it. */}
+                {useCase.target && !targets.some((t) => t.name === useCase.target) && (
+                  <option value={useCase.target}>
+                    {useCase.target} — not defined in this deployment
+                  </option>
+                )}
+              </select>
+            </label>
+            {useCase.target && !targets.some((t) => t.name === useCase.target) ? (
+              <p className="hint" style={{ color: 'var(--danger)' }}>
+                This deployment has no address for <code>{useCase.target}</code>, so runs will
+                refuse. Add it under Targets, or pick one above.
+              </p>
+            ) : (
+              <p className="hint">
+                {useCase.target
+                  ? `Runs against whatever ${useCase.target} points at here.`
+                  : `Runs against ${useCase.base_url || 'the recorded address'}. That is right for a single environment, and what you change before promoting.`}
+              </p>
+            )}
+          </div>
 
           <div className="card">
             <h3>Pace</h3>

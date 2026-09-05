@@ -233,3 +233,62 @@ async def test_a_run_naming_an_unknown_target_is_refused_before_it_starts(
 
     assert response.status_code == 422
     assert "'bank'" in response.json()["detail"]
+
+
+# --- getting unstuck -------------------------------------------------------
+
+
+def test_a_recording_made_on_localhost_names_no_target():
+    """Otherwise every locally recorded use case refuses to run.
+
+    "localhost" is where the browser was, not what it was looking at. Naming a
+    target after it means the use case will not run against the machine it was
+    just recorded on until somebody defines a target called localhost.
+    """
+    from routers.recordings import _target_name
+
+    assert _target_name("http://localhost:8002") == ""
+    assert _target_name("http://127.0.0.1:5173") == ""
+    assert _target_name("http://app.localhost:3000") == ""
+    # A real site still gets a name.
+    assert _target_name("https://uat.schemora.ai") == "schemora"
+
+
+def test_the_refusal_says_both_ways_out():
+    """A message that names the problem and not the remedy leaves you stuck."""
+    with pytest.raises(TargetMissing) as caught:
+        resolve_base_url(
+            target="localhost",
+            targets={"schemora-local": "http://localhost:8002"},
+            recorded="http://localhost:8002",
+        )
+
+    message = str(caught.value)
+    assert "'localhost'" in message
+    assert "schemora-local" in message, "it lists what this deployment does have"
+    assert "under Targets" in message, "one way out: define it"
+    assert "beside Pace" in message, "the other: point the use case at an existing one"
+
+
+async def test_a_use_case_can_be_pointed_at_a_different_target(client: TestClient):
+    """The thing that was impossible: the target was in the definition with no
+    endpoint or screen that could change it."""
+    from conftest import app_workspace
+    from test_api_execute import BROKEN
+
+    store = await app_workspace(client.app)
+    usecase_id, _ = await store.save_usecase({**BROKEN, "target": "localhost"})
+    client.put("/api/targets/schemora-local", json={"base_url": "http://localhost:8002"})
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    saved = client.put(
+        f"/api/usecases/{usecase_id}", json={**definition, "target": "schemora-local"}
+    )
+
+    assert saved.status_code == 201, saved.text
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert body["definition"]["target"] == "schemora-local"
+    assert body["meta"]["target"] == "schemora-local", (
+        "the summary row mirrors it, so the list can show it without loading "
+        "every definition"
+    )

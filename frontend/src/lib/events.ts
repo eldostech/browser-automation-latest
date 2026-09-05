@@ -329,6 +329,8 @@ export interface UseCase {
   row_delay_seconds: number | null;
   /** Which target supplies the base URL; "" means the recorded one. */
   target: string;
+  /** The origin this was recorded against, used when no target is named. */
+  base_url: string;
   warnings: string[];
   /** Recorded calls that did NOT become steps, and why. */
   dropped: string[];

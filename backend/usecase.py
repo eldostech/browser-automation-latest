@@ -128,7 +128,10 @@ def resolve_base_url(
             raise TargetMissing(
                 f"This use case runs against the target {target!r}, and this "
                 f"deployment has no address for it. Targets defined here: {known}. "
-                f"Add one under Targets, or start the run with an explicit URL."
+                f"Either add a target called {target!r} under Targets, or point this "
+                f"use case at one that already exists -- the target is on the use "
+                f"case's own screen, beside Pace. A single run can also be given an "
+                f"explicit address when it is started."
             )
         return found.rstrip("/")
     return recorded.rstrip("/")

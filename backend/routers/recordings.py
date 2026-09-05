@@ -329,6 +329,13 @@ def _target_name(origin: str) -> str:
     host = (urlparse(origin).hostname or "").lower()
     if not host:
         return ""
+    # A loopback recording has no site to name. "localhost" is where the
+    # browser was, not what it was looking at, and naming a target after it
+    # forces every locally recorded use case to be pointed somewhere before it
+    # will run -- against the machine it was just recorded on. Empty means "the
+    # URL in the recording", which is exactly right here.
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.endswith(".localhost"):
+        return ""
     parts = [p for p in host.split(".") if p]
     # Drop a leading environment-ish label and the public suffix, leaving the
     # name people actually use for the site.

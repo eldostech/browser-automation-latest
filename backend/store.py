@@ -653,17 +653,6 @@ class WorkspaceStore:
             await session.commit()
             return bool(result.rowcount)
 
-    async def set_usecase_target(self, usecase_id: str, target: str) -> bool:
-        """Point a use case at a target by name. Empty means "as recorded"."""
-        async with self._sessions() as session:
-            result = await session.execute(
-                update(UseCase)
-                .where(UseCase.id == usecase_id, UseCase.workspace_id == self._ws)
-                .values(target=target, updated_at=utcnow())
-            )
-            await session.commit()
-            return bool(result.rowcount)
-
     async def save_usecase(
         self,
         definition: dict[str, Any],
@@ -681,6 +670,11 @@ class WorkspaceStore:
         name = str(definition.get("name") or "Untitled")
         description = str(definition.get("description") or "")
         status = str(definition.get("status") or "draft")
+        # Mirrored from the definition, which is the source of truth: the
+        # document has to carry it for promotion. The column exists so the use
+        # case list can show and filter on it without parsing every definition,
+        # and it was previously never written, which made it a lie.
+        target = str(definition.get("target") or "")
         now = utcnow()
 
         async with self._sessions() as session:
@@ -707,6 +701,7 @@ class WorkspaceStore:
                 name=name,
                 description=description,
                 status=status,
+                target=target,
                 current_version=version,
                 source_run_id=definition.get("source_run_id"),
                 created_at=now,
@@ -719,6 +714,7 @@ class WorkspaceStore:
                         "name": upsert.excluded.name,
                         "description": upsert.excluded.description,
                         "status": upsert.excluded.status,
+                        "target": upsert.excluded.target,
                         "current_version": upsert.excluded.current_version,
                         "updated_at": upsert.excluded.updated_at,
                     },
@@ -1552,6 +1548,9 @@ def _usecase_dict(row: UseCase) -> dict[str, Any]:
         "name": row.name,
         "description": row.description,
         "status": row.status,
+        # Which site this points at in this deployment. On the summary so the
+        # list can show it without loading every definition.
+        "target": row.target,
         "current_version": row.current_version,
         "source_run_id": row.source_run_id,
         "scripts_enabled": row.scripts_enabled,
