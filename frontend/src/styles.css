@@ -1523,3 +1523,19 @@ table.mapping .examples {
 .discovery-output table {
   width: 100%;
 }
+
+/* The files a run pulled off a vendor site. */
+.downloads {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.downloads li {
+  padding: 8px 10px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}

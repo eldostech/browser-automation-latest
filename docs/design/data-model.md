@@ -243,9 +243,15 @@ comparison.
 
 ### `artifacts`
 
-Screenshots and Playwright traces. The row holds `kind`, `mime`, `bytes` and a
-`path`; the bytes themselves live on disk locally or in S3 in a cluster, served
-by presigned redirect.
+Screenshots, Playwright traces, and documents pulled off a site by a `download`
+step. The row holds `kind`, `mime`, `bytes` and a `path`; the bytes themselves
+live on disk locally or in S3 in a cluster, served by presigned redirect.
+
+`filename` is empty for a screenshot -- identified by the step it belongs to --
+and carries the vendor's own name for a download, because there the file *is*
+the deliverable and that name is what the next system expects. It is untrusted
+input from someone else's site, so the endpoint that serves it strips quotes
+and newlines before putting it in a `Content-Disposition` header.
 
 ---
 

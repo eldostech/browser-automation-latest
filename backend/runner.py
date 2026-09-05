@@ -23,6 +23,7 @@ import asyncio
 import logging
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -117,6 +118,34 @@ class RunEventSink:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("failed to save screenshot", extra={"run_id": self.run_id, "error": str(exc)})
+            return None
+        return record.id, f"{self.api_base}/api/artifacts/{record.id}"
+
+    async def save_download(
+        self, data: bytes, *, seq: int, filename: str, mime: str
+    ) -> tuple[str, str] | None:
+        """Keep a downloaded document beside the screenshots and traces.
+
+        Same storage as everything else -- a directory locally, S3 in a
+        cluster -- so a migration's documents land wherever the deployment
+        already puts its artifacts, and are fetched back by the same endpoint.
+        """
+        suffix = Path(filename).suffix or ".bin"
+        try:
+            record = await self.store.save_artifact(
+                self.run_id,
+                data,
+                kind="download",
+                mime=mime,
+                seq=seq,
+                suffix=suffix,
+                filename=filename,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "failed to save a download",
+                extra={"run_id": self.run_id, "filename": filename, "error": str(exc)},
+            )
             return None
         return record.id, f"{self.api_base}/api/artifacts/{record.id}"
 

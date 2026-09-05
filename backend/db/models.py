@@ -302,6 +302,12 @@ class Artifact(Base):
     seq: Mapped[int | None] = mapped_column(Integer)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     mime: Mapped[str] = mapped_column(String(100), nullable=False)
+    #: The name the file arrived with. Empty for a screenshot, which is
+    #: identified by its step; a downloaded document is identified by its name,
+    #: and that name is what the next system expects on the way back in.
+    filename: Mapped[str] = mapped_column(
+        String(400), nullable=False, default="", server_default=""
+    )
     path: Mapped[str] = mapped_column(Text, nullable=False)
     bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = created_at_column()

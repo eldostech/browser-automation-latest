@@ -43,9 +43,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -106,6 +108,17 @@ class EventSink(Protocol):
     async def save_screenshot(
         self, data: bytes, *, seq: int, mime: str = "image/png"
     ) -> tuple[str, str] | None: ...
+
+    async def save_download(
+        self, data: bytes, *, seq: int, filename: str, mime: str
+    ) -> tuple[str, str] | None:
+        """Keep a downloaded file. Optional, like ``record_step``.
+
+        A sink with no storage behind it -- a test's, or one used somewhere
+        with no database -- simply does not have this, and the executor checks
+        once rather than guarding every call.
+        """
+        raise NotImplementedError
 
     async def record_step(self, **fields: Any) -> None:
         """Persist one step as a row, for the timeline and the visual diff.
@@ -226,6 +239,10 @@ class UseCaseExecutor:
         # it. That ordering is the whole promotion story: dev runs the
         # recording as recorded, and UAT answers with its own address without
         # the document differing by a byte.
+        # Resolved once: a sink without storage behind it -- a test's -- simply
+        # does not have this, and a download step says so rather than failing
+        # per call. Same shape as `record_step`.
+        self._save_download = getattr(sink, "save_download", None)
         self.env = {
             **({"base_url": usecase.base_url} if usecase.base_url else {}),
             **(env or {}),
@@ -516,6 +533,8 @@ class UseCaseExecutor:
             return await self._do_extract(step, outputs)
         if step.action == "extract_rows":
             return await self._do_extract_rows(step, outputs)
+        if step.action == "download":
+            return await self._do_download(step, outputs)
         if step.action == "script":
             return await self._do_script(step, values)
         return await self._do_element_action(step, values)
@@ -679,6 +698,85 @@ class UseCaseExecutor:
             ok,
             0,
             f"{check.describe()} -- {'held' if ok else 'did not hold'}{detail}",
+        )
+
+    async def _do_download(self, step: Step, outputs: dict[str, Any]) -> StepOutcome:
+        """Click something that yields a file, and keep the file.
+
+        A download is a click with a consequence, not a kind of navigation:
+        Playwright only surfaces one through ``expect_download`` around the
+        action that triggers it, so the click and the capture cannot be
+        separate steps.
+
+        The file is stored exactly where screenshots and traces are -- locally
+        or in S3, per deployment -- and the row's output records what it was
+        called, how big it was, and the id to fetch it back by. That is what
+        makes a migration's second half possible: the documents are addressable
+        per record rather than sitting in a folder nobody can join to anything.
+
+        The vendor's own filename is kept. It is the deliverable's identity, and
+        the system it gets uploaded into will expect it.
+        """
+        resolved = await self._resolve(step.locators, step.id)
+        if resolved is None:
+            return StepOutcome(step.id, False, 0, self._not_found_message(step))
+        locator, rung, described = resolved
+
+        if self._save_download is None:
+            return StepOutcome(
+                step.id,
+                False,
+                0,
+                "this deployment has nowhere to keep a downloaded file, so the step "
+                "cannot run. Artifact storage is what holds them.",
+            )
+
+        started = time.monotonic()
+        try:
+            async with self.browser.page.expect_download(
+                timeout=int(self.step_timeout * 1000)
+            ) as info:
+                await locator.click(timeout=int(self.step_timeout * 1000))
+            download = await info.value
+            path = await download.path()
+            if path is None:
+                # Playwright refused the download -- usually the context was
+                # closing. Saying so beats an empty file that looks like a
+                # document until somebody opens it.
+                return StepOutcome(
+                    step.id, False, 0, "the download did not complete"
+                )
+            data = Path(path).read_bytes()
+            name = download.suggested_filename or f"{step.output or step.id}.bin"
+        except Exception as exc:  # noqa: BLE001
+            return StepOutcome(step.id, False, 0, _reason(exc))
+
+        duration = int((time.monotonic() - started) * 1000)
+        saved = await self._save_download(
+            data,
+            seq=self.step_number,
+            filename=name,
+            mime=_mime_for(name),
+        )
+        if saved is None:
+            return StepOutcome(
+                step.id, False, duration, f"{name!r} downloaded but could not be stored"
+            )
+        artifact_id, url = saved
+
+        outputs[step.output or step.id] = {
+            "filename": name,
+            "artifact_id": artifact_id,
+            "url": url,
+            "bytes": len(data),
+        }
+        return StepOutcome(
+            step.id,
+            True,
+            duration,
+            f"downloaded {name!r} ({len(data)} bytes)",
+            matched_locator=described,
+            locator_rung=rung,
         )
 
     async def _do_extract_rows(
@@ -1176,6 +1274,39 @@ class UseCaseExecutor:
         decision = check_navigation("navigate", {"url": url}, allowed)
         if not decision.allowed:
             raise NavigationBlocked(decision.reason or f"{url} is not an allowed domain")
+
+
+
+#: Content types for the files a migration actually pulls off a vendor site.
+#:
+#: Pinned rather than left to ``mimetypes`` because that reads the Windows
+#: registry: the same .csv is ``text/csv`` on a Linux worker and
+#: ``application/vnd.ms-excel`` on a developer's laptop. An artifact stored for
+#: years, and re-uploaded into another system, should not have a content type
+#: that depends on which machine happened to fetch it.
+_DOCUMENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".csv": "text/csv",
+    ".txt": "text/plain",
+    ".xml": "application/xml",
+    ".json": "application/json",
+    ".zip": "application/zip",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def _mime_for(filename: str) -> str:
+    """The content type to store a downloaded file under."""
+    suffix = Path(filename).suffix.lower()
+    if suffix in _DOCUMENT_TYPES:
+        return _DOCUMENT_TYPES[suffix]
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
 def _host_of(pattern: str) -> str:

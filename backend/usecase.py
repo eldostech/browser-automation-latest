@@ -43,7 +43,8 @@ TEMPLATE_RE = re.compile(r"\{\{\s*(input|secret|env)\.([A-Za-z_][A-Za-z0-9_]*)\s
 
 Action = Literal[
     "navigate", "click", "fill", "fill_form", "select", "press",
-    "hover", "upload", "wait", "assert", "extract", "extract_rows", "script",
+    "hover", "upload", "download", "wait", "assert", "extract", "extract_rows",
+    "script",
 ]
 
 #: Actions that cannot be performed without knowing which element to act on.
@@ -54,7 +55,7 @@ Action = Literal[
 #: ever recorded with a target. Requiring one made a recording containing an
 #: Enter keypress impossible to distil at all.
 ELEMENT_ACTIONS: frozenset[str] = frozenset(
-    {"click", "fill", "select", "hover", "extract", "extract_rows"}
+    {"click", "fill", "select", "hover", "extract", "extract_rows", "download"}
 )
 
 #: Actions that may carry a locator but work fine without one.
@@ -527,6 +528,11 @@ class Step(BaseModel):
                 f"step {self.id!r}: 'extract_rows' requires at least one column. "
                 "Without one it would find the rows and read nothing out of them."
             )
+        if self.action == "download" and not self.output:
+            raise ValueError(
+                f"step {self.id!r}: 'download' requires an output name. The file is the "
+                "point of the step, and the name is how a later row finds it."
+            )
         if self.action == "extract_rows" and not self.output:
             raise ValueError(
                 f"step {self.id!r}: 'extract_rows' requires an output name to land under"
@@ -821,7 +827,7 @@ class UseCase(BaseModel):
         produced = {
             s.output
             for s in self.all_steps
-            if s.action in {"extract", "extract_rows"} and s.output
+            if s.action in {"extract", "extract_rows", "download"} and s.output
         }
         declared = set(self.outputs)
         if declared - produced:

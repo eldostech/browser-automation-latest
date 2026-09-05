@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import quote
 from typing import Annotated, Any
 
 from fastapi import (
@@ -151,6 +152,34 @@ async def cancel_run(
     return {"run_id": run_id, "cancelled": True}
 
 
+
+def _artifact_headers(record) -> dict[str, str]:
+    """Caching, plus the download's own name when it has one.
+
+    A screenshot is rendered inline and needs no name -- it is identified by
+    the step it belongs to. A downloaded document does: the file is the
+    deliverable, and saving it as an opaque id is how a migration ends up with
+    a bucket nobody can join to anything. The name also travels to whatever
+    system it gets uploaded into next.
+    """
+    headers = {"Cache-Control": "private, max-age=31536000, immutable"}
+    name = (getattr(record, "filename", "") or "").strip()
+    if not name:
+        return headers
+
+    # A quote or a newline here would let a stored filename forge extra header
+    # content, so neither survives. The RFC 5987 form carries anything
+    # non-ASCII; the plain one is the fallback for older clients.
+    strip = str.maketrans({chr(92): '_', chr(34): '_', chr(13): '', chr(10): ''})
+    safe = name.translate(strip)
+    ascii_name = safe.encode("ascii", "replace").decode("ascii")
+    headers["Content-Disposition"] = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(safe, safe='')}"
+    )
+    return headers
+
+
 @router.get("/artifacts/{artifact_id}")
 async def get_artifact(
     artifact_id: str,
@@ -183,7 +212,7 @@ async def get_artifact(
         return Response(
             payload,
             media_type=record.mime,
-            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+            headers=_artifact_headers(record),
         )
 
     if not Path(record.path).exists():
@@ -191,12 +220,12 @@ async def get_artifact(
         # or a backend switch that left the old files behind.
         raise HTTPException(
             status_code=404,
-            detail="That screenshot is recorded but its file is missing from storage.",
+            detail="That artifact is recorded but its file is missing from storage.",
         )
     return FileResponse(
         record.path,
         media_type=record.mime,
-        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        headers=_artifact_headers(record),
     )
 
 

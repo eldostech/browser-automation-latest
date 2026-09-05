@@ -193,3 +193,74 @@ async def test_exactly_one_source_must_be_named(client: TestClient):
 
     assert both.status_code == 422
     assert neither.status_code == 422
+
+
+# --- downloads -------------------------------------------------------------
+
+
+def test_a_download_must_name_where_its_file_lands():
+    """The file is the point of the step; the name is how a row finds it."""
+    with pytest.raises(ValueError) as caught:
+        Step(
+            id="s1",
+            action="download",
+            locators=[{"strategy": "css", "selector": "#dl"}],
+        )
+    assert "output name" in str(caught.value)
+
+
+def test_a_download_counts_as_producing_its_output():
+    use_case = UseCase(
+        name="Fetch statements",
+        status="ready",
+        allowed_domains=["vendor.test"],
+        outputs=["statement"],
+        row_steps=[
+            Step(
+                id="s1",
+                action="download",
+                output="statement",
+                locators=[{"strategy": "css", "selector": "#dl"}],
+            )
+        ],
+    )
+    assert use_case.outputs == ["statement"]
+
+
+def test_a_stored_content_type_does_not_depend_on_the_machine():
+    """`mimetypes` reads the Windows registry, so .csv differs by platform.
+
+    An artifact kept for years and re-uploaded into another system should not
+    carry a content type that depended on which machine fetched it.
+    """
+    from engine import _mime_for
+
+    assert _mime_for("statement-A-1001.csv") == "text/csv"
+    assert _mime_for("deed.PDF") == "application/pdf"
+    assert _mime_for("ledger.xlsx") == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert _mime_for("mystery.qqq") == "application/octet-stream"
+
+
+def test_a_downloaded_name_cannot_forge_a_response_header():
+    """The filename comes off a vendor's site, so it is untrusted input."""
+    from routers.runs import _artifact_headers
+
+    class Record:
+        filename = 'evil".pdf\r\nX-Injected: yes'
+
+    headers = _artifact_headers(Record())
+    disposition = headers["Content-Disposition"]
+    assert "\r" not in disposition and "\n" not in disposition
+    assert "X-Injected" not in disposition.split(";")[0]
+
+
+def test_a_screenshot_is_not_served_as_an_attachment():
+    """It is rendered inline in the trail; only a download has a name."""
+    from routers.runs import _artifact_headers
+
+    class Record:
+        filename = ""
+
+    assert "Content-Disposition" not in _artifact_headers(Record())

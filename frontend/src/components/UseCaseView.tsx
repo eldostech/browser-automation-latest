@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
 import type { BatchDetail, CredentialSummary, DatasetSummary, UseCase } from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
-import { DiscoveryResult, summariseOutputs } from './DiscoveryResult';
+import {
+  DiscoveryResult,
+  Downloads,
+  downloadsIn,
+  summariseOutputs,
+} from './DiscoveryResult';
 import { formatDuration } from '../lib/format';
 import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
@@ -197,9 +202,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       if (result.status === 'succeeded') {
         setLastFailure(null);
         const outputs = (result.outputs ?? {}) as Record<string, unknown>;
-        const foundRows = Object.values(outputs).some(
-          (v) => Array.isArray(v) && v.length > 0,
-        );
+        // Stay here for anything worth acting on: rows to turn into a
+        // dataset, or files to open. Otherwise go to the run view as before.
+        const foundRows =
+          Object.values(outputs).some((v) => Array.isArray(v) && v.length > 0) ||
+          downloadsIn(outputs).length > 0;
         setNotice(
           `Succeeded using ${result.llm_tokens} LLM tokens. ` +
             `Outputs: ${summariseOutputs(outputs) || '(none)'}`,
@@ -729,6 +736,8 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
 
       {mode === 'batch' && (
         <div className="card">
+          {lastDiscovery && <Downloads outputs={lastDiscovery.outputs} />}
+
           {lastDiscovery && (
             <DiscoveryResult
               executionId={lastDiscovery.execution_id}

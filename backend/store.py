@@ -109,6 +109,8 @@ class ArtifactRecord:
     path: str
     bytes: int
     created_at: str
+    #: The name the file arrived with; empty for a screenshot.
+    filename: str = ""
 
 
 def _run_record(row: Run) -> RunRecord:
@@ -141,6 +143,7 @@ def _artifact_record(row: Artifact) -> ArtifactRecord:
         path=row.path,
         bytes=row.bytes,
         created_at=iso(row.created_at) or "",
+        filename=row.filename,
     )
 
 
@@ -1417,6 +1420,7 @@ class WorkspaceStore:
         mime: str = "image/png",
         seq: int | None = None,
         suffix: str = ".png",
+        filename: str = "",
     ) -> ArtifactRecord:
         """Write the bytes, then record where they went.
 
@@ -1438,6 +1442,7 @@ class WorkspaceStore:
                 seq=seq,
                 kind=kind,
                 mime=mime,
+                filename=filename,
                 path=stored.locator,
                 bytes=stored.bytes,
             )

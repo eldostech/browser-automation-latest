@@ -120,12 +120,74 @@ export function DiscoveryResult({ executionId, outputs, onSaved }: Props) {
   );
 }
 
-/** A one-line summary for a table cell, so a list output is not a wall of JSON. */
+/** A downloaded document, as a `download` step records it. */
+export type DownloadedFile = {
+  filename: string;
+  artifact_id: string;
+  url: string;
+  bytes: number;
+};
+
+function isDownload(value: unknown): value is DownloadedFile {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as DownloadedFile).filename === 'string' &&
+    typeof (value as DownloadedFile).artifact_id === 'string'
+  );
+}
+
+/** Every file a run pulled down, with what to call it. */
+export function downloadsIn(
+  outputs: Record<string, unknown> | null | undefined,
+): [string, DownloadedFile][] {
+  return Object.entries(outputs ?? {}).filter(
+    (entry): entry is [string, DownloadedFile] => isDownload(entry[1]),
+  );
+}
+
+function readableSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** The files a run kept, as links that save under the vendor's own name. */
+export function Downloads({ outputs }: { outputs: Record<string, unknown> }) {
+  const files = downloadsIn(outputs);
+  if (files.length === 0) return null;
+
+  return (
+    <div className="card">
+      <h3>Files this run kept</h3>
+      <p className="hint">
+        Stored where every other artifact goes — a directory locally, S3 in a cluster — under
+        the name the vendor gave them, which is what the next system will expect.
+      </p>
+      <ul className="downloads">
+        {files.map(([output, file]) => (
+          <li key={output}>
+            <a href={file.url}>{file.filename}</a>
+            <span className="hint">
+              {' '}
+              {readableSize(file.bytes)} · <code>{output}</code>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** A one-line summary for a table cell, so an output is not a wall of JSON. */
 export function summariseOutputs(outputs: Record<string, unknown> | null | undefined): string {
   if (!outputs) return '';
   return Object.entries(outputs)
     .map(([key, value]) => {
       if (Array.isArray(value)) return `${key}: ${value.length} rows`;
+      // A download is an object; its filename is the readable part, and
+      // String(value) would print "[object Object]".
+      if (isDownload(value)) return `${key}: ${value.filename}`;
       return `${key}=${String(value)}`;
     })
     .join(', ');

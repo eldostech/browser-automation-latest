@@ -101,6 +101,17 @@ ACCOUNTS = """<!doctype html>
 """
 
 
+#: A vendor's document page. `download` on the anchor is what makes the browser
+#: treat it as a file rather than navigating to it, which is how these pages
+#: actually behave.
+STATEMENT_PAGE = """<!doctype html>
+<html><head><title>Statement</title></head><body>
+  <h1>Statement</h1>
+  <a id="dl" href="/statement-A-1001.csv" download>Download statement</a>
+</body></html>
+"""
+
+
 #: Renders nothing for seven seconds, then puts the control on the page. This
 #: is a slow site reduced to the one property that matters: the element the
 #: recording asks for is not there when the step starts, and is there later.
@@ -125,6 +136,10 @@ def site(tmp_path_factory):
     (root / "index.html").write_text(SIGN_IN, encoding="utf-8")
     (root / "late.html").write_text(LATE, encoding="utf-8")
     (root / "accounts.html").write_text(ACCOUNTS, encoding="utf-8")
+    (root / "statement.html").write_text(STATEMENT_PAGE, encoding="utf-8")
+    (root / "statement-A-1001.csv").write_text(
+        "account,balance" + chr(10) + "A-1001,1240.55" + chr(10), encoding="utf-8"
+    )
     (root / "orders.html").write_text(ORDERS, encoding="utf-8")
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
@@ -173,6 +188,7 @@ class Sink:
     def __init__(self) -> None:
         self.events: list = []
         self.shots: list[bytes] = []
+        self.downloads: list[tuple[str, bytes, str]] = []
         self._seq = 0
 
     def reserve_seq(self) -> int:
@@ -185,6 +201,10 @@ class Sink:
     async def save_screenshot(self, data: bytes, *, seq: int, mime: str = "image/png"):
         self.shots.append(data)
         return f"artifact-{seq}", f"/artifacts/artifact-{seq}"
+
+    async def save_download(self, data: bytes, *, seq: int, filename: str, mime: str):
+        self.downloads.append((filename, data, mime))
+        return f"download-{seq}", f"/artifacts/download-{seq}"
 
     def failures(self) -> list:
         return [e for e in self.events if getattr(e, "type", "") == "step_finished" and not e.ok]
@@ -587,3 +607,43 @@ async def test_a_list_page_with_no_rows_is_not_a_failure(site):
 
     assert results[0].ok, "an empty page must not break the crawl at its final step"
     assert results[0].outputs["accounts"] == []
+
+
+async def test_a_document_is_downloaded_and_kept(site):
+    """The other half of a migration: the files, not just the fields.
+
+    A vendor who will not open their back end still lets you click "download",
+    and that file is the deliverable. It is kept where every other artifact
+    goes, under the name it arrived with, addressable per row.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="fetch a statement",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        outputs=["statement"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/statement.html"),
+            Step(
+                id="s2",
+                action="download",
+                output="statement",
+                locators=[Locator(strategy="css", selector="#dl")],
+            ),
+        ],
+    )
+
+    _, sink, results = await execute(use_case, site, [{}])
+
+    assert results[0].ok, results[0].error
+    kept = results[0].outputs["statement"]
+    assert kept["filename"] == "statement-A-1001.csv", "the vendor's own name is kept"
+    assert kept["bytes"] > 0
+    assert kept["artifact_id"], "it is addressable"
+
+    assert len(sink.downloads) == 1
+    filename, data, mime = sink.downloads[0]
+    assert filename == "statement-A-1001.csv"
+    assert b"A-1001,1240.55" in data, "the bytes are the real file"
+    assert mime == "text/csv"

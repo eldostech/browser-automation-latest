@@ -512,6 +512,19 @@ This is two use cases on purpose. The discovery output is auditable before you
 commit to four thousand detail runs, and a detail pass that fails at record
 3,000 resumes at 3,000 rather than starting over.
 
+### Downloading documents
+
+A `download` step clicks something that yields a file and keeps it. A download
+is a click with a consequence rather than a kind of navigation -- the browser
+only surfaces one around the action that triggers it -- so the click and the
+capture are one step.
+
+The file goes wherever artifacts already go: a directory locally, S3 in a
+cluster. It keeps the name the vendor gave it, because that is what the system
+you upload it into next will expect, and the row's output records the name,
+size and an id to fetch it back by. That is what makes the documents
+addressable per record instead of a folder nobody can join to anything.
+
 ### Pace
 
 Each use case carries its own **seconds between rows**, on the use case screen.
