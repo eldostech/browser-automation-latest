@@ -285,7 +285,8 @@ export interface UseCaseStep {
   optional: boolean;
   on_failure: 'abort' | 'continue' | 'heal';
   timeout_ms: number;
-  rejected_locators: Locator[];
+  rejected_locators: Locator[];  /** `extract_rows` — the fields read out of each matched row. */
+  columns?: { name: string; selector: string; attribute?: string }[];
 }
 
 export interface InputSpec {

@@ -157,19 +157,27 @@ export function Targets() {
                 <td>{target.description || <span className="hint">—</span>}</td>
                 <td className="hint">{target.updated_by || '—'}</td>
                 <td>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setName(target.name);
-                      setBaseUrl(target.base_url);
-                      setDescription(target.description);
-                    }}
-                  >
-                    Edit
-                  </button>{' '}
-                  <button type="button" className="danger" onClick={() => void remove(target.name)}>
-                    Remove
-                  </button>
+                  {/* A flex row rather than two inline buttons: the cell is
+                      narrow and they wrapped onto separate lines. */}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setName(target.name);
+                        setBaseUrl(target.base_url);
+                        setDescription(target.description);
+                      }}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => void remove(target.name)}
+                    >
+                      Remove
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}

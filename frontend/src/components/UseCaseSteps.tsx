@@ -107,6 +107,33 @@ export function UseCaseSteps({ title, hint, steps, onRemove }: Props) {
                 </div>
               )}
 
+              {/* Where the step's result lands. For an extract or a download
+                  that is the whole point of the step, and a review screen that
+                  does not show it makes the reviewer open the JSON. */}
+              {step.output && (
+                <div className="step-detail">
+                  <span className="label">saves as</span>
+                  <code>{step.output}</code>
+                </div>
+              )}
+
+              {/* Which fields a discovery step reads out of each row. Without
+                  these the step reads as "finds some rows" and a reviewer
+                  cannot tell whether it captures the identifier they need. */}
+              {(step.columns ?? []).length > 0 && (
+                <div className="step-detail">
+                  <span className="label">reads</span>
+                  <span>
+                    {step.columns!.map((column) => (
+                      <code key={column.name} style={{ marginRight: 8 }}>
+                        {column.name}={column.selector}
+                        {column.attribute ? `@${column.attribute}` : ''}
+                      </code>
+                    ))}
+                  </span>
+                </div>
+              )}
+
               {step.locators.length > 0 && (
                 <div className="step-detail">
                   <span className="label">finds it by</span>
