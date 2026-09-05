@@ -1,15 +1,69 @@
 {
   "artboards": [
-    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 1440, "h": 900, "title": "Use cases" },
-    { "file": "UseCaseDetail.dc.html", "x": 1560, "y": 0, "w": 1440, "h": 900, "title": "Use case detail" },
-    { "file": "Record.dc.html", "x": 0, "y": 1060, "w": 1440, "h": 900, "title": "Record — name your values" },
-    { "file": "RunFailed.dc.html", "x": 1560, "y": 1060, "w": 1440, "h": 940, "title": "Failed run — repair" }
+    {
+      "file": "Main.dc.html",
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "Use cases"
+    },
+    {
+      "file": "UseCaseDetail.dc.html",
+      "x": 1560,
+      "y": 0,
+      "w": 1440,
+      "h": 900,
+      "title": "Use case detail"
+    },
+    {
+      "file": "Record.dc.html",
+      "x": 0,
+      "y": 1060,
+      "w": 1440,
+      "h": 900,
+      "title": "Record — name your values"
+    },
+    {
+      "file": "RunFailed.dc.html",
+      "x": 1560,
+      "y": 1060,
+      "w": 1440,
+      "h": 940,
+      "title": "Failed run — repair"
+    }
   ],
   "annotations": [
-    { "id": "palette", "x": 0, "y": -190, "w": 700, "text": "Direction: regulated financial services.\n\nDeep navy #12293D carries the chrome and every primary action; a single restrained gold #C9A227 marks the current place and the environment. Status colour is deep and desaturated — nothing shouts. Source Serif 4 for headings gives the documentary weight that category expects; Public Sans (drawn for government interfaces) does the UI; IBM Plex Mono carries locators and ids, which this product is full of.\n\nNot Guardian's own palette, wordmark or brand assets — those are theirs." },
-    { "id": "content-note", "x": 760, "y": -190, "w": 620, "text": "Everything on these screens is your real content: the five use cases from your database, the actual locator syntax, the UUID dropdown values, the s7 failure and its page census.\n\nTwo things to decide:\n• The product is still called \"Browser Agent\" in the chrome — the agent is gone, so that name may want revisiting.\n• The environment chip (UAT) is new. It follows from the promotion work and I would argue it should be permanent — an operator should never be unsure which environment they are about to run a batch against." },
-    { "id": "detail-note", "x": 1560, "y": -110, "w": 560, "text": "Existing structure kept: same four sections, same top navigation. The change is the visual language, not the information architecture — so this reads as a restyle you can adopt incrementally rather than a rebuild." },
-    { "id": "failure-note", "x": 1560, "y": 2050, "w": 700, "text": "The repair panel is drawn in its resolved state, showing the fix, the locator ladder change, and the line confirming it will be remembered — the piece that was missing until this week. The recorded locator is shown kept beneath the new one, because that is what actually happens." }
+    {
+      "id": "palette",
+      "x": 0,
+      "y": -190,
+      "w": 700,
+      "text": "Direction: regulated financial services.\n\nDeep navy #12293D carries the chrome and every primary action; a single restrained gold #C9A227 marks the current place and the environment. Status colour is deep and desaturated — nothing shouts. Source Serif 4 for headings gives the documentary weight that category expects; Public Sans (drawn for government interfaces) does the UI; IBM Plex Mono carries locators and ids, which this product is full of.\n\nNot Guardian's own palette, wordmark or brand assets — those are theirs."
+    },
+    {
+      "id": "content-note",
+      "x": 760,
+      "y": -190,
+      "w": 620,
+      "text": "Everything on these screens is your real content: the use cases from your database, the actual locator syntax, the UUID dropdown values, the s7 failure and its page census.\n\nTwo things settled since:\n• The product is Understudy. It watches a person do the task once and then performs that part faithfully — which is what this does now that the agent is gone, and what \"Browser Agent\" stopped describing.\n• The environment badge is permanent. An operator should never be unsure which deployment they are about to run a batch against."
+    },
+    {
+      "id": "detail-note",
+      "x": 1560,
+      "y": -110,
+      "w": 560,
+      "text": "Existing structure kept: same four sections, same top navigation. The change is the visual language, not the information architecture — so this reads as a restyle you can adopt incrementally rather than a rebuild."
+    },
+    {
+      "id": "failure-note",
+      "x": 1560,
+      "y": 2050,
+      "w": 700,
+      "text": "The repair panel is drawn in its resolved state, showing the fix, the locator ladder change, and the line confirming it will be remembered — the piece that was missing until this week. The recorded locator is shown kept beneath the new one, because that is what actually happens."
+    }
   ],
-  "launch": { "view": "canvas" }
+  "launch": {
+    "view": "canvas"
+  }
 }

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
-import type { BatchDetail, CredentialSummary, DatasetSummary, UseCase } from '../lib/events';
+import type {
+  BatchDetail,
+  BatchSummary,
+  CredentialSummary,
+  DatasetSummary,
+  UseCase,
+} from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
 import {
   DiscoveryResult,
@@ -48,6 +54,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
   const [batch, setBatch] = useState<BatchDetail | null>(null);
+  // Batches this use case has already run. `batch` above is only ever set by
+  // starting or resuming one, so without this a batch became unreachable the
+  // moment the tab closed -- no progress, no resume, no results, on a job that
+  // can run for hours.
+  const [pastBatches, setPastBatches] = useState<BatchSummary[]>([]);
   // A run that found rows stays on screen, because the useful thing to do next
   // -- turn them into a dataset -- is here rather than in the run view.
   const [lastDiscovery, setLastDiscovery] = useState<{
@@ -66,6 +77,12 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         api.listCredentials(),
       ]);
       setUseCase(detail.definition);
+      // Best effort: a use case that has never run has none, and failing to
+      // list them must not stop the screen loading.
+      api
+        .listBatches(usecaseId)
+        .then((body) => setPastBatches(body.batches))
+        .catch(() => setPastBatches([]));
       setRowDelay(
         detail.definition.row_delay_seconds === null ||
           detail.definition.row_delay_seconds === undefined
@@ -744,6 +761,59 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               outputs={lastDiscovery.outputs}
               onSaved={() => setNotice('Saved. It is now under Run a file, below.')}
             />
+          )}
+
+          {pastBatches.length > 0 && (
+            <div className="card">
+              <h3>Earlier runs</h3>
+              <p className="hint">
+                A batch keeps running whether or not this page is open. Open one to watch it,
+                resume what a stopped run never attempted, or take the results.
+              </p>
+              <table className="mapping">
+                <thead>
+                  <tr>
+                    <th>Started</th>
+                    <th>Status</th>
+                    <th>Rows</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pastBatches.map((past) => (
+                    <tr key={past.id}>
+                      <td style={{ fontSize: 13 }}>
+                        {new Date(past.created_at).toLocaleString()}
+                      </td>
+                      <td>
+                        <span className={`badge ${past.status}`}>{past.status}</span>
+                      </td>
+                      <td style={{ fontSize: 13 }}>
+                        {past.succeeded}/{past.total} done
+                        {past.failed > 0 && (
+                          <span style={{ color: 'var(--danger)' }}> · {past.failed} failed</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              act(async () => setBatch(await api.getBatch(past.id)))
+                            }
+                          >
+                            Open
+                          </button>
+                          <a className="linkish" href={batchResultsUrl(past.id)}>
+                            Results
+                          </a>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
 
           <h3>Run a file</h3>
