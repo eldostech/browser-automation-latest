@@ -1003,6 +1003,22 @@ the point.
 
 ---
 
+## 10.1 Bringing an agent back, deliberately
+
+This document argues for removing the agent, and that argument still holds for
+*execution*: a per-row model call makes every run cost money and no two runs
+identical. What it did not anticipate is the demand for an agent as an
+**author** -- something that explores an unfamiliar site once and hands back a
+recording that then replays for free.
+
+[`agent-and-deterministic.md`](agent-and-deterministic.md) is the design for
+having both, on two independent axes: who authored a use case, and how it runs.
+The invariant that makes it safe is the one already enforced here -- `engine.py`
+cannot import `llm` -- so the agent lives in a separate driver and the
+deterministic path keeps its guarantee. Nothing in it is built.
+
+---
+
 ## 11. Risks
 
 **Codegen output is not a stable API.** Playwright can change what it emits

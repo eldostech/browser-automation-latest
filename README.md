@@ -63,6 +63,12 @@ parameterised list of steps that replays with no model at all.
 For what is stored where -- every table, what it holds and why -- see
 [`docs/design/data-model.md`](docs/design/data-model.md).
 
+For the proposed design that adds an LLM agent beside the deterministic engine
+-- authoring a workflow by describing it, and running one adaptively, without
+losing free replay -- see
+[`docs/design/agent-and-deterministic.md`](docs/design/agent-and-deterministic.md).
+Nothing in that document is built.
+
 If you want the full reasoning, including the three things the design document
 asserted that turned out to be wrong, read
 [`docs/design/deterministic-automation-platform.md`](docs/design/deterministic-automation-platform.md).
