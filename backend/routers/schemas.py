@@ -406,3 +406,14 @@ class SaveAgentSessionRequest(BaseModel):
     """Turn a finished session's draft into a use case."""
 
     name: str = Field(default="", max_length=200)
+
+
+class SpendLimitRequest(BaseModel):
+    """The monthly ceiling, or None to remove it.
+
+    None rather than zero for "no limit": zero is a perfectly reasonable
+    ceiling to set deliberately, and conflating the two would make "stop all
+    spending" unexpressible.
+    """
+
+    limit_usd: float | None = Field(default=None, ge=0, le=1_000_000)

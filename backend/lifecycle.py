@@ -47,6 +47,12 @@ class Terminal:
     summary: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    #: What this run spent. On the terminal rather than only in ``result`` so
+    #: it lands in columns that can be summed: "what has this workspace spent
+    #: this month" is a question with a JSONB answer otherwise, which is a
+    #: question nobody asks twice.
+    tokens: int = 0
+    cost_usd: float = 0.0
 
 
 class RunLifecycle:
@@ -148,6 +154,8 @@ class RunLifecycle:
             summary=terminal.summary,
             result=terminal.result,
             error=terminal.error,
+            tokens=terminal.tokens,
+            cost_usd=terminal.cost_usd,
         )
         log.info(
             "run finished",

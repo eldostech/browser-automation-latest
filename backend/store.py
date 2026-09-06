@@ -25,6 +25,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Sequence
 
 from sqlalchemy import delete, func, select, update
@@ -479,6 +480,8 @@ class WorkspaceStore:
         summary: str | None = None,
         result: dict[str, Any] | None = None,
         error: str | None = None,
+        tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> None:
         await self._update_run(
             run_id,
@@ -489,6 +492,8 @@ class WorkspaceStore:
             summary=summary,
             result=result,
             error=error,
+            tokens=tokens,
+            cost_usd=cost_usd,
         )
 
     async def _update_run(self, run_id: str, **values: Any) -> None:
@@ -575,6 +580,65 @@ class WorkspaceStore:
             return int(highest or 0) + 1
 
     # -- use cases ----------------------------------------------------------
+
+    # -- spend ----------------------------------------------------------------
+    async def spend_since(self, since: datetime) -> dict[str, Any]:
+        """What this workspace has spent with a model since ``since``.
+
+        Summed over runs, which is every kind of run: an agent authoring
+        session and a Guided replay that repaired itself both write their cost
+        to the same two columns, so there is one number rather than two that
+        have to be added by whoever remembers both exist.
+        """
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        func.coalesce(func.sum(Run.tokens), 0),
+                        func.coalesce(func.sum(Run.cost_usd), 0.0),
+                        func.count(Run.id),
+                    ).where(
+                        Run.workspace_id == self._ws,
+                        Run.created_at >= since,
+                    )
+                )
+            ).one()
+        return {"tokens": int(row[0] or 0), "usd": float(row[1] or 0.0), "runs": int(row[2] or 0)}
+
+    async def spend_this_month(self) -> dict[str, Any]:
+        """Spend since the first of the current UTC month, and the ceiling.
+
+        A calendar month rather than a rolling window because that is how a
+        person thinks about a budget, and because a rolling window means the
+        answer to "have I got room" changes while nothing happens.
+        """
+        now = utcnow()
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        used = await self.spend_since(start)
+        limit = await self.spend_limit()
+        remaining = None if limit is None else max(0.0, limit - used["usd"])
+        return {
+            **used,
+            "since": iso(start),
+            "limit_usd": limit,
+            "remaining_usd": remaining,
+        }
+
+    async def spend_limit(self) -> float | None:
+        async with self._sessions() as session:
+            return await session.scalar(
+                select(Workspace.monthly_spend_limit_usd).where(Workspace.id == self._ws)
+            )
+
+    async def set_spend_limit(self, limit: float | None) -> None:
+        """Set or clear the ceiling. None means no limit at all."""
+        async with self._sessions() as session:
+            await session.execute(
+                update(Workspace)
+                .where(Workspace.id == self._ws)
+                .values(monthly_spend_limit_usd=limit)
+            )
+            await session.commit()
 
     # -- targets ------------------------------------------------------------
     async def list_targets(self) -> list[dict[str, Any]]:

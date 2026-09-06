@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from auth.rbac import Permission, ROLE_PERMISSIONS
 from auth.service import AuthError, AuthService, Principal
 from deps import WorkspaceData, get_auth, require
-from routers.schemas import CreateUserRequest, UpdateUserRequest
+from routers.schemas import CreateUserRequest, SpendLimitRequest, UpdateUserRequest
 
 log = logging.getLogger(__name__)
 
@@ -129,3 +129,41 @@ async def read_audit(
             resource_type=resource_type, resource_id=resource_id, limit=limit
         )
     }
+
+
+@router.get("/spend")
+async def get_spend(
+    data: WorkspaceData,
+    _: Annotated[Principal, Depends(require(Permission.RUN_READ))],
+) -> dict[str, Any]:
+    """What this workspace has spent with a model this month, and its ceiling.
+
+    Readable by anyone who can read runs, not just an administrator. A person
+    about to start an agent session needs to know whether there is room, and
+    finding out by being refused is a worse way to learn it.
+    """
+    return await data.spend_this_month()
+
+
+@router.put("/spend/limit")
+async def set_spend_limit(
+    body: SpendLimitRequest,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USER_MANAGE))],
+) -> dict[str, Any]:
+    """Set or clear the monthly ceiling. Administrators only.
+
+    Setting a budget is the same kind of authority as managing accounts, and
+    deliberately not the same as being able to spend against it -- the person
+    who can raise the limit should not be every person who can hit it.
+    """
+    await data.set_spend_limit(body.limit_usd)
+    await data.audit(
+        "workspace.spend_limit",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="workspace",
+        resource_id=principal.workspace_id,
+        detail={"limit_usd": body.limit_usd},
+    )
+    return await data.spend_this_month()

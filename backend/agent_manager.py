@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from agent import AgentSession, AuthorRequest, AuthorResult, Budget
@@ -176,6 +176,7 @@ class AgentSessions:
         owner_email: str = "",
     ) -> Session:
         self.check_available()
+        budget = await self._within_the_ceiling(workspace_id, budget or Budget())
         session_id = uuid.uuid4().hex
         run_id = uuid.uuid4().hex
 
@@ -197,7 +198,7 @@ class AgentSessions:
             secrets=tuple(sorted(secrets or {})),
             sample=dict(sample or {}),
             may_write=may_write,
-            budget=budget or Budget(),
+            budget=budget,
             run_id=run_id,
             workspace_id=workspace_id,
         )
@@ -205,6 +206,36 @@ class AgentSessions:
             self._drive(record, request, dict(secrets or {}), name)
         )
         return record
+
+    async def _within_the_ceiling(self, workspace_id: str, budget: Budget) -> Budget:
+        """Fold the workspace's monthly ceiling into this session's own budget.
+
+        Rather than adding a second enforcement path. The session budget is
+        already checked before every model call and every tool call, so
+        lowering it to what is left in the month means one mechanism stops the
+        session and one message says which limit bit.
+
+        A workspace already at its ceiling is refused here instead, because
+        starting a session with nothing to spend would open a browser, take a
+        snapshot and stop -- which looks like a failure rather than a budget.
+        """
+        spend = await self.store.workspace(workspace_id).spend_this_month()
+        remaining = spend.get("remaining_usd")
+        if remaining is None:
+            return budget
+        if remaining <= 0:
+            raise AgentUnavailable(
+                f"This workspace has spent ${spend['usd']:.2f} of its "
+                f"${spend['limit_usd']:.2f} monthly limit. An administrator can "
+                "raise it, or it resets at the start of next month."
+            )
+        if budget.usd is None or budget.usd > remaining:
+            log.info(
+                "session budget lowered to the workspace ceiling",
+                extra={"workspace_id": workspace_id, "remaining_usd": remaining},
+            )
+            return replace(budget, usd=round(remaining, 4))
+        return budget
 
     async def _drive(
         self,
@@ -254,6 +285,8 @@ class AgentSessions:
                         steps=result.steps,
                         summary=result.summary or None,
                         error=result.stopped_by or None,
+                        tokens=int(result.spend.get("tokens") or 0),
+                        cost_usd=float(result.spend.get("usd") or 0.0),
                     )
                 )
         except asyncio.CancelledError:

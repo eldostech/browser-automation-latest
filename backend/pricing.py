@@ -1,0 +1,66 @@
+"""What a model turn costs, in one place.
+
+Two things in this application spend tokens: an agent authoring session, and a
+healer re-finding a control mid-replay. Both need to price what they used, and
+before this module they were the only two places that could have -- so pricing
+lived in the agent package, where the healer could not reach it without
+importing an optional dependency group it has nothing to do with.
+
+**These figures are estimates and the AWS bill is the authority.** They exist
+so a person can see roughly what a session cost before it finishes and set a
+limit in the unit they actually budget in. A ceiling built on them is a
+guard rail, not an accounting control.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+#: USD per million tokens, as (input, output). Matched loosely on the model id
+#: because a real Bedrock id carries a region prefix and a version suffix --
+#: `us.anthropic.claude-sonnet-5-20260514-v1:0` -- so an exact lookup would
+#: fall through to the default for every actual deployment.
+PRICES: dict[str, tuple[float, float]] = {
+    "claude-opus-5": (15.0, 75.0),
+    "claude-sonnet-5": (3.0, 15.0),
+    "claude-haiku-4-5": (0.80, 4.0),
+}
+
+#: What an unlisted model is assumed to cost. Deliberately not zero: an
+#: estimate of $0.00 for a four-thousand-row batch is the most expensive kind
+#: of wrong, and a model missing from the table above is far more likely to be
+#: new than to be free.
+DEFAULT_PRICE: tuple[float, float] = (3.0, 15.0)
+
+
+def rates_for(model: str) -> tuple[float, float]:
+    for known, rates in PRICES.items():
+        if known in (model or ""):
+            return rates
+    return DEFAULT_PRICE
+
+
+def price_of(model: str, usage: dict[str, Any]) -> float:
+    """Dollars for one turn, from its own input/output split."""
+    read, written = rates_for(model)
+    tokens_in = int(usage.get("input_tokens") or 0)
+    tokens_out = int(usage.get("output_tokens") or 0)
+    return (tokens_in * read + tokens_out * written) / 1_000_000
+
+
+def price_of_total(model: str, tokens: int, *, output_share: float = 0.2) -> float:
+    """Dollars for a token count whose split was not kept.
+
+    A worse answer than :func:`price_of` and used only where the split is
+    genuinely gone. The share is stated rather than hidden because output
+    tokens cost roughly five times input ones, so the assumption is most of the
+    answer -- and it is deliberately generous, since a governance number that
+    under-reports is the one that lets a bill through.
+    """
+    read, written = rates_for(model)
+    tokens = max(0, int(tokens))
+    out = tokens * output_share
+    return ((tokens - out) * read + out * written) / 1_000_000
+
+
+__all__ = ["DEFAULT_PRICE", "PRICES", "price_of", "price_of_total", "rates_for"]

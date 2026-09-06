@@ -13,7 +13,13 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
-import type { AgentEvent, AgentSessionDetail, CredentialSummary, Target } from '../lib/events';
+import type {
+  AgentEvent,
+  AgentSessionDetail,
+  CredentialSummary,
+  Target,
+  WorkspaceSpend,
+} from '../lib/events';
 import { useRunStream } from '../lib/useRunStream';
 
 type Props = {
@@ -37,10 +43,14 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
   const [spendCap, setSpendCap] = useState('1.00');
   const [targets, setTargets] = useState<Target[]>([]);
   const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
+  // What the workspace has left this month. Shown before the button rather
+  // than discovered by being refused, which is a worse way to learn it.
+  const [spend, setSpend] = useState<WorkspaceSpend | null>(null);
 
   useEffect(() => {
     api.listTargets().then((b) => setTargets(b.targets)).catch(() => setTargets([]));
     api.listCredentials().then((b) => setCredentials(b.credentials)).catch(() => undefined);
+    api.getSpend().then(setSpend).catch(() => setSpend(null));
   }, []);
 
   // Poll while it is working. The transcript is live over the websocket; this
@@ -172,6 +182,16 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
           Checked before every call, not reported after. Reaching a limit ends the session
           and keeps everything it did &mdash; often that is a complete recording.
         </p>
+        {spend && spend.limit_usd !== null && (
+          <p className={spend.remaining_usd === 0 ? 'banner error' : 'hint'}>
+            This workspace has spent ${spend.usd.toFixed(2)} of its $
+            {spend.limit_usd.toFixed(2)} limit this month.{' '}
+            {spend.remaining_usd === 0
+              ? 'There is nothing left, so a session cannot start until an administrator raises it.'
+              : `A session here can spend at most $${(spend.remaining_usd ?? 0).toFixed(2)}, whatever you set below.`}
+          </p>
+        )}
+
         <div className="row" style={{ gap: 16 }}>
           <label className="field" style={{ maxWidth: 140 }}>
             <span>Steps</span>

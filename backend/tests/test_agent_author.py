@@ -28,7 +28,7 @@ from agent.author import (
     stop_for_budget,
     system_prompt,
 )
-from agent.budget import price_of
+from pricing import price_of
 from agent.session import AgentToolSession
 from llm import LLMTurn, ToolCallRequest
 from test_agent_marks import INVITE

@@ -1859,3 +1859,33 @@ table.mapping .examples {
     grid-template-columns: 1fr;
   }
 }
+
+/* ------------------------------------------------------------- spending */
+.spend-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+.spend-figure .amount {
+  font-size: 28px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+/* Only drawn when there is a ceiling to be a share of. A bar with no
+   denominator says nothing and looks like it says something. */
+.spend-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 0 0 14px;
+  max-width: 320px;
+}
+.spend-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}

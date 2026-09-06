@@ -643,3 +643,16 @@ export interface AgentSessionDetail {
   draft_warnings: string[];
   verification: Partial<AgentVerification>;
 }
+
+
+/** What a workspace has spent with a model this month, and its ceiling.
+ *  `limit_usd` null means no ceiling was ever set, which is not the same as a
+ *  ceiling of zero. */
+export interface WorkspaceSpend {
+  usd: number;
+  tokens: number;
+  runs: number;
+  since: string;
+  limit_usd: number | null;
+  remaining_usd: number | null;
+}

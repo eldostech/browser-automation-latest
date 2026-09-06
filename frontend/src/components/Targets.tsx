@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import type { Target } from '../lib/events';
+import { SpendCard } from './SpendCard';
 
 export function Targets() {
   const [targets, setTargets] = useState<Target[]>([]);
@@ -184,6 +185,11 @@ export function Targets() {
           </tbody>
         </table>
       )}
+
+      {/* Not really a target, but the same kind of thing: something this
+          deployment decides on behalf of every use case in it. It gets its own
+          screen when there is an admin one to put it on. */}
+      <SpendCard />
     </div>
   );
 }

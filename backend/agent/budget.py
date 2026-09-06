@@ -30,36 +30,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-#: What Bedrock charges, per million tokens, for the models this deployment
-#: uses. Approximate on purpose: this drives a warning and an estimate a person
-#: reads, not an invoice. A model absent from the table costs the default,
-#: which is deliberately not zero -- an unpriced model must not look free.
-PRICES: dict[str, tuple[float, float]] = {
-    # (input, output) USD per million tokens.
-    "claude-opus-5": (15.0, 75.0),
-    "claude-sonnet-5": (3.0, 15.0),
-    "claude-haiku-4-5": (0.80, 4.0),
-}
-DEFAULT_PRICE = (3.0, 15.0)
+from pricing import price_of
 
-
-def price_of(model: str, usage: dict[str, int]) -> float:
-    """Dollars for one turn's usage. Matched loosely on the model id.
-
-    Bedrock ids carry a region prefix and a version suffix -- `us.anthropic.
-    claude-sonnet-5-20260514-v1:0` -- so an exact lookup would silently fall
-    through to the default for every real deployment.
-    """
-    rates = DEFAULT_PRICE
-    for known, known_rates in PRICES.items():
-        if known in (model or ""):
-            rates = known_rates
-            break
-    read = int(usage.get("input_tokens") or 0)
-    written = int(usage.get("output_tokens") or 0)
-    return (read * rates[0] + written * rates[1]) / 1_000_000
-
-
+# Pricing lives in `pricing.py`, not here. The healer spends tokens too, and
+# it cannot import this package -- the agent is an optional dependency group
+# and a replay must work without it installed.
 class BudgetExhausted(RuntimeError):
     """A limit was reached. Carries which one, because it is the whole answer."""
 
@@ -168,4 +143,4 @@ class Spend:
         }
 
 
-__all__ = ["PRICES", "Budget", "BudgetExhausted", "Spend", "price_of"]
+__all__ = ["Budget", "BudgetExhausted", "Spend"]

@@ -185,6 +185,12 @@ class RowResult:
     #: Always 0 for a pure replay. Recorded so the dashboard can prove it.
     llm_calls: int = 0
     llm_tokens: int = 0
+    #: What those calls cost. Zero on a Strict row by construction -- the
+    #: engine cannot reach a model -- and non-zero on a Guided row that had to
+    #: repair itself. Reported rather than assumed: "free" and "not measured"
+    #: look identical on a dashboard, and until this existed every replay
+    #: claimed to be free whether or not it had healed.
+    llm_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +201,7 @@ class RowResult:
             "duration_ms": self.duration_ms,
             "llm_calls": self.llm_calls,
             "llm_tokens": self.llm_tokens,
+            "llm_usd": round(self.llm_usd, 4),
         }
 
 
@@ -296,6 +303,34 @@ class UseCaseExecutor:
         #: Repairs accepted this session, for the version bump afterwards.
         self.healed: list[Any] = []
 
+    # -- what this run has spent --------------------------------------------
+    @property
+    def spent(self) -> tuple[int, int, float]:
+        """(calls, tokens, usd) for this session, cumulative.
+
+        Read off the injected healer, which is the only object in reach that
+        can spend anything -- and read by attribute rather than by importing
+        it, because this module must not import ``llm`` and the healer is the
+        thing that does. Zero when there is no healer, which is the Strict
+        case, and it is a measured zero rather than an assumed one.
+        """
+        healer = self.healer
+        if healer is None:
+            return 0, 0, 0.0
+        return (
+            int(getattr(healer, "calls_used", 0) or 0),
+            int(getattr(healer, "tokens_used", 0) or 0),
+            float(getattr(healer, "usd_used", 0.0) or 0.0),
+        )
+
+    def _since(self, before: tuple[int, int, float]) -> dict[str, Any]:
+        calls, tokens, usd = self.spent
+        return {
+            "llm_calls": calls - before[0],
+            "llm_tokens": tokens - before[1],
+            "llm_usd": usd - before[2],
+        }
+
     # -- public API ---------------------------------------------------------
     async def run_setup(self) -> RowResult:
         """Run ``setup_steps`` once for this session. Signing in happens here."""
@@ -323,6 +358,9 @@ class UseCaseExecutor:
         must keep going. Only a dead browser propagates.
         """
         started = time.monotonic()
+        # What the healer had spent before this row, so the row reports its own
+        # cost rather than the session's running total.
+        before = self.spent
         values = self.usecase.with_defaults(inputs)
         outputs: dict[str, Any] = {}
         outcomes: list[StepOutcome] = []
@@ -352,6 +390,7 @@ class UseCaseExecutor:
                 error=str(exc),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 steps=outcomes,
+                **self._since(before),
             )
 
         await self._capture_row(ok=True)
@@ -360,6 +399,7 @@ class UseCaseExecutor:
             outputs=outputs,
             duration_ms=int((time.monotonic() - started) * 1000),
             steps=outcomes,
+            **self._since(before),
         )
 
     async def run_teardown(self) -> RowResult:

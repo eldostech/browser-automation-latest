@@ -705,16 +705,28 @@ class ReplayManager:
 def replay_terminal(result: RowResult) -> Terminal:
     """How a replayed row ended, in the shape the finaliser wants.
 
-    ``llm_calls`` and ``llm_tokens`` are reported as zero rather than omitted:
-    they are the number this whole feature exists to produce, and a dashboard
-    that shows a blank cannot tell "free" from "not measured".
+    The token counts are reported rather than omitted: they are the number this
+    whole feature exists to produce, and a dashboard showing a blank cannot
+    tell "free" from "not measured".
+
+    They used to be *hardcoded* to zero, which was true while healing was the
+    only thing that could spend and nothing carried what it spent. It stopped
+    being true the moment a use case could choose Guided mode, and a run that
+    repaired itself twice still claimed to have cost nothing. They come off the
+    result now, where a Strict row still reports a measured zero.
     """
     return Terminal(
         status="succeeded" if result.ok else "failed",
         steps=len(result.steps),
         duration_ms=result.duration_ms,
         summary="replay finished" if result.ok else None,
-        result={"outputs": result.outputs, "llm_calls": 0, "llm_tokens": 0},
+        result={
+            "outputs": result.outputs,
+            "llm_calls": result.llm_calls,
+            "llm_tokens": result.llm_tokens,
+        },
+        tokens=result.llm_tokens,
+        cost_usd=result.llm_usd,
         error=result.error,
     )
 

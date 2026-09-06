@@ -67,6 +67,16 @@ class Workspace(Base):
     id: Mapped[str] = id_column()
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    #: What this workspace may spend with a model in a calendar month, or NULL
+    #: for no ceiling. Nullable rather than a large default because "unlimited"
+    #: and "limited to a number somebody picked" are different states, and an
+    #: install that has never thought about it should not be told it has a
+    #: budget it did not set.
+    #:
+    #: A guard rail, not an accounting control: it is enforced against this
+    #: application's own estimate of what a turn costs, and the AWS bill is the
+    #: authority. See pricing.py.
+    monthly_spend_limit_usd: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = created_at_column()
 
 
@@ -201,6 +211,20 @@ class Run(Base):
     summary: Mapped[str | None] = mapped_column(Text)
     result: Mapped[dict | None] = _json_column(default=None, nullable=True)
     error: Mapped[str | None] = mapped_column(Text)
+    #: What this run spent with a model. Columns rather than fields inside
+    #: ``result`` because the question they exist to answer -- what has this
+    #: workspace spent this month -- is a SUM, and a SUM over JSONB is a
+    #: question nobody asks twice.
+    #:
+    #: Zero is the ordinary value and it is *measured*, not assumed: a Strict
+    #: replay cannot reach a model at all, and saying so with a number is what
+    #: lets a dashboard tell "free" from "not recorded".
+    tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    cost_usd: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default="0"
+    )
 
 
 class Event(Base):

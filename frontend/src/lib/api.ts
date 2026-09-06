@@ -25,6 +25,7 @@ import type {
   ServerConfig,
   StartAgentSession,
   Target,
+  WorkspaceSpend,
   UseCase,
   UseCaseSummary,
 } from './events';
@@ -500,6 +501,14 @@ export const api = {
 
   deleteCredential: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/api/credentials/${id}`, { method: 'DELETE' }),
+
+  getSpend: () => request<WorkspaceSpend>('/api/admin/spend'),
+
+  setSpendLimit: (limitUsd: number | null) =>
+    request<WorkspaceSpend>('/api/admin/spend/limit', {
+      method: 'PUT',
+      body: JSON.stringify({ limit_usd: limitUsd }),
+    }),
 
   // --- the agent -----------------------------------------------------------
   // Deliberately the same shape as the recording endpoints: start, watch,

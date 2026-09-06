@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from memory import HealingMemory, as_prompt
+from pricing import price_of
 from prompt_loader import HEAL, HEAL_REQUEST, load, render
 from snapshot import Node, Snapshot
 from usecase import Locator, Step
@@ -90,14 +91,20 @@ class HealingBudget:
     max_tokens: int = 20_000
     attempts_used: int = 0
     tokens_used: int = 0
+    #: What those tokens cost, priced from each turn's own input/output split
+    #: rather than from a total. Recorded because "this replay was free" and
+    #: "this replay healed itself twice" have to be tellable apart, and until
+    #: now they were not: the tokens were counted here and never left.
+    usd_used: float = 0.0
 
     @property
     def exhausted(self) -> bool:
         return self.attempts_used >= self.max_attempts or self.tokens_used >= self.max_tokens
 
-    def record(self, tokens: int) -> None:
+    def record(self, tokens: int, usd: float = 0.0) -> None:
         self.attempts_used += 1
         self.tokens_used += tokens
+        self.usd_used += usd
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,6 +112,7 @@ class HealingBudget:
             "max_attempts": self.max_attempts,
             "tokens_used": self.tokens_used,
             "max_tokens": self.max_tokens,
+            "usd_used": round(self.usd_used, 4),
             "exhausted": self.exhausted,
         }
 
@@ -151,6 +159,14 @@ class StepHealer:
     @property
     def tokens_used(self) -> int:
         return self.budget.tokens_used
+
+    @property
+    def usd_used(self) -> float:
+        return self.budget.usd_used
+
+    @property
+    def calls_used(self) -> int:
+        return self.budget.attempts_used
 
     def candidates(self, snapshot: Snapshot) -> list[Node]:
         """Interactive, named controls currently on the page."""
@@ -230,7 +246,7 @@ class StepHealer:
             return None
 
         tokens = int(turn.usage.get("input_tokens", 0)) + int(turn.usage.get("output_tokens", 0))
-        self.budget.record(tokens)
+        self.budget.record(tokens, price_of(getattr(self.llm, "model", ""), turn.usage))
 
         call = next((c for c in turn.tool_calls if c.name == CHOOSE_TOOL["name"]), None)
         if call is None:
