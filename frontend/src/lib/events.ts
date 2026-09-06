@@ -594,6 +594,9 @@ export interface StartAgentSession {
   credential_id?: string | null;
   sample?: Record<string, string>;
   may_write?: boolean;
+  /** Show a real window instead of running headless. Unset follows the
+   *  deployment default. */
+  headless?: boolean;
   budget_steps?: number;
   budget_usd?: number;
 }

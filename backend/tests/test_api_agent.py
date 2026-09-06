@@ -53,7 +53,10 @@ def arm(client: TestClient, *turns, replay=None) -> FakeMCP:
         for name in ("browser_snapshot", "browser_navigate", "browser_type", "browser_click")
     })
     manager = client.app.state.agent_sessions
-    manager.provider = lambda: provider
+    # Accepts the per-session headless override even though this fake ignores
+    # it -- the production signature takes one, and a stub narrower than that
+    # would silently pass every test that calls it the real way.
+    manager.provider = lambda headless=None: provider
     manager.llm_factory = lambda: ScriptedLLM(list(turns or a_recording()))
     # Verification would otherwise start Chromium, which is not what this file
     # is about. `test_agent_mcp_live.py` covers the real one, end to end.
@@ -314,3 +317,71 @@ async def test_shutting_down_waits_for_what_it_cancels(
         "never ran and its connection was never handed back"
     )
     assert manager._sessions == {}
+
+
+# --- watching the session ----------------------------------------------
+
+
+def test_headless_defaults_to_the_deployment_setting():
+    """Nobody asked, so the installation's own default decides -- same as it
+    always has."""
+    from agent_manager import AgentSessions
+
+    manager = AgentSessions(None, None, object(), lambda: None)
+    manager.settings = type("S", (), {"agent_headless": True, "agent_browser_provider": "local"})()
+
+    assert manager.provider().headless is True
+    assert manager.provider(headless=None).headless is True
+
+
+def test_a_person_starting_a_session_can_ask_to_watch_it():
+    """The same choice a replay already offers under "Show the browser while
+    it runs" -- watching is how trust in this gets built the first few times,
+    and nobody should have to ask an administrator to see it."""
+    from agent_manager import AgentSessions
+
+    manager = AgentSessions(None, None, object(), lambda: None)
+    manager.settings = type("S", (), {"agent_headless": True, "agent_browser_provider": "local"})()
+
+    assert manager.provider(headless=False).headless is False
+
+
+def test_the_override_has_no_effect_on_a_managed_browser():
+    """A CDP session's browser is somebody else's to configure, and this
+    session did not start it -- headless is not this deployment's call to make
+    there either way."""
+    from agent_manager import AgentSessions
+
+    manager = AgentSessions(None, None, object(), lambda: None)
+    manager.settings = type(
+        "S",
+        (),
+        {
+            "agent_headless": True,
+            "agent_browser_provider": "cdp",
+            "agent_cdp_endpoint": "ws://managed/abc",
+        },
+    )()
+
+    provider = manager.provider(headless=False)
+    assert "--headless" not in provider.argv()
+    assert "ws://managed/abc" in provider.argv()
+
+
+async def test_starting_a_session_can_request_a_visible_browser(client: TestClient):
+    """Through the whole path: the request body, the manager, the provider
+    that is actually constructed."""
+    arm(client)
+    manager = client.app.state.agent_sessions
+    seen = {}
+    real_start = manager.start
+
+    async def spy(**kwargs):
+        seen["headless"] = kwargs.get("headless")
+        return await real_start(**kwargs)
+
+    manager.start = spy
+
+    client.post("/api/agent-sessions", json={**START, "headless": False})
+
+    assert seen["headless"] is False

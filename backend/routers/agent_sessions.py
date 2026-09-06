@@ -84,6 +84,7 @@ async def start_session(
             allowed_domains=(allowed,),
             workspace_id=principal.workspace_id,
             may_write=body.may_write,
+            headless=body.headless,
             budget=Budget(
                 steps=body.budget_steps,
                 tokens=body.budget_tokens,

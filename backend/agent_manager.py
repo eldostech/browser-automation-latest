@@ -138,15 +138,23 @@ class AgentSessions:
                 "Recording with codegen does not, and still works."
             )
 
-    def provider(self) -> Any:
+    def provider(self, headless: bool | None = None) -> Any:
         """The agent's browser, per this deployment's configuration.
 
         `cdp` attaches to a browser somebody else runs -- a managed session --
         rather than launching one. It is a different argv and nothing else,
         which is the whole point of the provider being an interface.
+
+        ``headless`` is a per-session override of the deployment default, for
+        the same reason a replay has "Show the browser while it runs": whether
+        a person wants to watch is a choice made when the session starts, not
+        a thing the deployment should decide for everyone. It has no effect on
+        `cdp` -- the browser there is somebody else's to configure, and this
+        session did not start it.
         """
         endpoint = ""
-        if getattr(self.settings, "agent_browser_provider", "local") == "cdp":
+        provider = getattr(self.settings, "agent_browser_provider", "local")
+        if provider == "cdp":
             endpoint = getattr(self.settings, "agent_cdp_endpoint", "")
             if not endpoint:
                 raise AgentUnavailable(
@@ -154,7 +162,11 @@ class AgentSessions:
                     "empty, so there is no browser to attach to."
                 )
         return LocalPlaywrightMCP(
-            headless=getattr(self.settings, "agent_headless", True),
+            headless=(
+                getattr(self.settings, "agent_headless", True)
+                if headless is None or provider == "cdp"
+                else headless
+            ),
             version=getattr(self.settings, "agent_mcp_version", None),
             cdp_endpoint=endpoint,
         )
@@ -174,6 +186,7 @@ class AgentSessions:
         name: str = "",
         owner_id: str | None = None,
         owner_email: str = "",
+        headless: bool | None = None,
     ) -> Session:
         self.check_available()
         budget = await self._within_the_ceiling(workspace_id, budget or Budget())
@@ -203,7 +216,7 @@ class AgentSessions:
             workspace_id=workspace_id,
         )
         record._task = asyncio.create_task(
-            self._drive(record, request, dict(secrets or {}), name)
+            self._drive(record, request, dict(secrets or {}), name, headless)
         )
         return record
 
@@ -243,6 +256,7 @@ class AgentSessions:
         request: AuthorRequest,
         secrets: dict[str, str],
         name: str,
+        headless: bool | None,
     ) -> None:
         """Run the session, writing its events where every run writes them."""
         data = self.store.workspace(record.workspace_id)
@@ -261,7 +275,7 @@ class AgentSessions:
                 async with AgentSession(
                     request,
                     llm=self.llm_factory(),
-                    provider=self.provider(),
+                    provider=self.provider(headless),
                     emit=_stamped(run.sink),
                     secrets=secrets,
                     name=name,

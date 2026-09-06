@@ -39,6 +39,10 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
   const [name, setName] = useState('');
   const [credentialId, setCredentialId] = useState('');
   const [mayWrite, setMayWrite] = useState(false);
+  // Off by default because a session runs unattended more often than not;
+  // when somebody is starting one and staying to watch, they can ask for the
+  // window the same way they would for a replay.
+  const [watch, setWatch] = useState(false);
   const [steps, setSteps] = useState('40');
   const [spendCap, setSpendCap] = useState('1.00');
   const [targets, setTargets] = useState<Target[]>([]);
@@ -79,6 +83,7 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
           name: name.trim() || undefined,
           credential_id: credentialId || undefined,
           may_write: mayWrite,
+          headless: !watch,
           budget_steps: Number(steps) || 40,
           budget_usd: Number(spendCap) || 1,
         }),
@@ -216,6 +221,17 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
             <span className="hint" style={{ margin: '2px 0 0' }}>
               Off means it can look but not click, type or submit. Anything irreversible
               &mdash; submitting, deleting, paying &mdash; stops and asks you either way.
+            </span>
+          </span>
+        </label>
+
+        <label className="checkbox">
+          <input type="checkbox" checked={watch} onChange={(e) => setWatch(e.target.checked)} />
+          <span>
+            Show the browser while it works
+            <span className="hint" style={{ margin: '2px 0 0' }}>
+              Opens a visible window instead of running headless. The quickest way to
+              see what it is doing, especially the first few times.
             </span>
           </span>
         </label>

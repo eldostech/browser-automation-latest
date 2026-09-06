@@ -389,6 +389,12 @@ class StartAgentSessionRequest(BaseModel):
     #: Off by default. An agent sent to find out how a form works must not
     #: submit it on the way.
     may_write: bool = False
+    #: Show a real window instead of running headless. None follows the
+    #: deployment default; a person starting a session chooses for themselves
+    #: the same way they choose it for a replay, under "Show the browser while
+    #: it runs" -- watching is how trust in this gets built the first few
+    #: times, and nobody should have to ask an administrator for that.
+    headless: bool | None = None
 
     budget_steps: int | None = Field(default=40, ge=1, le=500)
     budget_tokens: int | None = Field(default=120_000, ge=1000)
