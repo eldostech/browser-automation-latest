@@ -1644,3 +1644,18 @@ table.mapping .examples {
   line-height: 1.6;
   color: var(--text-dim);
 }
+
+/* A pointer to a gesture that lives in another window, so it has to stand out
+   from the surrounding prose without shouting. */
+.hint.callout {
+  background: var(--accent-dim);
+  border: 1px solid #c6dbe3;
+  border-left: 3px solid var(--accent-ink);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  margin: 10px 0 0;
+  color: var(--text-dim);
+}
+.hint.callout strong {
+  color: var(--text);
+}

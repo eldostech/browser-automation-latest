@@ -76,6 +76,9 @@ export function RecordWorkflow({ onSaved }: Props) {
   const [name, setName] = useState('');
   const [recording, setRecording] = useState<RecordingDetail | null>(null);
   const [fields, setFields] = useState<FieldChoice[]>([]);
+  // Elements pointed at with the recorder's assert buttons, and what to call
+  // each in the results file. Empty name means "leave it as a check".
+  const [reads, setReads] = useState<Record<number, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const poll = useRef<number | null>(null);
@@ -106,6 +109,11 @@ export function RecordWorkflow({ onSaved }: Props) {
           setRecording(body);
           if (body.status !== 'recording') {
             stopPolling();
+            setReads(
+              Object.fromEntries(
+                (body.captured ?? []).map((c) => [c.line, fromLabel(c.label)]),
+              ),
+            );
             setFields(
               (body.values ?? (body.typed ?? []).map((value) => ({ value, action: 'fill', label: '' }))).map(
                 (entry, index) => ({
@@ -165,6 +173,9 @@ export function RecordWorkflow({ onSaved }: Props) {
             index: f.index,
             secret: f.secret,
           })),
+        extractions: Object.entries(reads)
+          .filter(([, name]) => name.trim())
+          .map(([line, name]) => ({ line: Number(line), name: name.trim() })),
       });
       onSaved(saved.usecase_id);
     } catch (e) {
@@ -204,6 +215,13 @@ export function RecordWorkflow({ onSaved }: Props) {
             A browser window opens. Do the task once, by hand, then close the window. Nothing is
             sent to a model — what you do is captured directly, so recording costs nothing.
           </p>
+          <div className="hint callout">
+            <strong>To pull a value out into a spreadsheet:</strong> in the recorder&rsquo;s own
+            toolbar, click <strong>Assert text</strong> (or <strong>Assert value</strong> for
+            something you typed into), then click the thing on the page you want. Do that for
+            each value. Afterwards you name them, and each becomes a column in the results
+            file.
+          </div>
           <label className="field">
             <span>Start at</span>
             <input
@@ -278,6 +296,48 @@ export function RecordWorkflow({ onSaved }: Props) {
                 ))}
               </ul>
             </div>
+          )}
+
+          {(recording.captured ?? []).length > 0 && (
+            <>
+              <h4>What should it read?</h4>
+              <p className="hint">
+                You pointed at these while recording. Name the ones whose value you want in
+                the results file &mdash; each becomes a column. Leave a name blank and it
+                stays a check that the page still says what it said.
+              </p>
+              <table className="mapping">
+                <thead>
+                  <tr>
+                    <th>Where</th>
+                    <th>It said</th>
+                    <th>Column name</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recording.captured!.map((c) => (
+                    <tr key={c.line}>
+                      <td style={{ fontSize: 13 }}>
+                        {c.label || <code>{c.describe}</code>}
+                        {c.kind === 'value' && <span className="hint"> (a field)</span>}
+                      </td>
+                      <td>
+                        <code>{c.value}</code>
+                      </td>
+                      <td>
+                        <input
+                          value={reads[c.line] ?? ''}
+                          placeholder="leave blank to just check it"
+                          onChange={(e) =>
+                            setReads((r) => ({ ...r, [c.line]: e.target.value }))
+                          }
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
           )}
 
           {fields.length > 0 && (

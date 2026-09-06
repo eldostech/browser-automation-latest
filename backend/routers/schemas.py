@@ -213,6 +213,20 @@ class CredentialRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ExtractionChoice(BaseModel):
+    """One element the person pointed at, and what they want done with it.
+
+    ``line`` identifies which captured element this is about -- it is the line
+    of the recording it came from, which is stable and does not depend on the
+    client keeping a list in order.
+    """
+
+    line: int
+    #: The spreadsheet column to put it under. Empty means "not a value" --
+    #: keep it as a check, or drop it.
+    name: str = Field(default="", max_length=64)
+
+
 class DatasetFromRunRequest(BaseModel):
     """Make a dataset out of what a discovery run extracted."""
 
@@ -264,6 +278,9 @@ class SaveRecordingRequest(BaseModel):
     name: str = ""
     description: str = ""
     fields: list[DeclaredFieldPayload] = []
+    #: Which of the pointed-at elements are values to read out, and what to
+    #: call each. Anything not named here stays a check, as codegen recorded it.
+    extractions: list[ExtractionChoice] = []
 
 
 class RememberFixRequest(BaseModel):

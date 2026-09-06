@@ -73,6 +73,11 @@ _EXPECTATIONS: dict[str, tuple[str, bool]] = {
     "to_be_hidden": ("element_visible", True),
     "to_have_text": ("text_present", False),
     "to_contain_text": ("text_present", False),
+    # The recorder's "Assert value" button, for an input. It was not handled,
+    # so pointing at a filled-in field produced a dropped line and nothing
+    # else -- which is exactly the gesture somebody makes when they mean
+    # "read this one".
+    "to_have_value": ("field_value", False),
     "to_have_url": ("url_contains", False),
 }
 
@@ -111,6 +116,9 @@ class Recording:
     #: after -- "test" and a UUID say nothing -- whereas the control's
     #: accessible name is what the person saw on screen when they typed it.
     values: list["TypedValue"] = field(default_factory=list)
+    #: Elements a person pointed at with the recorder's assert buttons. Each is
+    #: offered afterwards as either a check or a value to put in the results.
+    captured: list["CapturedValue"] = field(default_factory=list)
 
     @property
     def typed(self) -> list[str]:
@@ -128,8 +136,49 @@ class Recording:
             "urls": list(self.urls),
             "typed": list(self.typed),
             "values": [entry.to_dict() for entry in self.values],
+            "captured": [entry.to_dict() for entry in self.captured],
             "unsupported": [entry.to_dict() for entry in self.unsupported],
         }
+
+
+
+@dataclass
+class CapturedValue:
+    """An element a person pointed at while recording, and what it held.
+
+    Produced by the recorder's **Assert text** and **Assert value** buttons:
+    you click the button, then click the field. That is the whole gesture, and
+    it is the only point-and-click way codegen offers to name an element
+    without typing a selector.
+
+    codegen writes it as an assertion, because that is what those buttons are
+    for. Whether it is really a *check* ("this should still say Approved") or a
+    *reading* ("put this in the spreadsheet") is a question only the person can
+    answer, so both are offered afterwards and neither is guessed.
+
+    ``after_step`` is how many steps had been recorded when this was seen. An
+    extraction has to happen where the value was on screen -- appending them
+    all at the end would read page one's field after navigating to page three.
+    """
+
+    locator: "Locator"
+    value: str
+    #: "text" for Assert text, "value" for Assert value on an input.
+    kind: str
+    after_step: int
+    line: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "locator": self.locator.model_dump(mode="json", exclude_none=True),
+            "describe": self.locator.describe(),
+            "label": self.locator.name or self.locator.text or "",
+            "value": self.value,
+            "kind": self.kind,
+            "after_step": self.after_step,
+            "line": self.line,
+        }
+
 
 
 @dataclass
@@ -384,12 +433,26 @@ def _consume_expect(
         )
         return
 
-    if kind == "text_present":
+    if kind in {"text_present", "field_value"}:
         value = _string_arg(call, 0)
         if value is not None:
-            recording.assertions.append(
-                Assertion(kind="text_present", value=value, negate=negate)
+            # Kept with its locator, which the text case used to discard. A
+            # value with no element is only ever "this text is somewhere on the
+            # page"; with one it can also be "read this field", and which of
+            # those the person meant is asked rather than assumed.
+            recording.captured.append(
+                CapturedValue(
+                    locator=subject[0],
+                    value=value,
+                    kind="value" if kind == "field_value" else "text",
+                    after_step=len(recording.steps),
+                    line=call.lineno,
+                )
             )
+            if kind == "text_present":
+                recording.assertions.append(
+                    Assertion(kind="text_present", value=value, negate=negate)
+                )
             return
 
     recording.assertions.append(

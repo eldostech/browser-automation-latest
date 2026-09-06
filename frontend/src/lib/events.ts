@@ -437,6 +437,15 @@ export interface RecordingDetail {
   steps?: RecordedStep[];
   /** Values typed during the recording, for the user to name and classify. */
   typed?: string[];
+  /** Elements pointed at with the recorder's assert buttons. Each is offered
+   *  as either a check or a value to read into the results file. */
+  captured?: {
+    describe: string;
+    label: string;
+    value: string;
+    kind: 'text' | 'value';
+    line: number;
+  }[];
   /** The same values, each with the control it went into. `label` is what was
    *  on screen; it is empty when the control had no accessible name, which is
    *  common for a custom dropdown. */

@@ -397,6 +397,8 @@ export const api = {
       name?: string;
       description?: string;
       fields: { name: string; value: string; index?: number; secret: boolean }[];
+      /** Pointed-at elements the person wants read into the results file. */
+      extractions?: { line: number; name: string }[];
     },
   ) =>
     request<{ usecase_id: string; version: number; status: string }>(

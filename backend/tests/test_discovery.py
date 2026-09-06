@@ -264,3 +264,103 @@ def test_a_screenshot_is_not_served_as_an_attachment():
         filename = ""
 
     assert "Content-Disposition" not in _artifact_headers(Record())
+
+
+# --- pointing at a field while recording -----------------------------------
+
+POINTED = '''import asyncio
+from playwright.async_api import Playwright, async_playwright, expect
+
+
+async def run(playwright: Playwright) -> None:
+    browser = await playwright.chromium.launch(headless=False)
+    context = await browser.new_context()
+    page = await context.new_page()
+    await page.goto("https://vendor.test/account")
+    await expect(page.get_by_label("Balance")).to_have_text("1,240.55")
+    await page.get_by_role("link", name="Statements").click()
+    await expect(page.get_by_label("Reference")).to_have_value("REF-88213")
+'''
+
+
+def test_pointing_at_a_field_is_captured_with_its_locator():
+    """The only point-and-click gesture codegen offers.
+
+    "Assert text" and "Assert value" are how a non-technical person names an
+    element without typing a selector. The text case used to keep the value and
+    throw the locator away -- leaving "this text is somewhere on the page",
+    which cannot be read from -- and the value case was not parsed at all.
+    """
+    from codegen import parse as parse_script
+
+    recording = parse_script(POINTED)
+
+    assert [(c.kind, c.locator.text, c.value) for c in recording.captured] == [
+        ("text", "Balance", "1,240.55"),
+        ("value", "Reference", "REF-88213"),
+    ]
+    assert not recording.unsupported, recording.unsupported
+
+
+def test_a_named_field_is_read_where_it_was_pointed_at():
+    """Position is correctness, not tidiness.
+
+    Appending every reading to the end would read the first page's field after
+    the browser had already moved to the third.
+    """
+    from codegen import parse as parse_script
+    from fields import FieldSet
+    from routers.recordings import build_usecase
+
+    recording = parse_script(POINTED)
+    lines = [c.line for c in recording.captured]
+    use_case = build_usecase(
+        recording,
+        name="Read an account",
+        description="",
+        declared=FieldSet.from_payload([]),
+        extractions={lines[0]: "balance", lines[1]: "reference"},
+    )
+
+    assert [(s.action, s.output) for s in use_case.row_steps if s.action != "assert"] == [
+        ("navigate", None),
+        ("extract", "balance"),
+        ("click", None),
+        ("extract", "reference"),
+    ], "each value is read on the page it was pointed at"
+    assert use_case.outputs == ["balance", "reference"]
+
+
+def test_an_input_is_read_by_its_value_not_its_text():
+    """`inner_text` on an input returns nothing, so the button used decides."""
+    from codegen import parse as parse_script
+    from fields import FieldSet
+    from routers.recordings import build_usecase
+
+    recording = parse_script(POINTED)
+    lines = [c.line for c in recording.captured]
+    use_case = build_usecase(
+        recording, name="x", description="", declared=FieldSet.from_payload([]),
+        extractions={lines[0]: "balance", lines[1]: "reference"},
+    )
+
+    by_output = {s.output: s for s in use_case.row_steps if s.action == "extract"}
+    assert by_output["balance"].attribute == "", "visible text is read as text"
+    assert by_output["reference"].attribute == "value", "a field holds its text in value"
+
+
+def test_leaving_a_pointed_at_element_unnamed_keeps_it_as_a_check():
+    """Not everything pointed at is a value; some of it is "this should say X"."""
+    from codegen import parse as parse_script
+    from fields import FieldSet
+    from routers.recordings import build_usecase
+
+    recording = parse_script(POINTED)
+    use_case = build_usecase(
+        recording, name="x", description="", declared=FieldSet.from_payload([]),
+        extractions={},
+    )
+
+    assert not [s for s in use_case.all_steps if s.action == "extract"]
+    assert use_case.outputs == []
+    assert [s for s in use_case.all_steps if s.action == "assert"], "still checked"

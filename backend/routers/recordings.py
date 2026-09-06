@@ -28,11 +28,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from auth.rbac import Permission
 from auth.service import Principal
 from codegen import Recording, urls_of
+# The parser's own ladder builder: a pointed-at element deserves the same
+# semantic-then-weak fallback chain every recorded action gets.
+from codegen import _ladder  # noqa: PLC2701
 from deps import WorkspaceData, require
 from fields import FieldSet, parameterise
 from recorder import Recorder, RecorderUnavailable
 from routers.schemas import SaveRecordingRequest, StartRecordingRequest
-from usecase import Assertion, InputSpec, SecretSpec, Step, UseCase
+from usecase import Assertion, InputSpec, Locator, SecretSpec, Step, UseCase
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +148,7 @@ async def save_recording(
             name=body.name or session.name,
             description=body.description,
             declared=declared,
+            extractions={c.line: c.name for c in body.extractions},
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -200,7 +204,12 @@ def _refuse_ambiguous_values(declared: FieldSet) -> None:
 
 
 def build_usecase(
-    recording: Recording, *, name: str, description: str, declared: FieldSet
+    recording: Recording,
+    *,
+    name: str,
+    description: str,
+    declared: FieldSet,
+    extractions: dict[int, str] | None = None,
 ) -> UseCase:
     """A draft use case from a parsed recording and the values the user named."""
     substitutions = {
@@ -250,6 +259,32 @@ def build_usecase(
         for step in steps:
             if step.url:
                 step.url = _bind_origin(step.url, origin)
+
+    # Elements the person pointed at and named become reading steps, placed
+    # where they were pointed at rather than appended. A value read after the
+    # browser has moved on is read from the wrong page, which is the failure
+    # this ordering exists to avoid.
+    named = extractions or {}
+    outputs: list[str] = []
+    if named:
+        for captured in sorted(recording.captured, key=lambda c: -c.after_step):
+            column = (named.get(captured.line) or "").strip()
+            if not column:
+                continue
+            steps.insert(
+                captured.after_step,
+                Step(
+                    id=f"x{captured.line}",
+                    action="extract",
+                    output=column,
+                    locators=_ladder_for(captured.locator),
+                    # An input holds its text in `value`, and inner_text on one
+                    # returns nothing at all -- so which button was used decides
+                    # how it has to be read.
+                    attribute="value" if captured.kind == "value" else "",
+                ),
+            )
+            outputs.append(column)
 
     setup, row = _split(steps, declared)
 
@@ -311,6 +346,9 @@ def build_usecase(
         ],
         setup_steps=setup,
         row_steps=row,
+        # Declared in the order they were pointed at, which is the order the
+        # results file gets its columns in.
+        outputs=list(reversed(outputs)),
         warnings=_warnings(recording, setup),
         dropped=[
             f"line {item.line}: {item.source} -- {item.reason}"
@@ -343,6 +381,18 @@ def _target_name(origin: str) -> str:
         parts = parts[1:]
     stem = parts[0] if parts else host
     return "".join(c for c in stem if c.isalnum() or c in "-_")[:64]
+
+
+
+def _ladder_for(locator: Locator) -> list[Locator]:
+    """A pointed-at element as a locator ladder.
+
+    The recorder gives one locator, and one locator is brittle. `_ladder` is
+    what the parser already builds for every recorded action -- a semantic rung
+    first, a weaker one behind it -- and a reading step deserves the same.
+    """
+    return _ladder(locator)
+
 
 
 def _origin_of(url: str) -> str:

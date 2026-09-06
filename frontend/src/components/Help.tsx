@@ -4,9 +4,8 @@
  * Written because the product is not self-evident: recording a workflow is
  * discoverable, and getting data *out* of a website is not. The panel is
  * organised by what someone is trying to do rather than by what the software
- * is made of, and it is honest about the one path that has no UI yet — telling
- * somebody to click a button that does not exist is worse than telling them
- * there is no button.
+ * is made of, and it names what still has no screen — telling somebody to
+ * click a button that does not exist is worse than telling them there is none.
  */
 
 import { useEffect } from 'react';
@@ -66,49 +65,28 @@ export function Help({ onClose }: Props) {
           </ol>
 
           <h3>Getting data out, into a spreadsheet</h3>
-          <div className="help-warning">
-            <strong>There is no UI for this yet.</strong> Recording captures what you
-            <em> do</em> to a page — clicks, typing, choosing. Reading a value is not
-            something you do, so the recorder never sees it. The engine fully supports
-            extraction; the screen to set it up has not been built. Until it is, the steps
-            are added over the API, below.
-          </div>
           <p>
-            Three kinds of reading step exist. Add them to a use case&rsquo;s{' '}
-            <code>row_steps</code>, and list their <code>output</code> names in the use
-            case&rsquo;s <code>outputs</code> — that is what puts them in the results file.
+            While recording, use the recorder&rsquo;s own toolbar:
+            <strong> Assert text</strong> for something shown on the page, or{' '}
+            <strong>Assert value</strong> for something typed into a field. Click the
+            button, then click the thing you want. Do that for each value.
           </p>
-          <ul>
-            <li>
-              <code>extract</code> — one value from one element. Add{' '}
-              <code>"attribute": "href"</code> to read a link&rsquo;s address instead of
-              its text.
-            </li>
-            <li>
-              <code>extract_rows</code> — a whole table or list in one step. Give it a
-              locator matching the rows and a column per field.
-            </li>
-            <li>
-              <code>download</code> — clicks something that yields a file and keeps it,
-              under the name the site gave it.
-            </li>
-          </ul>
-          <pre>{`# fetch it
-curl -H "Authorization: Bearer $TOKEN" \\
-  $API/api/usecases/$ID | jq .definition > uc.json
-
-# add to row_steps, and add the name to "outputs":
-{ "id": "x1", "action": "extract", "output": "balance",
-  "locators": [{"strategy": "css", "selector": ".balance"}] }
-
-# put it back — it saves a new version and re-validates
-curl -H "Authorization: Bearer $TOKEN" -X PUT \\
-  -H "Content-Type: application/json" \\
-  -d @uc.json $API/api/usecases/$ID`}</pre>
-          <p className="hint">
-            Ask for the step editor if this is in your way — it is the missing half of the
-            extraction work, not a deliberate omission.
+          <p>
+            When you close the window you are asked <em>What should it read?</em> — name
+            each one, and it becomes a column in the results file. Leave a name blank and
+            it stays a check that the page still says what it said.
           </p>
+          <p>
+            Values are read on the page you pointed at them on, in the order you did it, so
+            reading something on one screen and then moving to the next works as you would
+            expect.
+          </p>
+          <div className="help-warning">
+            <strong>Still needing the API:</strong> reading a whole table in one step
+            (<code>extract_rows</code>), keeping a file (<code>download</code>), and reading
+            an attribute such as a link&rsquo;s address. Those exist in the engine and have
+            no screen yet.
+          </div>
 
           <h3>Where the spreadsheet comes from</h3>
           <p>
