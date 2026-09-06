@@ -30,15 +30,18 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 #: Prompt names, so call sites are not stringly typed.
 #:
-#: The agent's prompts -- its system prompt, the task template, the loop nudge,
-#: the approval rejection and the empty-result note -- went with it, and so did
-#: the distillation prompt. What is left is what a model is still asked: repair
-#: a broken locator, and explain a navigation the allowlist refused.
+#: For a while this list was only what a model is asked during a *replay*:
+#: repair a broken locator, and explain a navigation the allowlist refused.
+#: The authoring prompts are back, for an agent with a different job from the
+#: one that was deleted -- it records a workflow the engine then repeats for
+#: nothing, rather than being the only way to run anything.
 NAVIGATION_BLOCKED = "navigation_blocked"
 HEAL = "heal"
 HEAL_REQUEST = "heal_request"
 REPAIR = "repair"
 REPAIR_REQUEST = "repair_request"
+AUTHOR = "author"
+AUTHOR_TASK = "author_task"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
@@ -49,6 +52,8 @@ REQUIRED_PROMPTS: tuple[str, ...] = (
     HEAL_REQUEST,
     REPAIR,
     REPAIR_REQUEST,
+    AUTHOR,
+    AUTHOR_TASK,
 )
 
 _BLANK_RUN = re.compile(r"\n{3,}")

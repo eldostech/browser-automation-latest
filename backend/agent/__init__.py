@@ -29,7 +29,10 @@ from .provider import (
     ToolSpec,
     local_availability,
 )
+from .author import AuthorRequest, AuthorState
+from .budget import Budget, BudgetExhausted, Spend
 from .marks import MARK_TOOLS, Described, Mark, Marks, describe_element
+from .run import AuthorResult, run_agent_session
 from .session import AgentToolSession, Recorder, ToolCallRecord
 from .tools import DISTILS_TO, GuardContext, Guarded, PERCEPTION, REFUSED, guard, offered
 
@@ -37,6 +40,13 @@ __all__ = [
     "AgentToolSession",
     "Availability",
     "MARK_TOOLS",
+    "AuthorRequest",
+    "AuthorResult",
+    "AuthorState",
+    "Budget",
+    "BudgetExhausted",
+    "Spend",
+    "run_agent_session",
     "Described",
     "Mark",
     "Marks",
