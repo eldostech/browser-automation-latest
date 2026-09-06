@@ -29,12 +29,18 @@ from .provider import (
     ToolSpec,
     local_availability,
 )
+from .marks import MARK_TOOLS, Described, Mark, Marks, describe_element
 from .session import AgentToolSession, Recorder, ToolCallRecord
 from .tools import DISTILS_TO, GuardContext, Guarded, PERCEPTION, REFUSED, guard, offered
 
 __all__ = [
     "AgentToolSession",
     "Availability",
+    "MARK_TOOLS",
+    "Described",
+    "Mark",
+    "Marks",
+    "describe_element",
     "BrowserProvider",
     "DISTILS_TO",
     "GuardContext",

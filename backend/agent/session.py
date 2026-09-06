@@ -26,6 +26,9 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from redaction import NULL_REDACTOR, Redactor
 
+from snapshot import Snapshot, parse as parse_snapshot
+
+from .marks import MARK_TOOLS, Described, Marks, describe_element
 from .provider import BrowserProvider, MCPSession, ToolResult, ToolSpec
 from .tools import DISTILS_TO, GuardContext, PERCEPTION, guard, offered
 
@@ -102,6 +105,13 @@ class AgentToolSession:
 
         self._session: MCPSession | None = None
         self._specs: list[ToolSpec] = []
+        #: What the agent has declared about the shape of the use case.
+        self.marks = Marks()
+        #: The page as it was last reported, parsed. Held because every mark
+        #: resolves a ref against it, and because re-snapshotting to answer
+        #: `describe_element` would both cost a round trip and risk describing
+        #: a different page than the one the agent is looking at.
+        self._snapshot: Snapshot | None = None
         #: Refs the page has reported. Replaced rather than accumulated: a ref
         #: is only valid for the snapshot it came from, and remembering old
         #: ones would let a stale target through the check that exists to catch
@@ -122,8 +132,30 @@ class AgentToolSession:
     # -- what the model is shown -------------------------------------------
     @property
     def tools(self) -> list[ToolSpec]:
-        """The tool list, refusals already removed rather than forbidden."""
-        return list(self._specs)
+        """The tool list: the server's, minus refusals, plus ours.
+
+        The marking tools are advertised beside the browser's own because from
+        the model's side there is no difference -- it calls a tool and gets an
+        answer. That they never reach the browser is this object's business.
+        """
+        ours = [
+            ToolSpec(
+                name=name,
+                description=spec["description"],
+                input_schema={
+                    "type": "object",
+                    "properties": spec["properties"],
+                    "required": spec["required"],
+                },
+            )
+            for name, spec in MARK_TOOLS.items()
+        ]
+        return [*self._specs, *ours]
+
+    @property
+    def snapshot(self) -> Snapshot | None:
+        """The page as it was last reported."""
+        return self._snapshot
 
     @property
     def known_refs(self) -> frozenset[str]:
@@ -134,7 +166,7 @@ class AgentToolSession:
             allowed_domains=self.allowed_domains,
             known_refs=self._refs,
             may_write=self.may_write,
-            available=frozenset(spec.name for spec in self._specs),
+            available=frozenset(spec.name for spec in self._specs) | frozenset(MARK_TOOLS),
         )
 
     # -- the one method that matters ---------------------------------------
@@ -157,6 +189,14 @@ class AgentToolSession:
                 started, refused=True,
             )
 
+        # Ours are answered here and never reach the browser. They still pass
+        # the guard first, because the ref discipline applies to a mark as much
+        # as to a click: marking an element the page is not showing would
+        # record a step nothing can replay.
+        if name in MARK_TOOLS:
+            result = self._mark(name, arguments)
+            return await self._finish(name, arguments, result, verdict, started)
+
         if self._session is None:
             raise RuntimeError(
                 "The tool session is not open. Use it as an async context manager."
@@ -173,8 +213,46 @@ class AgentToolSession:
         # because it did not re-render the page and did not invalidate them.
         if result.refs:
             self._refs = frozenset(result.refs)
+            # Parsed once, here, rather than by each mark that needs it. The
+            # snapshot the agent is looking at and the one a mark resolves
+            # against have to be the same page.
+            self._snapshot = parse_snapshot(result.text)
 
         return await self._finish(name, arguments, result, verdict, started)
+
+    # -- our own tools ------------------------------------------------------
+    def _mark(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Answer a marking tool. No browser, no model, no I/O."""
+        after = self._seq
+
+        if name == "mark_setup_complete":
+            return self._say(self.marks.setup_complete(after), "Setup ends here.")
+        if name == "begin_row":
+            key = str(arguments.get("key") or "")
+            return self._say(self.marks.begin_row(after, key), f"Row {key!r} started.")
+        if name == "end_row":
+            return self._say(self.marks.end_row(after), "Row finished.")
+
+        described = self._describe(str(arguments.get("ref") or ""))
+        if name == "describe_element":
+            return ToolResult(text=described.as_text(), is_error=described.matches == 0)
+
+        field = {"mark_as_input": "name", "mark_as_output": "column"}.get(name, "slot")
+        value = str(arguments.get(field) or "")
+        if not value:
+            return ToolResult.failed(f"{name} needs a {field}.")
+        problem = self.marks.mark_value(name, after, described.ref, value, described)
+        return self._say(problem, f"{described.describe_first()} marked as {value!r}.")
+
+    def _describe(self, ref: str) -> Described:
+        if self._snapshot is None:
+            return Described(ref=ref, role="", name="", matches=0)
+        return describe_element(self._snapshot, ref)
+
+    @staticmethod
+    def _say(problem: str, done: str) -> ToolResult:
+        """A mark either happened or did not, and the reason is the answer."""
+        return ToolResult.failed(problem) if problem else ToolResult(text=done)
 
     async def _finish(
         self,

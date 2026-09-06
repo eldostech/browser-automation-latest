@@ -115,3 +115,36 @@ async def test_leaving_the_allowlist_never_reaches_the_browser(tools):
 
     assert result.is_error
     assert "example.com" in result.text
+
+
+#: The page that broke a real run: two controls whose accessible names contain
+#: each other, one of them inside a dialog covering the other.
+INVITE_PAGE = (
+    "data:text/html,<h1>Users</h1>"
+    "<button>+ Invite User</button>"
+    "<div role=dialog aria-label=Invite>"
+    "<input type=email placeholder=Email><button>Invite</button></div>"
+)
+
+
+async def test_describe_element_reads_a_real_snapshot(tools):
+    """The bridge, against the format the server actually emits.
+
+    `snapshot.py` was written for Playwright MCP's tree and this is what stops
+    that claim rotting: a change to the rendering breaks here rather than
+    silently producing use cases whose locators describe nothing.
+    """
+    await tools.call("browser_navigate", {"url": INVITE_PAGE})
+    await tools.call("browser_snapshot", {})
+
+    assert tools.snapshot is not None, "the reply did not parse as a snapshot"
+    named = {node.name: node.ref for node in tools.snapshot if node.name}
+    assert "+ Invite User" in named
+    assert "Invite" in named
+
+    described = await tools.call("describe_element", {"ref": named["Invite"]})
+    assert not described.is_error, described.text
+    assert "exact" in described.text, (
+        "'Invite' is a substring of '+ Invite User', so the recorded locator "
+        "has to require the whole accessible name"
+    )
