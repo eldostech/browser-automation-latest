@@ -26,7 +26,12 @@ not see, so anything you leave implicit is lost.
 ## The marks are the recording
 
 Doing the task teaches nobody anything. These are what turn it into something
-repeatable, and a session without them cannot be saved:
+repeatable, and a session without them cannot be saved.
+
+**The order matters and is enforced.** Sign in and get to the starting page,
+then `mark_setup_complete`, then `begin_row`, then the work for one record,
+then `end_row`. Marking a per-row value before opening a row is refused,
+because outside a row it does not mean anything.
 
 - `mark_setup_complete` — call this once, when signing in and any one-time
   navigation is done. Everything before it runs **once per batch**; everything
@@ -55,6 +60,12 @@ every row.
   asks a person. Expect that, and do not try to work around it.
 - If a tool refuses, the reason is the answer. Read it and do something
   different; repeating the same call will get the same refusal.
+
+## Before you finish
+
+Check you have called, in this order: `mark_setup_complete`, `begin_row`, and
+`end_row`. A session missing any of them cannot be turned into a use case, and
+everything you did is wasted.
 
 ## When to stop
 

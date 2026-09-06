@@ -90,10 +90,14 @@ async def test_a_real_model_records_a_workflow_that_replays():
             start_url=PAGE,
             allowed_domains=("data",),
             may_write=True,
-            # Small on purpose. This is a protocol check, not a capability
-            # demonstration, and the failure mode of a generous budget is a
-            # bill nobody chose.
-            budget=Budget(steps=25, tokens=90_000, seconds=240, usd=0.60),
+            # Measured rather than guessed. A session of this shape takes
+            # 13-15 calls at roughly 7,000 tokens each -- most of it the tool
+            # schemas and the system prompt, which are re-sent every call --
+            # so 90,000 stopped it *after* doing the task and *before* it
+            # could close the row. Sized to finish, and still capped in
+            # dollars, because the failure mode of a generous budget is a bill
+            # nobody chose.
+            budget=Budget(steps=30, tokens=200_000, seconds=300, usd=0.90),
         ),
         llm=llm,
         provider=LocalPlaywrightMCP(headless=True),
@@ -110,6 +114,9 @@ async def test_a_real_model_records_a_workflow_that_replays():
         print(f"  ! {warning}")
 
     assert result.status in {"succeeded", "partial"}, result.stopped_by
+    assert not result.unfinished, (
+        f"the session could not be distilled: {result.unfinished}"
+    )
     assert result.use_case is not None, "the session produced no draft at all"
 
     # The marking gesture is the part most likely to be unnatural to a model,

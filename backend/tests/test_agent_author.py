@@ -192,6 +192,7 @@ async def test_planning_costs_one_call_and_produces_prose_not_steps():
     assert w.spend.llm_calls == 1
     assert w.spend.tokens == 230
     assert w.llm.asked[0]["tools"] == [], "planning has no tools to call"
+    assert state["messages"][-1]["role"] == "user"
 
 
 async def test_deciding_offers_the_browser_tools_the_marks_and_finish():
@@ -369,3 +370,83 @@ async def test_an_approved_action_runs():
 
     assert w.tools.provider.calls[-1][0] == "browser_click"
     assert [e.type for e in w.events if e.type == "approval_resolved"]
+
+
+# --- what a session costs --------------------------------------------------
+
+
+def test_stale_pages_are_dropped_from_the_model_context():
+    """Found by a real session, at real cost.
+
+    Every tool result is a full accessibility tree, and they stayed in the
+    history forever -- so turn N carried N snapshots and a session's cost grew
+    with the square of its length. One measured 7,700 tokens per call and ran
+    out of budget after doing the task correctly but before calling end_row,
+    which lost the recording.
+    """
+    from agent.author import SNAPSHOTS_KEPT, for_model
+
+    def page(n: int) -> dict:
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": f"c{n}",
+                    "content": f"### Page\n- Page URL: /p{n}\n" + "x" * 4000,
+                }
+            ],
+        }
+
+    history = [{"role": "user", "content": "do the task"}]
+    for index in range(5):
+        history.append({"role": "assistant", "content": f"turn {index}"})
+        history.append(page(index))
+
+    pruned = for_model(history)
+
+    assert len(pruned) == len(history), "messages are replaced, never removed"
+    full = [m for m in pruned if "xxxx" in str(m["content"])]
+    assert len(full) == SNAPSHOTS_KEPT, "only the current pages stay in full"
+    assert "/p4" in str(pruned[-1]["content"]), "and the newest is one of them"
+
+
+def test_a_dropped_page_says_why_it_is_gone():
+    """A model reading back must not conclude the page went blank -- and the
+    reason is the useful part: those refs are stale and the guard refuses
+    them, so keeping the page was paying to send something unusable."""
+    from agent.author import for_model
+
+    history = []
+    for index in range(4):
+        history.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": f"c{index}",
+                     "content": "### Page\nold"},
+                ],
+            }
+        )
+
+    text = str(for_model(history)[0]["content"])
+    assert "refs are stale" in text
+    assert "Take a snapshot" in text
+
+
+def test_anything_that_is_not_a_page_is_left_alone():
+    """A refusal, a mark's answer, the task itself: all small and all worth
+    keeping. Pruning by size rather than by kind would have eaten them."""
+    from agent.author import for_model
+
+    history = [
+        {"role": "user", "content": "the task"},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c1",
+             "content": "e3 recorded as 'balance'."}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c2",
+             "content": "not an element reference"}]},
+    ]
+
+    assert for_model(history) == history

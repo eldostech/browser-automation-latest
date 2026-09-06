@@ -346,3 +346,106 @@ async def test_going_back_records_where_it_went():
     back = result.use_case["row_steps"][-1]
     assert back["action"] == "navigate"
     assert back["url"] == "https://vendor.test/users", "where it landed"
+
+
+# --- what a real model actually did ----------------------------------------
+
+
+def test_a_column_named_the_way_a_person_would_is_made_usable():
+    """Found by the live test, at real cost.
+
+    Asked to name the column for a field labelled "Account number", the model
+    answered "Account number" -- the right answer to the question, and not an
+    identifier. It reached InputSpec and raised mid-distillation, losing a
+    session that had otherwise gone perfectly.
+    """
+    from agent.marks import as_name
+
+    assert as_name("Account number") == "account_number"
+    assert as_name("balance") == "balance"
+    assert as_name("Ref #") == "ref"
+    assert as_name("2024 Total") == "_2024_total", "an identifier cannot start with a digit"
+    assert as_name("   ") == ""
+
+
+async def test_the_agent_is_told_the_name_it_actually_got():
+    """Answering "recorded" leaves it using its own spelling in the next call
+    and in its summary, and then two names for one column are loose."""
+    turns = [
+        PLAN,
+        turn_calling("browser_snapshot"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("browser_type", target="e2", text="A-1001"),
+        turn_calling("mark_as_input", ref="e2", name="Account number"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="done"),
+    ]
+    result = await a_run(turns=turns)
+
+    assert [i["name"] for i in result.use_case["inputs"]] == ["account_number"]
+    said = next(c for c in result.trajectory if c["tool"] == "mark_as_input")["detail"]
+    assert "account_number" in said
+
+
+async def test_distillation_never_loses_a_session_to_a_schema_error():
+    """A session is the expensive part. A model drove a browser for two minutes
+    and a person watched it; losing all of that at the last step is the worst
+    possible way to spend it.
+
+    A draft that will not validate is rebuilt without the parts that would not,
+    and the reviewer is told which -- a missing column name is a minute's work,
+    a vanished session is not.
+    """
+    from agent.distil import _build
+
+    warnings: list[str] = []
+    use_case = _build(
+        {
+            "name": "Salvageable",
+            "status": "draft",
+            "inputs": [],
+            "outputs": ["never extracted by any step"],
+            "warnings": warnings,
+        },
+        warnings,
+    )
+
+    assert use_case is not None, "it raised instead of degrading"
+    assert use_case.name == "Salvageable"
+    assert any("could not be turned into" in w for w in warnings)
+
+
+async def test_typing_a_per_row_value_before_the_row_began_moves_into_it():
+    """Found by a real session, and the fix is not leniency.
+
+    A model works the way a person would: do the task, then say what the parts
+    were. So the typing lands before `mark_setup_complete`, in setup -- and a
+    setup step referencing {{input.x}} is refused by the schema, correctly,
+    because setup runs once per batch and there is no row to take a value from.
+
+    The mark is a statement of fact: this value changes per record. So the step
+    that types it is row work by definition, and moving it acts on what the
+    agent said rather than guessing at what it meant.
+    """
+    turns = [
+        PLAN,
+        turn_calling("browser_snapshot"),
+        turn_calling("browser_type", target="e2", text="A-1001"),
+        turn_calling("browser_click", target="e3"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("mark_as_input", ref="e2", name="account"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="did it, then said what it was"),
+    ]
+    result = await a_run(turns=turns)
+
+    assert result.use_case is not None
+    row = [s["action"] for s in result.use_case["row_steps"]]
+    setup = [s["action"] for s in result.use_case["setup_steps"]]
+
+    assert "fill" in row, "the step that types a per-row value has to be in the row"
+    assert "fill" not in setup
+    assert any("before the row began" in w for w in result.draft_warnings)
+    assert [i["name"] for i in result.use_case["inputs"]] == ["account"]

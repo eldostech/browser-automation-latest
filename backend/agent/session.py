@@ -267,7 +267,14 @@ class AgentToolSession:
         if not value:
             return ToolResult.failed(f"{name} needs a {field}.")
         problem = self.marks.mark_value(name, after, described.ref, value, described)
-        return self._say(problem, f"{described.describe_first()} marked as {value!r}.")
+        if problem:
+            return ToolResult.failed(problem)
+        # Told what the name *became*, not what was asked for. A model that
+        # said "Account number" and is answered "recorded" will use its own
+        # spelling in the next call and in its summary, and then two names for
+        # one column are loose in the session.
+        recorded = self.marks.entries[-1].name
+        return ToolResult(text=f"{described.describe_first()} recorded as {recorded!r}.")
 
     def _describe(self, ref: str) -> Described:
         if self._snapshot is None:

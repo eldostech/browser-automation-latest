@@ -31,6 +31,7 @@ dispatched here rather than over MCP.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -86,7 +87,8 @@ MARK_TOOLS: dict[str, dict[str, Any]] = {
     "mark_as_input": {
         "description": (
             "This value changes per record and should come from a spreadsheet "
-            "column. The step that types it becomes a template."
+            "column. The step that types it becomes a template. Only valid "
+            "inside a row: call begin_row first."
         ),
         "properties": {
             "ref": {"type": "string"},
@@ -97,7 +99,8 @@ MARK_TOOLS: dict[str, dict[str, Any]] = {
     "mark_as_output": {
         "description": (
             "Read this element's value into the results file. Becomes an "
-            "extract step at this point in the run, on the page it was seen on."
+            "extract step at this point in the run, on the page it was seen "
+            "on. Only valid inside a row: call begin_row first."
         ),
         "properties": {
             "ref": {"type": "string"},
@@ -117,6 +120,32 @@ MARK_TOOLS: dict[str, dict[str, Any]] = {
         "required": ["ref", "slot"],
     },
 }
+
+
+#: What a column or slot name has to look like: an identifier, because it
+#: becomes a `{{input.x}}` template and a spreadsheet header.
+NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def as_name(value: str) -> str:
+    """Turn what a person or a model called something into a usable name.
+
+    A real model, asked to name the column for a field labelled "Account
+    number", calls it ``"Account number"`` -- which is the right answer to the
+    question and the wrong shape for a template. Before this, that arrived at
+    `InputSpec` and raised a ValidationError in the middle of distillation,
+    losing an entire session that had otherwise gone perfectly.
+
+    Rejecting it would have been worse than fixing it: the model is not wrong,
+    the constraint is ours, and telling it to try again spends another turn to
+    arrive somewhere it could have been taken directly.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip()).strip("_").lower()
+    if not cleaned:
+        return ""
+    # A name beginning with a digit is not an identifier, and "2024_total"
+    # is a name somebody will genuinely want.
+    return cleaned if NAME_PATTERN.match(cleaned) else f"_{cleaned}"
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +367,27 @@ class Marks:
     def mark_value(
         self, kind: str, after_call: int, ref: str, name: str, described: Described
     ) -> str:
+        """Record a value, under a name that can actually be used.
+
+        A per-row value marked outside a row is refused rather than accepted
+        and sorted out later. A real model did exactly this -- marked an input
+        and an output without ever opening a row -- and distillation then had
+        marks it could not place and a session that could not be saved. Being
+        told at the moment of the mistake costs one turn; finding out at the
+        end costs the session.
+        """
+        if kind in {"mark_as_input", "mark_as_output"} and self._open_row is None:
+            return (
+                "No row is open, and this is a per-row value -- it only means "
+                "something inside one record's work. Call begin_row first (and "
+                "mark_setup_complete before that, if the sign-in is done)."
+            )
+        name = as_name(name)
+        if not name:
+            return (
+                "That name has nothing usable in it. A column name becomes a "
+                "spreadsheet header, so it needs at least one letter or digit."
+            )
         if described.matches == 0:
             return (
                 f"{ref} is not on the page as it now stands, so there is nothing "
@@ -379,6 +429,7 @@ class Marks:
 
 __all__ = [
     "MARK_TOOLS",
+    "as_name",
     "Described",
     "Mark",
     "Marks",

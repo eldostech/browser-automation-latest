@@ -46,6 +46,7 @@ from events import ErrorEvent, Thinking, ToolCall, ToolResult as ToolResultEvent
 from llm import LLMClient
 from prompt_loader import EXPLORE, RECOVER, render
 
+from .author import for_model
 from .budget import Budget, BudgetExhausted, Spend
 from .inprocess import EngineBrowser
 from .session import AgentToolSession
@@ -299,7 +300,9 @@ async def agent_loop(
         except BudgetExhausted as exc:
             return Ending(tool=GIVE_UP, arguments={"reason": str(exc)})
 
-        turn = await w.llm.run_turn(system=system, messages=messages, tools=schemas)
+        turn = await w.llm.run_turn(
+            system=system, messages=for_model(messages), tools=schemas
+        )
         w.spend.turn(turn.usage, w.llm.model)
         if turn.text.strip():
             await w.emit(

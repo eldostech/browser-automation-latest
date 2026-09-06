@@ -71,12 +71,26 @@ PERCEPTION: frozenset[str] = frozenset(
     {
         "browser_snapshot",
         "browser_find",
+        "browser_tabs",
+        "browser_handle_dialog",
+    }
+)
+
+#: Advertised by the server, and deliberately not offered.
+#:
+#: Not refused -- there is nothing wrong with them -- just not worth their
+#: weight. **Every tool schema is re-sent on every model call**, and a real
+#: session measured 7,600 tokens per call with most of it in the tool list
+#: rather than in the page. These five carry large schemas and answer
+#: questions an agent recording a workflow does not have: a person is watching
+#: the browser, so it does not need to screenshot it, and network and console
+#: dumps are for debugging a site rather than recording one.
+NOT_WORTH_THE_TOKENS: frozenset[str] = frozenset(
+    {
         "browser_take_screenshot",
         "browser_console_messages",
         "browser_network_requests",
         "browser_network_request",
-        "browser_tabs",
-        "browser_handle_dialog",
         "browser_resize",
     }
 )
@@ -170,7 +184,11 @@ def offered(specs: Iterable[ToolSpec]) -> list[ToolSpec]:
     called by a model that decides the rules do not apply to it, and a prompt
     saying "do not use browser_evaluate" is a request.
     """
-    return [spec for spec in specs if spec.name not in REFUSED]
+    return [
+        spec
+        for spec in specs
+        if spec.name not in REFUSED and spec.name not in NOT_WORTH_THE_TOKENS
+    ]
 
 
 def guard(name: str, arguments: dict[str, Any], ctx: GuardContext) -> Guarded:
@@ -250,6 +268,7 @@ __all__ = [
     "DISTILS_TO",
     "GuardContext",
     "Guarded",
+    "NOT_WORTH_THE_TOKENS",
     "PERCEPTION",
     "REFUSED",
     "IRREVERSIBLE",

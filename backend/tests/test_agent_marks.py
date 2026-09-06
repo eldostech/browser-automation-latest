@@ -166,6 +166,7 @@ async def test_a_mark_never_reaches_the_browser():
     """They are ours. The model cannot tell, and does not need to."""
     async with await session(replies={"browser_snapshot": INVITE}) as tools:
         await tools.call("browser_snapshot")
+        await tools.call("begin_row", {"key": "A-1"})
         before = len(tools.provider.calls)
 
         await tools.call("mark_as_output", {"ref": "e10", "column": "status"})
@@ -178,6 +179,7 @@ async def test_marking_an_element_records_its_durable_locator():
     is the whole reason to do this during recording rather than after."""
     async with await session(replies={"browser_snapshot": INVITE}) as tools:
         await tools.call("browser_snapshot")
+        await tools.call("begin_row", {"key": "A-1"})
         result = await tools.call("mark_as_output", {"ref": "e10", "column": "status"})
 
     assert not result.is_error, result.text
@@ -192,16 +194,18 @@ async def test_marking_an_ambiguous_element_is_refused_with_the_count():
     """Recording it would produce a step that can act on the wrong row."""
     async with await session(replies={"browser_snapshot": LIST}) as tools:
         await tools.call("browser_snapshot")
+        await tools.call("begin_row", {"key": "A-1"})
         result = await tools.call("mark_as_output", {"ref": "e2", "column": "link"})
 
     assert result.is_error
     assert "3 elements" in result.text
-    assert tools.marks.entries == []
+    assert [m.kind for m in tools.marks.entries] == ["begin_row"]
 
 
 async def test_marking_before_looking_says_so():
     """No snapshot means no page, and a ref that resolves against nothing."""
     async with await session() as tools:
+        await tools.call("begin_row", {"key": "A-1"})
         result = await tools.call("mark_as_input", {"ref": "e4", "name": "account"})
 
     assert result.is_error
@@ -227,6 +231,7 @@ async def test_a_mark_is_tied_to_the_call_it_followed():
 async def test_the_same_column_cannot_be_marked_twice():
     async with await session(replies={"browser_snapshot": INVITE}) as tools:
         await tools.call("browser_snapshot")
+        await tools.call("begin_row", {"key": "A-1"})
         await tools.call("mark_as_output", {"ref": "e10", "column": "status"})
         again = await tools.call("mark_as_output", {"ref": "e3", "column": "status"})
 
@@ -267,3 +272,30 @@ async def test_a_mark_is_audited_like_any_other_call():
     assert [c.name for c in tools.calls] == ["browser_snapshot", "mark_setup_complete"]
     assert tools.calls[-1].action == "", "a mark is not a step"
     assert tools.calls[-1].ok
+
+
+async def test_a_per_row_value_marked_outside_a_row_is_refused():
+    """Found by a real session.
+
+    A model marked an input and an output without ever opening a row.
+    Distillation then had marks it could not place and a session that could not
+    be saved. Being told at the moment of the mistake costs one turn; finding
+    out at the end costs the whole session.
+    """
+    async with await session(replies={"browser_snapshot": INVITE}) as tools:
+        await tools.call("browser_snapshot")
+        result = await tools.call("mark_as_output", {"ref": "e10", "column": "status"})
+
+    assert result.is_error
+    assert "begin_row" in result.text
+    assert tools.marks.entries == []
+
+
+async def test_a_credential_may_be_marked_during_setup():
+    """The exception, and it is not an inconsistency: a credential is typed
+    once per batch, which is precisely outside a row."""
+    async with await session(replies={"browser_snapshot": INVITE}) as tools:
+        await tools.call("browser_snapshot")
+        result = await tools.call("mark_as_secret", {"ref": "e9", "slot": "vendor"})
+
+    assert not result.is_error, result.text

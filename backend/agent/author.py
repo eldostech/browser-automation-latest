@@ -259,6 +259,15 @@ async def plan(state: AuthorState, w: Wiring) -> AuthorState:
             Thinking(run_id=w.request.run_id, seq=0, step=0, text=state["outline"], done=True)
         )
         state["messages"].append({"role": "assistant", "content": state["outline"]})
+    state["messages"].append(
+        {
+            "role": "user",
+            "content": (
+                "The outline is enough. Now inspect the current page and use the "
+                "available tools to carry out the task."
+            ),
+        }
+    )
     return state
 
 
@@ -278,7 +287,7 @@ async def decide(state: AuthorState, w: Wiring) -> AuthorState:
 
     turn = await w.llm.run_turn(
         system=system_prompt(w.request),
-        messages=state["messages"],
+        messages=for_model(state["messages"]),
         tools=_tool_schemas(w),
     )
     w.spend.turn(turn.usage, w.llm.model)
@@ -530,6 +539,62 @@ def _tool_schemas(w: Wiring) -> list[dict[str, Any]]:
         }
     )
     return schemas
+
+
+#: How many page snapshots stay in the model's context in full. Everything
+#: older is replaced by one line.
+SNAPSHOTS_KEPT = 2
+
+
+def for_model(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The conversation, with stale page snapshots taken out.
+
+    Every tool result here is a full accessibility tree -- thousands of tokens
+    -- and it stayed in the history forever, so turn N carried N snapshots and
+    the cost of a session grew with the square of its length. A real session
+    measured at ~7,700 tokens per call and ran out of budget *after* doing the
+    task correctly but *before* calling `end_row`, which lost the recording.
+
+    Dropping them costs nothing, and not for a subtle reason: a ref from an
+    older snapshot is stale, and the guard refuses it. Keeping those pages in
+    context was paying to send the model information it is forbidden to act
+    on -- and, worse, tempting it to try.
+
+    The replacement says *why* it is gone, so a model reading back does not
+    conclude the page went blank.
+    """
+    kept = 0
+    out: list[dict[str, Any]] = []
+    for message in reversed(messages):
+        content = message.get("content")
+        if isinstance(content, list) and content and _is_page(content[0]):
+            kept += 1
+            if kept > SNAPSHOTS_KEPT:
+                out.append(
+                    {
+                        **message,
+                        "content": [
+                            {
+                                **content[0],
+                                "content": (
+                                    "(page omitted: this is no longer the current "
+                                    "page and its refs are stale. Take a snapshot "
+                                    "if you need to look again.)"
+                                ),
+                            }
+                        ],
+                    }
+                )
+                continue
+        out.append(message)
+    out.reverse()
+    return out
+
+
+def _is_page(block: dict[str, Any]) -> bool:
+    return block.get("type") == "tool_result" and "### Page" in str(
+        block.get("content") or ""
+    )
 
 
 def _trim(text: str) -> str:

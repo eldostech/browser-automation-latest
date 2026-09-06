@@ -22,7 +22,7 @@ import os
 import pytest
 
 from agent import AgentToolSession, LocalPlaywrightMCP
-from agent.tools import DISTILS_TO, PERCEPTION, REFUSED
+from agent.tools import DISTILS_TO, NOT_WORTH_THE_TOKENS, PERCEPTION, REFUSED
 
 pytestmark = [
     pytest.mark.anyio,
@@ -64,7 +64,7 @@ async def test_the_server_advertises_the_tools_the_registry_is_written_against()
     finally:
         await provider.close()
 
-    missing = (set(DISTILS_TO) | PERCEPTION) - advertised
+    missing = (set(DISTILS_TO) | PERCEPTION | NOT_WORTH_THE_TOKENS) - advertised
     assert not missing, f"the registry names tools this server does not have: {missing}"
 
     still_there = set(REFUSED) & advertised

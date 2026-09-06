@@ -109,6 +109,7 @@ def distil(
 
     setup_steps = _steps(setup_calls, bindings, warnings)
     row_steps = _steps(row_calls, bindings, warnings)
+    setup_steps, row_steps = _move_per_row_work(setup_steps, row_steps, warnings)
     outputs = _insert_reads(row_steps, row_calls, marks, first_row, warnings)
 
     if len(marks.rows) > 1:
@@ -123,20 +124,21 @@ def distil(
     if not row_steps:
         warnings.append("No steps fall inside the recorded row, so a batch would do nothing.")
 
-    use_case = UseCase(
-        name=name,
-        description=task,
-        status="draft",
-        authored_by="agent",
-        base_url=_origin(start_url),
-        allowed_domains=sorted({_host(d) for d in allowed_domains if d}),
-        inputs=[InputSpec(name=n) for n in inputs],
-        secrets=[SecretSpec(name=n) for n in secrets],
-        setup_steps=setup_steps,
-        row_steps=row_steps,
-        outputs=outputs,
-        warnings=warnings,
-    )
+    fields: dict[str, Any] = {
+        "name": name,
+        "description": task,
+        "status": "draft",
+        "authored_by": "agent",
+        "base_url": _origin(start_url),
+        "allowed_domains": sorted({_host(d) for d in allowed_domains if d}),
+        "inputs": [InputSpec(name=n) for n in inputs],
+        "secrets": [SecretSpec(name=n) for n in secrets],
+        "setup_steps": setup_steps,
+        "row_steps": row_steps,
+        "outputs": outputs,
+        "warnings": warnings,
+    }
+    use_case = _build(fields, warnings)
     return Draft(
         use_case=use_case,
         warnings=warnings,
@@ -145,6 +147,50 @@ def distil(
         # the site accepts the literal text "{{input.account}}".
         sample_inputs={name: typed[name] for name in inputs if name in typed},
         rows_recorded=len(marks.rows),
+    )
+
+
+def _build(fields: dict[str, Any], warnings: list[str]) -> UseCase:
+    """The draft, or the most of it that can be built.
+
+    Distillation must not raise. A session is the expensive part -- a model
+    drove a browser for two minutes and a person watched it -- and losing all
+    of that to a schema error at the last step is the worst possible way to
+    spend it. A real session was lost exactly this way: the model named a
+    column "Account number", which is the right answer to the question asked
+    and not an identifier, and `InputSpec` refused it mid-construction.
+
+    So a document that will not validate is rebuilt without the parts that
+    would not, and the reviewer is told which. A draft missing an input is
+    something a person can fix in a minute; a session that vanished is not.
+    """
+    try:
+        return UseCase(**fields)
+    except Exception as exc:  # noqa: BLE001 - the whole point is not to raise
+        # Bound outside the handler: `except ... as` unbinds the name on the
+        # way out, and the message below is the only account a reviewer gets.
+        refusal = str(exc)
+        log.warning("draft did not validate; degrading", extra={"error": refusal})
+
+    warnings.append(
+        "Some of what was recorded could not be turned into a valid use case "
+        f"and was left out: {refusal}. Everything else is here, and the steps "
+        "are worth reading before you decide whether to record it again."
+    )
+    # Dropped in the order that loses least. The steps are the recording; the
+    # declared inputs and outputs are labels on it, and a reviewer can retype
+    # a column name far more easily than a browser can redo the session.
+    for give_up in ("inputs", "secrets", "outputs"):
+        fields[give_up] = []
+        try:
+            return UseCase(**fields)
+        except Exception:  # noqa: BLE001
+            continue
+    return UseCase(
+        name=str(fields.get("name") or "Recorded by the agent"),
+        status="draft",
+        authored_by="agent",
+        warnings=warnings,
     )
 
 
@@ -172,6 +218,39 @@ def _steps(
             continue
         steps.append(step)
     return steps
+
+
+def _move_per_row_work(
+    setup: list[Step], row: list[Step], warnings: list[str]
+) -> tuple[list[Step], list[Step]]:
+    """A step that types a per-row value belongs in the row, wherever it fell.
+
+    Models work in the order a person would: do the task, then say what the
+    parts were. So the typing happens before `mark_setup_complete` and lands in
+    setup -- and a setup step referencing `{{input.x}}` is refused by the
+    schema, correctly, because setup runs once per batch and there is no row to
+    take the value from.
+
+    Rejecting the session over it would be pedantry. The mark is a *statement
+    of fact* -- this value changes per record -- so the step that types it is
+    row work by definition, and moving it is acting on what the agent said
+    rather than guessing at what it meant. The alternative, seen once for real,
+    is losing an otherwise perfect recording to an ordering convention.
+    """
+    stays, moves = [], []
+    for step in setup:
+        if any(kind == "input" for kind, _ in step.references()):
+            moves.append(step)
+        else:
+            stays.append(step)
+    if moves:
+        warnings.append(
+            f"{len(moves)} step(s) that type a per-row value were recorded "
+            "before the row began, and have been moved into the row. Check "
+            "they are in the right order -- everything left in setup runs once "
+            "per batch."
+        )
+    return stays, [*moves, *row]
 
 
 def _step(call: ToolCallRecord, bindings: dict[int, tuple[str, str]]) -> Step | None:

@@ -23,6 +23,8 @@ from typing import Any
 PRICES: dict[str, tuple[float, float]] = {
     "claude-opus-5": (15.0, 75.0),
     "claude-sonnet-5": (3.0, 15.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5": (0.80, 4.0),
 }
 
