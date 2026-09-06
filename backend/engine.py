@@ -179,6 +179,10 @@ class RowResult:
     ok: bool
     outputs: dict[str, Any] = field(default_factory=dict)
     failed_step_id: str | None = None
+    #: Where in ``row_steps`` it stopped, so a caller that fixes the page can
+    #: carry on from there rather than from the top. Re-running a partial row
+    #: from the beginning is how a form gets submitted twice.
+    failed_index: int | None = None
     error: str | None = None
     duration_ms: int = 0
     steps: list[StepOutcome] = field(default_factory=list)
@@ -351,18 +355,34 @@ class UseCaseExecutor:
             ok=True, duration_ms=int((time.monotonic() - started) * 1000), steps=outcomes
         )
 
-    async def run_row(self, inputs: dict[str, Any]) -> RowResult:
+    async def run_row(
+        self,
+        inputs: dict[str, Any],
+        *,
+        start_at: int = 0,
+        outputs: dict[str, Any] | None = None,
+    ) -> RowResult:
         """Run ``row_reset`` then ``row_steps`` for one input row.
 
         Never raises for an ordinary step failure -- the caller is a batch that
         must keep going. Only a dead browser propagates.
+
+        ``start_at`` continues a row that stopped part way, for a caller that
+        has put the page back where the next step expects it. It skips
+        ``row_reset``, deliberately: a reset returns the browser to the start,
+        which is the one thing a resume must not do. Re-running a partial row
+        from the top is how a form gets submitted twice, so this is not an
+        optimisation -- it is the only safe way to carry on at all.
+
+        ``outputs`` carries forward what earlier steps already read, because a
+        value extracted before the failure is not extracted again.
         """
         started = time.monotonic()
         # What the healer had spent before this row, so the row reports its own
         # cost rather than the session's running total.
         before = self.spent
         values = self.usecase.with_defaults(inputs)
-        outputs: dict[str, Any] = {}
+        outputs = dict(outputs or {})
         outcomes: list[StepOutcome] = []
 
         missing = self.usecase.missing_inputs(values)
@@ -373,12 +393,15 @@ class UseCaseExecutor:
                 duration_ms=0,
             )
 
+        index = start_at
         try:
-            if self.usecase.row_reset is not None:
+            if self.usecase.row_reset is not None and start_at == 0:
                 outcomes.append(
                     await self._run_step(self.usecase.row_reset, values, phase="reset")
                 )
-            for step in self.usecase.row_steps:
+            for index, step in enumerate(
+                self.usecase.row_steps[start_at:], start=start_at
+            ):
                 outcomes.append(
                     await self._run_step(step, values, phase="row", outputs=outputs)
                 )
@@ -387,6 +410,7 @@ class UseCaseExecutor:
                 ok=False,
                 outputs=outputs,
                 failed_step_id=exc.step_id,
+                failed_index=index,
                 error=str(exc),
                 duration_ms=int((time.monotonic() - started) * 1000),
                 steps=outcomes,
@@ -935,6 +959,16 @@ class UseCaseExecutor:
             ) from exc
 
     # -- locator ladder -----------------------------------------------------
+    async def locate(self, locators: list[Locator], step_id: str = "ad-hoc"):
+        """Find an element the way a recorded step would.
+
+        Public so that something outside a step can borrow the ladder -- the
+        recovery agent, which is handed the same page mid-replay and must not
+        get a second, weaker way of finding things. Sharing this is what makes
+        its ambiguity refusal apply there too.
+        """
+        return await self._resolve(locators, step_id)
+
     async def _resolve(
         self, locators: list[Locator], step_id: str, *, single: bool = True
     ):

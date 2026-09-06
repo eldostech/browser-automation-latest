@@ -302,6 +302,54 @@ class ReplayManager:
         # simply the one every recording needs.
         return {**self.settings.usecase_env, **({"base_url": base} if base else {})}
 
+    def make_row_runner(
+        self, executor: Any, usecase: UseCase, run_id: str, sink: Any, redactor: Any
+    ) -> Any:
+        """How one row runs: the engine alone, or the engine with an agent on call.
+
+        None means "the executor's own method", which is every Strict row and
+        every Guided row in a deployment without the agent installed. That is
+        the default and it stays the default: this returns something only when
+        a use case has asked for Guided *and* this deployment can actually
+        provide a recovery, so nothing changes underneath an installation that
+        did not opt in.
+
+        The agent here is a second line, not a replacement. The healer inside
+        the engine still gets first refusal on a step whose locator moved,
+        because it is cheaper and it is right far more often.
+        """
+        if self.llm_factory is None:
+            return None
+        if effective_mode(
+            usecase.mode, healing_enabled=self.settings.replay_healing_enabled
+        ) != "guided":
+            return None
+        if not getattr(self.settings, "agent_enabled", False):
+            return None
+        try:
+            from agent.graph import available
+            from agent.operate import run_row_with_agent
+        except ImportError:
+            return None
+        if not available():
+            return None
+
+        llm = self.llm_factory()
+        allowed = tuple(usecase.allowed_domains)
+
+        async def run(row: dict[str, Any]):
+            return await run_row_with_agent(
+                executor,
+                row,
+                llm=llm,
+                emit=_stamp(sink),
+                run_id=run_id,
+                allowed_domains=allowed,
+                redactor=redactor,
+            )
+
+        return run
+
     def make_memory(self, workspace_id: str) -> Any:
         """What this workspace has learned about broken locators, or None."""
         if not workspace_id or not getattr(
@@ -690,7 +738,14 @@ class ReplayManager:
                     )
                     result = setup
                 else:
-                    result = await executor.run_row(request.inputs)
+                    row_runner = self.make_row_runner(
+                        executor, request.usecase, run_id, sink, redactor
+                    )
+                    result = await (
+                        row_runner(request.inputs)
+                        if row_runner
+                        else executor.run_row(request.inputs)
+                    )
                     await executor.run_teardown()
                     if not result.ok:
                         await emit_replay_error(
@@ -700,6 +755,20 @@ class ReplayManager:
             await emit_replay_error(sink, run_id, "browser_unavailable", str(exc))
             result = RowResult(ok=False, error=str(exc))
         return result
+
+
+def _stamp(sink: Any):
+    """Give each event from the agent its sequence number.
+
+    The same adapter the authoring sessions use, for the same reason: the agent
+    package emits with ``seq=0`` because it owns no counter, and the run's sink
+    owns the one that is the client's resume token.
+    """
+
+    async def emit(event: Any) -> None:
+        await sink.emit(event.model_copy(update={"seq": sink.reserve_seq()}))
+
+    return emit
 
 
 def replay_terminal(result: RowResult) -> Terminal:
@@ -883,6 +952,13 @@ async def _drive_batch(
                 ),
                 sleep=asyncio.sleep,
                 indices=indices,
+                # Guided rows get the operate graph where the deployment can
+                # provide it: replay first, and an agent only on a row that
+                # failed. A batch of four thousand rows that all work makes no
+                # model call at all, which is the same as it made before.
+                run_row=manager.make_row_runner(
+                    executor, usecase, run_id, sink, redactor
+                ),
             )
 
             async def record(position: int, row: dict[str, Any], result: RowResult) -> None:

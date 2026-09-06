@@ -42,6 +42,7 @@ REPAIR = "repair"
 REPAIR_REQUEST = "repair_request"
 AUTHOR = "author"
 AUTHOR_TASK = "author_task"
+RECOVER = "recover"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
@@ -54,6 +55,7 @@ REQUIRED_PROMPTS: tuple[str, ...] = (
     REPAIR_REQUEST,
     AUTHOR,
     AUTHOR_TASK,
+    RECOVER,
 )
 
 _BLANK_RUN = re.compile(r"\n{3,}")

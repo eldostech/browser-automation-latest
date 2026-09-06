@@ -158,8 +158,16 @@ class BatchRunner:
         on_row: Callable[[int, dict[str, Any], Any], Any] | None = None,
         sleep: Callable[[float], Any] | None = None,
         indices: list[int] | None = None,
+        run_row: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.executor = executor
+        #: How one row is run. Defaults to the executor's own method, which is
+        #: the Strict and Guided path; a caller can supply the operate graph
+        #: instead, which replays first and asks an agent to clear the way only
+        #: when a row fails. Injected rather than branched on here so this loop
+        #: -- the failure streak, the pacing, the row indices -- has one shape
+        #: whichever is running underneath it.
+        self._run_row = run_row
         self.rows = rows
         #: The original row numbers, when this is a resume running a subset.
         #: Without them a resumed batch would label its rows 0..n again and the
@@ -184,7 +192,9 @@ class BatchRunner:
             # Stamped on every step row this produces, so a thousand-row batch
             # can be read back one record at a time.
             self.executor.row_index = self.indices[index] if self.indices else index
-            result = await self.executor.run_row(row)
+            result = await (
+                self._run_row(row) if self._run_row else self.executor.run_row(row)
+            )
             self.results.append(result)
 
             self.progress.attempted += 1
