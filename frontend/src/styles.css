@@ -1539,3 +1539,108 @@ table.mapping .examples {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
+
+/* --- help ----------------------------------------------------------------
+   A slide-over rather than a page, so the guidance sits beside whatever you
+   were stuck on rather than replacing it. */
+.topbar .help-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--chrome-line);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--chrome-text);
+  border-radius: var(--radius-sm);
+  padding: 5px 11px;
+  font-weight: 600;
+}
+.topbar .help-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: var(--gold);
+}
+.help-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(18, 41, 61, 0.35);
+  z-index: 40;
+}
+.help-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(560px, 100vw);
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(18, 41, 61, 0.12);
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+}
+.help-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.help-head h2 {
+  margin: 0;
+  font-size: 19px;
+}
+.help-body {
+  overflow: auto;
+  padding: 4px 24px 40px;
+}
+.help-body h3 {
+  font-size: 16px;
+  margin: 26px 0 8px;
+}
+.help-body p,
+.help-body li {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.help-body ol,
+.help-body ul {
+  padding-left: 20px;
+}
+.help-body li {
+  margin-bottom: 8px;
+}
+.help-body strong {
+  color: var(--text);
+}
+.help-body code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 1px 4px;
+}
+.help-body pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+}
+/* The one path with no screen behind it. Marked so nobody hunts for a button
+   that does not exist. */
+.help-warning {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}

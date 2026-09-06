@@ -3,6 +3,7 @@ import { api } from './lib/api';
 import { session, type CurrentUser } from './lib/session';
 import { HealingMemory } from './components/HealingMemory';
 import { Targets } from './components/Targets';
+import { Help } from './components/Help';
 import { RecordWorkflow } from './components/RecordWorkflow';
 import { RunHistory } from './components/RunHistory';
 import { SignIn } from './components/SignIn';
@@ -55,6 +56,7 @@ export default function App() {
     queue?: { queued?: number; running?: number };
   } | null>(null);
   const [environment, setEnvironment] = useState('');
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const navigate = useCallback((next: View) => {
     setView(next);
@@ -138,6 +140,19 @@ export default function App() {
           <span className="who" title={`${user.email} (${user.role})`}>
             {user.email} <span className="role-chip">{user.role}</span>
           </span>
+          <button
+            type="button"
+            className="help-button"
+            onClick={() => setHelpOpen(true)}
+            title="How to use this"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M9.5 9.5a2.5 2.5 0 113.5 2.3c-.7.3-1 .9-1 1.7" />
+              <path d="M12 17v.5" />
+            </svg>
+            Help
+          </button>
           <button type="button" className="linkish" onClick={() => api.logout()}>
             Sign out
           </button>
@@ -184,6 +199,8 @@ export default function App() {
           </button>
         </nav>
       </header>
+
+      {helpOpen && <Help onClose={() => setHelpOpen(false)} />}
 
       <main className={view.name === 'run' || view.name === 'usecase' ? 'page' : 'page narrow'}>
         {view.name === 'record' && !session.can('usecase:create') && (
