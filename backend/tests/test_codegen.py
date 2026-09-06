@@ -551,3 +551,67 @@ await page.get_by_role("combobox").first.select_option("e45fde3f-552b-4d8c")
     assert chosen.label == ""
     assert chosen.action == "select"
     assert chosen.value == "e45fde3f-552b-4d8c"
+
+
+# --- a name that contains another name -------------------------------------
+
+
+def test_exact_is_carried_off_the_recorded_locator():
+    """`exact=True` is codegen telling two controls apart, and it was dropped.
+
+    A page with a "+ Invite User" button and, in the dialog it opens, an
+    "Invite" button. Playwright matches an accessible name as a
+    case-insensitive substring, so the dialog's button can only be named
+    unambiguously with ``exact=True`` -- which codegen writes, and which the
+    parser discarded. The recorded locator then meant "either of these", and a
+    replay took whichever came first.
+    """
+    recording = parse(
+        script(
+            """
+await page.get_by_role("button", name="+ Invite User").click()
+await page.get_by_role("button", name="Invite", exact=True).click()
+"""
+        )
+    )
+
+    opener, submit = recording.steps
+    assert opener.locators[0].name == "+ Invite User"
+    assert opener.locators[0].exact is False
+    assert submit.locators[0].name == "Invite"
+    assert submit.locators[0].exact is True, "the whole point of the recorded line"
+
+
+def test_an_exact_rung_does_not_get_a_loose_text_fallback():
+    """The fallback must not find the control the exact rung exists to avoid."""
+    recording = parse(
+        script('await page.get_by_role("button", name="Invite", exact=True).click()')
+    )
+
+    assert [(loc.strategy, loc.exact) for loc in recording.steps[0].locators] == [
+        ("role", True),
+        ("text", True),
+    ]
+
+
+def test_exact_is_read_off_the_other_get_by_calls_too():
+    """Every ``get_by_*`` that matches by name takes it, and codegen writes it."""
+    recording = parse(
+        script(
+            """
+await page.get_by_label("Name", exact=True).fill("Ada")
+await page.get_by_text("Total", exact=True).click()
+"""
+        )
+    )
+
+    assert [loc.exact for step in recording.steps for loc in step.locators] == [True, True]
+
+
+def test_exact_survives_a_round_trip_through_the_document():
+    """It is stored, or replay reads back the locator that was already wrong."""
+    from usecase import Locator
+
+    stored = Locator(strategy="role", role="button", name="Invite", exact=True)
+    assert Locator.model_validate(stored.model_dump()).exact is True
+    assert "exact" in stored.describe()

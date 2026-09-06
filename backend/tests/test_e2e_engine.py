@@ -51,9 +51,14 @@ pytestmark = [
 #: whole assertion.
 PNG_MAGIC = b"\x89PNG"
 
+#: The heading deliberately does *not* repeat the button's wording. It used to,
+#: and `get_by_text("Sign in")` then matched the heading as well as the button
+#: -- so the fall-through test below was passing while clicking an <h1>. That
+#: is the bug the resolver now refuses to commit, and a fixture that contains
+#: it cannot demonstrate a working fall-through.
 SIGN_IN = """<!doctype html>
 <html><head><title>Sign in</title></head><body>
-  <h1>Sign in</h1>
+  <h1>Welcome back</h1>
   <form action="/orders.html">
     <label>Username <input name="u"></label>
     <label>Password <input name="p" type="password"></label>
@@ -129,6 +134,48 @@ LATE = """<!doctype html>
 """
 
 
+#: The page that broke a real run. A "+ Invite User" button opens a dialog
+#: holding an "Invite" button, and the dialog's backdrop covers the first one.
+#: Playwright matches an accessible name as a substring, so "Invite" names both
+#: -- and the one it finds first is the one nobody can click.
+INVITE = """<!doctype html>
+<html><head><title>Users</title>
+<style>
+  .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; }
+  .backdrop.open { display: block; }
+  .dialog { position: fixed; top: 25%; left: 30%; background: #fff; padding: 24px; }
+</style></head>
+<body>
+  <h1>Users</h1>
+  <button id="open">+ Invite User</button>
+  <div class="backdrop" id="backdrop"><div class="dialog" role="dialog">
+    <label>Email <input type="email"></label>
+    <button id="send">Invite</button>
+  </div></div>
+  <p id="outcome"></p>
+  <script>
+    document.getElementById('open').onclick = function () {
+      document.getElementById('backdrop').classList.add('open');
+    };
+    document.getElementById('send').onclick = function () {
+      document.getElementById('outcome').textContent = 'invited';
+    };
+  </script>
+</body></html>
+"""
+
+
+#: Two controls with the same accessible name and nothing to tell them apart.
+#: No locator can mean one of them, which is a different problem from the one
+#: above and has to fail differently.
+TWINS = """<!doctype html>
+<html><head><title>Twins</title></head><body>
+  <form><button type="button">Save</button></form>
+  <form><button type="button">Save</button></form>
+</body></html>
+"""
+
+
 @pytest.fixture(scope="module")
 def site(tmp_path_factory):
     """A two-page static site on a random port."""
@@ -141,6 +188,8 @@ def site(tmp_path_factory):
         "account,balance" + chr(10) + "A-1001,1240.55" + chr(10), encoding="utf-8"
     )
     (root / "orders.html").write_text(ORDERS, encoding="utf-8")
+    (root / "invite.html").write_text(INVITE, encoding="utf-8")
+    (root / "twins.html").write_text(TWINS, encoding="utf-8")
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -347,6 +396,12 @@ async def test_a_renamed_control_falls_through_to_the_next_rung(site):
     # The recorded rung names a control that is not on this page. The free text
     # rung recorded beside it still is.
     click.locators[0].name = "Log in instead"
+
+    # Without this the row would begin by navigating to the orders page, and
+    # would succeed whether or not the sign-in click found anything at all.
+    # Dropping it makes the row's own steps the proof: they are on the page
+    # that only a real click on the sign-in button reaches.
+    use_case.row_reset = None
 
     executor, _, [result] = await execute(use_case, site, [{"reference": "A-1024"}])
     assert result.ok, result.error
@@ -647,3 +702,104 @@ async def test_a_document_is_downloaded_and_kept(site):
     assert filename == "statement-A-1001.csv"
     assert b"A-1001,1240.55" in data, "the bytes are the real file"
     assert mime == "text/csv"
+
+
+# --- a name that contains another name -------------------------------------
+
+
+def invite_use_case(site, *, exact: bool):
+    """Open the dialog, then click the button inside it."""
+    from usecase import UseCase
+
+    return UseCase(
+        name="invite",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/invite.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="role", role="button", name="+ Invite User")],
+            ),
+            Step(
+                id="s3",
+                action="click",
+                locators=[
+                    Locator(strategy="role", role="button", name="Invite", exact=exact),
+                    Locator(strategy="text", text="Invite", exact=exact),
+                ],
+            ),
+            Step(
+                id="s4",
+                action="extract",
+                output="outcome",
+                locators=[Locator(strategy="css", selector="#outcome")],
+            ),
+        ],
+    )
+
+
+async def test_the_button_in_a_dialog_is_clicked_and_not_the_one_behind_it(site):
+    """The failure this whole arrangement exists to prevent.
+
+    ``get_by_role("button", name="Invite")`` finds "+ Invite User" as well, and
+    the resolver used to take ``.first`` of whatever matched. That is the
+    button the dialog's backdrop is covering, so the click waited for it to
+    become actionable and died on the step timeout -- reporting a timeout on a
+    button that was on the page, enabled, and one match away.
+    """
+    started = asyncio.get_running_loop().time()
+    _, _, [result] = await execute(
+        invite_use_case(site, exact=True), site, [{}], step_timeout=8.0
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result.ok, result.error
+    assert result.outputs["outcome"] == "invited", "the dialog's button, not the page's"
+    assert elapsed < 8, "it cannot have spent the step budget waiting"
+
+
+async def test_a_recording_made_before_exact_was_kept_still_resolves(site):
+    """Recordings already saved have no ``exact`` to read, and must still run.
+
+    The ladder narrows a named rung to the whole accessible name before trying
+    it as recorded. That is not a guess about the page: it is the same name,
+    read strictly, and it is taken only when it matches exactly one element.
+    """
+    _, _, [result] = await execute(
+        invite_use_case(site, exact=False), site, [{}], step_timeout=8.0
+    )
+
+    assert result.ok, result.error
+    assert result.outputs["outcome"] == "invited"
+
+
+async def test_two_identical_controls_fail_as_ambiguous_rather_than_as_missing(site):
+    """When no reading of the name picks one, say so.
+
+    Clicking whichever came first is how a batch acts on the wrong element a
+    thousand times over, and "no element matched" for two elements that did
+    sends somebody looking for the wrong problem.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="twins",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/twins.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="role", role="button", name="Save")],
+            ),
+        ],
+    )
+
+    _, _, [result] = await execute(use_case, site, [{}], step_timeout=3.0)
+
+    assert not result.ok
+    assert "ambiguous" in result.error
+    assert "matched 2" in result.error

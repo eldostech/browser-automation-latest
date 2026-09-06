@@ -71,6 +71,7 @@ from usecase import (
     Assertion,
     Locator,
     MissingValue,
+    NAMED_STRATEGIES,
     Step,
     UseCase,
     render_template,
@@ -287,6 +288,9 @@ class UseCaseExecutor:
         self._last_snapshot_text = ""
         self._last_page_url: str | None = None
         self._last_node = None
+        #: Rungs that matched more than one element on the last resolve, and
+        #: how many. Read only to explain a failure.
+        self._ambiguous: dict[str, int] = {}
         #: Rungs deeper than the first, per step id. Surfaced as drift.
         self.locator_drift: dict[str, int] = {}
         #: Repairs accepted this session, for the version bump afterwards.
@@ -906,15 +910,21 @@ class UseCaseExecutor:
         navigates. More than one is ambiguous, and picking the first silently
         is how a batch fills the wrong row of a table a thousand times; the
         recorded ``nth`` is how a recording says which one it meant.
+
+        This used to accept any rung matching *at least* one and collapse it
+        with ``.first``, which is the opposite of the paragraph above. It
+        failed on a page with a "+ Invite User" button and an "Invite" button
+        in the dialog that button opens: Playwright matches an accessible name
+        as a substring, so the dialog's rung found both, took the one behind
+        the dialog, and spent the whole step budget waiting for an element the
+        dialog was covering. A thirty-second timeout was the only symptom.
         """
         self._last_node = None
+        self._ambiguous = {}
         if not locators:
             return None
 
-        semantic = [(i, loc) for i, loc in enumerate(locators) if loc.semantic]
-        weak = [(i, loc) for i, loc in enumerate(locators) if not loc.semantic]
-        ordered = [*semantic, *weak]
-
+        ordered = self._rungs(locators)
         deadline = time.monotonic() + self.step_timeout
 
         while True:
@@ -923,21 +933,50 @@ class UseCaseExecutor:
                 if locator is None:
                     continue
                 try:
-                    if await locator.count() >= 1:
-                        if rung > 0:
-                            self._note_drift(step_id, rung)
-                        # Collapsed to the first match for an action that acts
-                        # on one element. `extract_rows` passes single=False,
-                        # because matching many is the whole point there.
-                        if single and spec.nth == 0:
-                            return locator.first, rung, spec.describe()
-                        return locator, rung, spec.describe()
+                    count = await locator.count()
                 except Exception:  # noqa: BLE001 - mid-navigation; try again
                     continue
+                # `extract_rows` passes single=False, because matching many is
+                # the whole point there.
+                if count == 1 or (count > 1 and not single):
+                    if rung > 0:
+                        self._note_drift(step_id, rung)
+                    return locator, rung, spec.describe()
+                if count > 1:
+                    # Kept for the failure message. A step that dies saying
+                    # "no element matched" when three of them did sends
+                    # somebody looking for the wrong problem entirely.
+                    self._ambiguous[spec.describe()] = count
 
             if time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(POLL_INTERVAL)
+
+    def _rungs(self, locators: list[Locator]) -> list[tuple[int, Locator]]:
+        """The ladder in the order it is walked, semantic rungs first.
+
+        A named rung that was *not* recorded as exact is walked twice: once
+        requiring the whole accessible name, then as recorded. Playwright's
+        default is a case-insensitive substring, so "Invite" also finds "+
+        Invite User" -- and a recording made before ``exact`` was carried
+        through the parser has no way left to say which was meant.
+
+        The narrowed twin is not a guess about the page. It is the same
+        recorded name, read more strictly, and it is taken only when it matches
+        exactly one element; when it matches nothing the rung as recorded is
+        tried immediately after. It shares its parent's rung number, so
+        resolving through it is not reported as drift.
+        """
+        expanded: list[tuple[int, Locator]] = []
+        for index, spec in enumerate(locators):
+            named = spec.name if spec.strategy == "role" else spec.text
+            if named and not spec.exact and spec.strategy in NAMED_STRATEGIES:
+                expanded.append((index, spec.model_copy(update={"exact": True})))
+            expanded.append((index, spec))
+        return [
+            *[pair for pair in expanded if pair[1].semantic],
+            *[pair for pair in expanded if not pair[1].semantic],
+        ]
 
     def _build(self, spec: Locator):
         """One rung as a Playwright locator.
@@ -947,18 +986,24 @@ class UseCaseExecutor:
         """
         page = self.browser.page
         try:
+            # `exact` decides whether the recorded name has to be the whole
+            # accessible name or merely part of it, and Playwright's default is
+            # the loose one. Every strategy that matches by name takes it;
+            # `get_by_test_id` matches an attribute and has no such parameter.
             if spec.strategy == "role":
-                base = page.get_by_role(spec.role or "", name=spec.name or None)
+                base = page.get_by_role(
+                    spec.role or "", name=spec.name or None, exact=spec.exact
+                )
             elif spec.strategy == "label":
-                base = page.get_by_label(spec.text or "")
+                base = page.get_by_label(spec.text or "", exact=spec.exact)
             elif spec.strategy == "placeholder":
-                base = page.get_by_placeholder(spec.text or "")
+                base = page.get_by_placeholder(spec.text or "", exact=spec.exact)
             elif spec.strategy == "test_id":
                 base = page.get_by_test_id(spec.text or "")
             elif spec.strategy == "alt_text":
-                base = page.get_by_alt_text(spec.text or "")
+                base = page.get_by_alt_text(spec.text or "", exact=spec.exact)
             elif spec.strategy == "text":
-                base = page.get_by_text(spec.text or "")
+                base = page.get_by_text(spec.text or "", exact=spec.exact)
             elif spec.strategy == "css":
                 base = page.locator(spec.selector or "")
             elif spec.strategy == "nth":
@@ -982,6 +1027,18 @@ class UseCaseExecutor:
         log.info("locator fell through", extra={"step_id": step_id, "rung": rung})
 
     def _not_found_message(self, step: Step) -> str:
+        if self._ambiguous:
+            # Naming the count is most of the fix: two matches on a name means
+            # the page holds a second control whose name contains this one, and
+            # re-recording that step gets an exact locator written for it.
+            found = "; ".join(
+                f"{described} matched {count}" for described, count in self._ambiguous.items()
+            )
+            return (
+                f"the locator is ambiguous: {found}. The recording does not say which one "
+                "was meant, and clicking whichever comes first is how a batch acts on the "
+                "wrong element. Re-record this step, or repair it to pick the right control."
+            )
         tried = "; ".join(loc.describe() for loc in step.locators) or "(no locators recorded)"
         available = ""
         if self._last_snapshot is not None:

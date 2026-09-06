@@ -181,37 +181,61 @@ class FakePage:
         return PNG
 
     # -- locators -----------------------------------------------------------
-    def get_by_role(self, role: str, name: str | None = None) -> FakeLocator:
-        nodes = self._snapshot().find(role, name)
+    def get_by_role(
+        self, role: str, name: str | None = None, exact: bool = False
+    ) -> FakeLocator:
+        """Careful: the loose path here is kinder than Playwright's.
+
+        ``Snapshot.find`` tries an exact name, then a normalised one, then a
+        substring, and stops at the first tier that yields anything. Playwright
+        goes straight to the substring. So a page holding both "Invite" and
+        "+ Invite User" resolves to one node here and to two there -- which is
+        why an ambiguous locator can only be caught in the real-browser tests,
+        and why one lived in `_resolve` long enough to break a run.
+        """
+        if exact and name is not None:
+            nodes = [
+                node
+                for node in self._snapshot().find(role)
+                if (node.name or "").strip() == name
+            ]
+        else:
+            nodes = self._snapshot().find(role, name)
         return FakeLocator(self, nodes, f'role={role} name="{name}"')
 
-    def _by_name(self, value: str, label: str) -> FakeLocator:
+    def _by_name(self, value: str, label: str, exact: bool = False) -> FakeLocator:
         snapshot = self._snapshot()
+        if exact:
+            nodes = [node for node in snapshot if (node.name or "").strip() == value]
+            return FakeLocator(self, nodes[:1], f"{label}={value!r}")
         node = snapshot.by_name(value)
         return FakeLocator(self, [node] if node else [], f"{label}={value!r}")
 
-    def get_by_label(self, text: str, **_: Any) -> FakeLocator:
-        return self._by_name(text, "label")
+    def get_by_label(self, text: str, exact: bool = False, **_: Any) -> FakeLocator:
+        return self._by_name(text, "label", exact)
 
-    def get_by_placeholder(self, text: str, **_: Any) -> FakeLocator:
-        return self._by_name(text, "placeholder")
+    def get_by_placeholder(self, text: str, exact: bool = False, **_: Any) -> FakeLocator:
+        return self._by_name(text, "placeholder", exact)
 
-    def get_by_alt_text(self, text: str, **_: Any) -> FakeLocator:
-        return self._by_name(text, "alt_text")
+    def get_by_alt_text(self, text: str, exact: bool = False, **_: Any) -> FakeLocator:
+        return self._by_name(text, "alt_text", exact)
 
     def get_by_test_id(self, text: str) -> FakeLocator:
         return self._by_name(text, "test_id")
 
-    def get_by_text(self, text: str, **_: Any) -> FakeLocator:
+    def get_by_text(self, text: str, exact: bool = False, **_: Any) -> FakeLocator:
         """Any node whose name or text contains this, which is what
-        `get_by_text` does on a real page."""
+        `get_by_text` does on a real page -- unless `exact`, which is the whole
+        string and is why a recorded `exact=True` has to reach this far."""
         wanted = text.casefold()
-        nodes = [
-            node
-            for node in self._snapshot()
-            if wanted in (node.name or "").casefold() or wanted in (node.text or "").casefold()
-        ]
-        return FakeLocator(self, nodes, f"text={text!r}")
+
+        def holds(node) -> bool:
+            name, body = (node.name or ""), (node.text or "")
+            if exact:
+                return name.strip() == text or body.strip() == text
+            return wanted in name.casefold() or wanted in body.casefold()
+
+        return FakeLocator(self, [n for n in self._snapshot() if holds(n)], f"text={text!r}")
 
     def locator(self, selector: str) -> FakeLocator:
         """`body` is the whole page; anything else matches nothing.

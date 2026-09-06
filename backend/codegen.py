@@ -581,10 +581,15 @@ def _locator_from(name: str, call: ast.Call) -> Locator | None:
     value = _string_arg(call, 0)
     if value is None:
         return None
+    # `exact=True` is codegen saying "this name, not one that contains it".
+    # It writes it only when it has to -- which is exactly when the page holds
+    # a second control whose name contains this one -- so dropping it turned
+    # the recorded element into "whichever of them comes first".
+    exact = _keyword_true(call, "exact")
     if strategy == "role":
         accessible_name = _keyword_string(call, "name")
-        return Locator(strategy="role", role=value, name=accessible_name)
-    return Locator(strategy=strategy, text=value)
+        return Locator(strategy="role", role=value, name=accessible_name, exact=exact)
+    return Locator(strategy=strategy, text=value, exact=exact)
 
 
 def _ladder(primary: Locator) -> list[Locator]:
@@ -604,7 +609,12 @@ def _ladder(primary: Locator) -> list[Locator]:
     """
     ladder = [primary]
     if primary.strategy == "role" and primary.name:
-        ladder.append(Locator(strategy="text", text=primary.name, nth=primary.nth))
+        # Carrying `exact` down to the fallback matters as much as it does on
+        # the rung above: a loose text rung under an exact role rung would
+        # find the very control the exact one exists to avoid.
+        ladder.append(
+            Locator(strategy="text", text=primary.name, nth=primary.nth, exact=primary.exact)
+        )
     return ladder
 
 
@@ -620,6 +630,14 @@ def _int_arg(call: ast.Call, index: int) -> int | None:
         return None
     node = call.args[index]
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, int) else None
+
+
+def _keyword_true(call: ast.Call, keyword: str) -> bool:
+    """Whether a literal ``keyword=True`` was written on this call."""
+    for item in call.keywords:
+        if item.arg == keyword and isinstance(item.value, ast.Constant):
+            return item.value.value is True
+    return False
 
 
 def _keyword_string(call: ast.Call, keyword: str) -> str | None:

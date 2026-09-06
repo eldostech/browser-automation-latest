@@ -362,6 +362,15 @@ one below exists on the server today.
 The executor records **which rung matched**. If a use case starts falling through to rung 3 or
 4, the site has drifted and the dashboard should say so *before* the whole thing breaks.
 
+**A rung is taken only when it matches exactly one element.** Playwright reads an accessible
+name as a case-insensitive *substring* unless told otherwise, so a button recorded as `Invite`
+also finds `+ Invite User` — and taking the first of those is how a batch acts on the wrong
+control. Codegen writes `exact=True` when it needs to tell two such names apart; the recorded
+locator carries it as `exact`, and every named rung is additionally tried in its strict reading
+first, so a recording made before that field existed still resolves. When no reading of the
+ladder picks a single element the step fails as **ambiguous**, naming what matched, rather than
+acting on whichever came first.
+
 ### 6.3 Templating rules
 
 `{{input.x}}`, `{{secret.x}}` and `{{env.x}}` are substituted in **value-bearing fields only**:

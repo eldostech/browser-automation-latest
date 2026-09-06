@@ -255,6 +255,12 @@ STRING_STRATEGIES = frozenset({"text", "label", "placeholder", "test_id", "alt_t
 #: ladder is built with them first.
 SEMANTIC_STRATEGIES = frozenset({"role", "label", "placeholder", "alt_text"})
 
+#: Strategies that match by a *name* and so have a loose and a strict reading
+#: of it. Playwright's ``exact`` parameter exists on exactly these calls;
+#: ``get_by_test_id`` matches an attribute and has no such thing, and ``css``
+#: and ``nth`` are not names at all.
+NAMED_STRATEGIES = frozenset({"role", "label", "placeholder", "alt_text", "text"})
+
 
 class Locator(BaseModel):
     """One rung of the locator ladder.
@@ -282,6 +288,14 @@ class Locator(BaseModel):
     #: strategy="role"
     role: str | None = None
     name: str | None = None
+    #: Whether the recorded name must be the element's *whole* accessible name.
+    #:
+    #: Playwright matches a name as a case-insensitive substring unless told
+    #: otherwise, so a button recorded as "Invite" also matches "+ Invite
+    #: User". Codegen writes ``exact=True`` when it needs to tell two such
+    #: controls apart; carrying it is therefore not an optimisation but the
+    #: difference between the recorded element and a different one.
+    exact: bool = False
     #: Disambiguates when several nodes share role+name, and indexes `nth`.
     nth: int = 0
     #: strategy="css"
@@ -315,6 +329,8 @@ class Locator(BaseModel):
             base = f"{self.strategy}={self.text!r}"
         else:
             base = f"nth={self.nth}"
+        if self.exact and self.strategy in NAMED_STRATEGIES:
+            base += " exact"
         return base if self.nth == 0 or self.strategy == "nth" else f"{base} [{self.nth}]"
 
 
