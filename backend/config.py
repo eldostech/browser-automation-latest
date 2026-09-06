@@ -195,6 +195,36 @@ class Settings(BaseSettings):
     #: to a timeout costs more than a stray browser process does.
     recorder_timeout_seconds: float = 1800.0
 
+    # --- Agent -------------------------------------------------------------
+    #: Whether this deployment offers the agent at all. Off by default: it
+    #: needs an optional dependency group and a Node runtime, and a feature
+    #: that fails when pressed is worse than one that says it is not here.
+    #:
+    #: This is the third deployment role, beside RECORDER_ENABLED and
+    #: WORKER_ENABLED. It exists for the same reason they do -- capabilities
+    #: differ per machine, and a laptop, a replay pod and an AgentCore runtime
+    #: are not the same machine.
+    agent_enabled: bool = False
+    #: Where the agent's browser comes from.
+    #:
+    #:   local      `npx @playwright/mcp`, owning its own Chromium.
+    #:   cdp        attach to a browser somebody else runs, named by
+    #:              AGENT_CDP_ENDPOINT. This is the AgentCore Browser path,
+    #:              and it is why the provider is an interface at all.
+    agent_browser_provider: str = "local"
+    #: The CDP endpoint to attach to when the provider is `cdp`. Blank
+    #: otherwise. A managed browser session's address, never a secret.
+    agent_cdp_endpoint: str = ""
+    #: The @playwright/mcp version to start. Pinned for the reason `playwright`
+    #: is pinned: its tool names and argument shapes are the contract the tool
+    #: registry is written against, and `@latest` would let a release change
+    #: them inside somebody's session rather than in CI.
+    agent_mcp_version: str = "0.0.80"
+    #: Whether the agent's browser is headed. Headless by default; a person
+    #: watching an authoring session wants to see it, and that is a per-session
+    #: choice made where the session starts rather than here.
+    agent_headless: bool = True
+
     # --- Job worker --------------------------------------------------------
     #: Whether this process claims queued batches as well as serving HTTP. True
     #: is what makes a single-machine install work with nothing else started.

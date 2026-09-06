@@ -25,11 +25,23 @@ the *agent*, and three things changed my mind:
    AgentCore, its tools reach it through Gateway as MCP and its browser is a
    managed CDP endpoint rather than a process we own. Building a bespoke tool
    protocol now means porting it later.
-2. **Playwright MCP already enforces the invariant we care most about.** It
-   drives the *accessibility tree* and hands the model opaque element handles
-   (`ref=e12`) with human descriptions. The model picks a handle; it cannot
-   author a selector. "The model can never invent a locator" stops being a rule
-   we police and becomes a property of the interface.
+2. **Playwright MCP hands back a durable locator for free.** It drives the
+   *accessibility tree*, and when a call names an element by a handle from a
+   snapshot (`e12`) the server replies with the Playwright code it ran —
+   `page.getByRole('button', { name: '+ Invite User' })`. That is a
+   role-and-name locator produced by the thing that just resolved it, which is
+   most of what distillation needs.
+
+   > **Corrected while building phase B.** An earlier version of this point
+   > claimed the protocol *enforced* "the model can never invent a locator",
+   > because the model picks an opaque handle out of a snapshot. Probing a real
+   > server showed otherwise: `browser_click`'s `target` is documented as
+   > "Exact target element reference from the page snapshot, **or a unique
+   > element selector**", and passing `#o` clicks the element. The property is
+   > not free. `guard` restores it by refusing any target that is not
+   > `eN`-shaped and present in what the page last reported — which also
+   > protects the durable-locator reply above, since a raw selector is only
+   > echoed back.
 3. **The step vocabulary is already Playwright MCP's vocabulary.** Read the
    comment above `ELEMENT_ACTIONS` in `usecase.py` — it explains `press` and
    `upload` in terms of `browser_press_key` and `browser_file_upload`. The
@@ -256,12 +268,24 @@ The left column is not a coincidence; see §0.3.
 
 ### 4.2 Refused, and not merely discouraged
 
-- **`browser_evaluate`.** Arbitrary JavaScript. `allow_scripts` is a privileged
-  grant to a *reviewed* recording; an agent that can write JS at run time makes
-  that gate meaningless. It is removed from the registry, not left to a prompt.
-- **`browser_install`**, and anything that writes outside the artifact store.
-- **Navigation outside the allowlist.** Enforced in `guard`, as a refused tool
-  call with an audit entry — never as an instruction the model is asked to obey.
+Removed from the list the model is shown, rather than forbidden in a prompt. A
+tool absent from the list cannot be called by a model that decides the rules do
+not apply to it; a prompt saying "do not use `browser_evaluate`" is a request.
+
+- **`browser_evaluate`** and **`browser_run_code_unsafe`.** Arbitrary
+  JavaScript and arbitrary Playwright code against a live session that may hold
+  someone else's credentials. `allow_scripts` is a privileged grant to a
+  *reviewed* recording; an agent that can write either at run time makes that
+  gate decorative.
+- **`browser_close`.** The session's lifetime belongs to the caller.
+- **`browser_drag` / `browser_drop`**, for now: not expressible as a step, so
+  they could not be distilled.
+- **A `target` that is not a ref.** See the correction in —0.2 — the
+  protocol accepts a raw selector there and this does not.
+- **Navigation outside the allowlist.** Enforced in `guard` on *every* call
+  rather than on a navigation tool by name, because a tool we have never seen
+  could still take a URL. Refused as a tool error with an audit entry — never
+  as an instruction the model is asked to obey.
 
 ### 4.3 The tools we add, and why each one earns its place
 

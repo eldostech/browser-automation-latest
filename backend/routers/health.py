@@ -81,6 +81,24 @@ async def healthz(request: Request, deep: bool = Query(default=False)) -> JSONRe
     return JSONResponse(body, status_code=200 if healthy else 503)
 
 
+def _agent_status(settings: Settings) -> dict[str, Any]:
+    """Whether an agent session could start here, and why not.
+
+    Two independent answers, deliberately kept apart. The deployment may have
+    the agent switched off, which is a decision; or it may be switched on and
+    unable to run, which is a missing optional dependency or a missing Node.
+    Collapsing them would tell an operator who enabled it that it is disabled.
+    """
+    if not settings.agent_enabled:
+        return {
+            "enabled": False,
+            "reason": "AGENT_ENABLED is false in this deployment.",
+        }
+    from agent import local_availability
+
+    return local_availability().as_dict()
+
+
 @router.get("/api/config")
 async def get_config_endpoint(
     _: CurrentUser, settings: Annotated[Settings, Depends(get_config)]
@@ -102,6 +120,11 @@ async def get_config_endpoint(
         },
         "environment": settings.environment,
         "recorder": {"enabled": settings.recorder_enabled},
+        # The third deployment role. Reported the same way the recorder is, and
+        # for the same reason: a capability that fails when pressed is worse
+        # than one that says up front it is not available here. Recording with
+        # codegen is unaffected either way -- it is a separate role.
+        "agent": _agent_status(settings),
         "model": settings.llm_repair_model,
         "provider": PROVIDER,
     }

@@ -232,6 +232,8 @@ export interface ServerConfig {
    *  single-environment install, and then the badge is not shown. */
   environment: string;
   recorder: { enabled: boolean };
+  /** The third deployment role. `reason` says why not, when it is off. */
+  agent: { enabled: boolean; reason: string | null };
   model: string;
   /** Always "bedrock" — the only provider. */
   provider: string;

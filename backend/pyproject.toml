@@ -33,6 +33,9 @@ pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-  "e2e: exercises a real browser through a real MCP server (set RUN_E2E=1)",
+  # The description was left over from the retired MCP design: the e2e tests
+  # drive Playwright directly, which is the whole point of them.
+  "e2e: records and replays against a real Chromium (set RUN_E2E=1)",
+  "mcp: drives a real `npx @playwright/mcp` server (set RUN_MCP=1)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
