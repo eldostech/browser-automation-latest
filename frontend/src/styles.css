@@ -1711,3 +1711,151 @@ table.mapping .examples {
   color: var(--text-dim);
   border: 1px solid var(--border);
 }
+
+/* ------------------------------------------------------ the agent session */
+/* Two ways to record, and the cards say what each costs the first time. The
+   difference is priced, not hidden: one is free forever, the other buys a
+   recording once. */
+.fork {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 14px 0 0;
+}
+.fork-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  text-align: left;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.fork-card:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.fork-card:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.fork-card strong {
+  font-size: 17px;
+  font-weight: 600;
+}
+.fork-card .hint {
+  margin: 0;
+}
+.fork-icon {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.fork-card .price {
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-top: auto;
+  padding-top: 8px;
+  color: var(--text-dim);
+}
+.converge {
+  margin: 14px 0 0;
+  padding: 11px 14px;
+  border-radius: 6px;
+  background: var(--bg-inset);
+  font-size: 13.5px;
+  color: var(--text-dim);
+}
+
+/* What it has spent. Always visible while it runs: an agent session is the
+   one thing in this product that costs money per second. */
+.meter {
+  display: flex;
+  gap: 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.meter .cost {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.approval {
+  border: 1px solid var(--gold);
+  background: #fdf8e8;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 12px 0 0;
+}
+.approval .args {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--bg-code);
+  border-radius: 5px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.transcript {
+  margin: 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 380px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+.transcript li {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.transcript li:last-child {
+  border-bottom: 0;
+}
+/* The marks are the recording. Doing the task teaches nobody anything; these
+   are what make it repeatable, so they read differently. */
+.transcript li.mark code {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+.transcript li.thought {
+  color: var(--text-dim);
+  font-style: italic;
+}
+.transcript li.asked {
+  color: var(--gold);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.verified {
+  border-left: 3px solid var(--ok, #1f7a4d);
+  background: var(--bg-inset);
+  padding: 10px 14px;
+  border-radius: 0 6px 6px 0;
+  font-size: 13.5px;
+}
+.warnings {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.warnings li {
+  margin-bottom: 5px;
+}
+
+@media (max-width: 700px) {
+  .fork {
+    grid-template-columns: 1fr;
+  }
+}

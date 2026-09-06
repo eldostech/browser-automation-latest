@@ -41,6 +41,23 @@ export function Help({ onClose }: Props) {
             once per row of a spreadsheet, with no model involved and no cost per run.
           </p>
 
+          <h3>Two ways to record, one result</h3>
+          <p>
+            <strong>Do it myself</strong> opens a browser and records what you do. Free,
+            and the right choice when you know the steps.
+          </p>
+          <p>
+            <strong>Describe it</strong> gives the task to an agent, which works it out in
+            a browser you can watch. It costs tokens once. It marks what varies per row and
+            what to read out as it goes, and before you see anything it replays what it
+            recorded to check that it works &mdash; you are told either way.
+          </p>
+          <p>
+            Both land in the same review screen and produce the same use case, which
+            replays for nothing afterwards. Neither publishes anything: a person always
+            reviews before a thousand rows run.
+          </p>
+
           <h3>Filling a website in from a spreadsheet</h3>
           <ol>
             <li>

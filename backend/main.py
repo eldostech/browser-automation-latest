@@ -25,6 +25,7 @@ from credentials import Vault
 from llm import RepairModel
 from jobs import JobQueue, Worker
 from logging_setup import configure_logging
+from agent_manager import AgentSessions
 from recorder import Recorder
 from routers import ALL_ROUTERS
 from storage import build_storage
@@ -118,9 +119,10 @@ async def lifespan(app: FastAPI):
     await app.state.bus.start()
 
     app.state.vault = Vault(settings.credentials_key or None)
-    # One model, built on first use. It looks at a page when a step breaks, and
-    # that is the only thing left in this application that costs tokens per
-    # run. The driver and the distiller went with the agent.
+    # One model, built on first use, shared by the two things that can spend a
+    # token: repairing a locator mid-replay, and driving an authoring session.
+    # Sharing it keeps Bedrock configured in one place, which is the reason
+    # there is only one provider at all.
     app.state.repair_model = RepairModel(settings)
 
     # The healer is the only route from a replay to a model, and it is handed
@@ -170,6 +172,19 @@ async def lifespan(app: FastAPI):
     ok, reason = app.state.recorder.available()
     log.info("recorder", extra={"available": ok, "reason": reason or None})
 
+    # The third role, beside the recorder and the worker. Sessions live in this
+    # process for the same reason recordings do -- a browser is open and a
+    # person is watching it -- and the events they produce are persisted as
+    # they happen, so the transcript survives even when the live session does
+    # not.
+    app.state.agent_sessions = AgentSessions(
+        store, app.state.bus, settings, app.state.repair_model
+    )
+    log.info(
+        "agent",
+        extra={"enabled": settings.agent_enabled, "provider": settings.agent_browser_provider},
+    )
+
     # Said at startup rather than when the first run fails. On Windows only a
     # ProactorEventLoop can spawn the Playwright driver, and uvicorn picks the
     # other one whenever --reload or --workers is set -- so the usual
@@ -195,6 +210,9 @@ async def lifespan(app: FastAPI):
         # Before the rest: a headed browser that outlives its backend is a
         # window nobody owns, very possibly signed into something.
         await app.state.recorder.shutdown()
+        # Same reason, one layer along: a Node subprocess and the Chromium
+        # behind it must not outlive the API that started them.
+        await app.state.agent_sessions.shutdown()
         await app.state.bus.stop()
         await store.close()
         log.info("backend stopped")

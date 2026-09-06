@@ -82,6 +82,119 @@ class AuthorResult:
         }
 
 
+class AgentSession:
+    """One authoring session's whole lifetime: browser, graph, checkpoint.
+
+    An object rather than a function because of the interrupt. When the graph
+    stops to ask a person, **the browser has to stay open**: the agent is three
+    pages into a workflow and the refs it is holding belong to the page in
+    front of it. Closing and reopening between ``start`` and ``resume`` would
+    leave the resumed graph acting on a blank tab -- the opposite of what a
+    durable checkpoint is for.
+
+    So the caller owns the lifetime. :func:`run_agent_session` is the one-shot
+    wrapper for a caller that never needs to resume.
+    """
+
+    def __init__(
+        self,
+        request: AuthorRequest,
+        *,
+        llm: LLMClient,
+        provider: BrowserProvider,
+        emit: Any,
+        recorder: Recorder | None = None,
+        secrets: dict[str, str] | None = None,
+        checkpointer: Any = None,
+        thread_id: str = "",
+        replay: Replayer | None = None,
+        name: str = "",
+    ) -> None:
+        request.run_id = request.run_id or uuid.uuid4().hex
+        self.request = request
+        self.secrets = dict(secrets or {})
+        self.replay = replay
+        self.name = name
+        self.thread_id = thread_id or request.run_id
+        self._checkpointer = checkpointer
+        self._compiled: Any = None
+        self._config: dict[str, Any] = {}
+        self._state: AuthorState = initial_state()
+        # The redactor is built from the secret *values* before the tool
+        # session exists: the existing invariant is that it is registered
+        # before anything is emitted, and an agent makes that easier to break
+        # than a replay does, because typing credentials into pages is most of
+        # what it does.
+        self.tools = AgentToolSession(
+            provider,
+            allowed_domains=request.allowed_domains,
+            may_write=request.may_write,
+            redactor=Redactor(self.secrets.values()),
+            recorder=recorder,
+        )
+        self.wiring = Wiring(
+            request=request,
+            tools=self.tools,
+            llm=llm,
+            spend=Spend(budget=request.budget),
+            emit=emit,
+        )
+
+    async def __aenter__(self) -> "AgentSession":
+        from . import graph as graph_module
+
+        if not graph_module.available():
+            raise RuntimeError(
+                "LangGraph is not installed here. The agent is an optional "
+                "extra: pip install -r backend/requirements-agent.txt"
+            )
+        await self.tools.__aenter__()
+        self._checkpointer = self._checkpointer or graph_module.memory_checkpointer()
+        self._compiled = graph_module.build(self.wiring, self._checkpointer)
+        self._config = {
+            "configurable": {"thread_id": self.thread_id},
+            "recursion_limit": 400,
+        }
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.tools.__aexit__(*exc)
+
+    async def start(self) -> AuthorResult:
+        return await self._run(initial_state())
+
+    async def resume(self, decision: str) -> AuthorResult:
+        """Continue after a person answered. Same browser, same checkpoint."""
+        from langgraph.types import Command
+
+        return await self._run(Command(resume={"decision": decision}))
+
+    async def _run(self, entry: Any) -> AuthorResult:
+        # `astream` rather than `invoke` so a cancelled session stops between
+        # nodes, and so the checkpoint after each node is written as the
+        # session goes rather than in one write at the end.
+        async for state in self._compiled.astream(
+            entry, config=self._config, stream_mode="values"
+        ):
+            self._state = state
+
+        awaiting = await _awaiting(self._compiled, self._config)
+        if awaiting:
+            # Paused mid-recording, not over. Nothing to distil yet.
+            return _result(
+                self.request, self._state, self.tools, self.wiring, awaiting=awaiting
+            )
+        return await _draft_and_verify(
+            self.request,
+            self._state,
+            self.tools,
+            self.wiring,
+            name=self.name,
+            replay=self.replay,
+            secrets=self.secrets,
+        )
+
+
 async def run_agent_session(
     request: AuthorRequest,
     *,
@@ -95,43 +208,24 @@ async def run_agent_session(
     replay: Replayer | None = None,
     name: str = "",
 ) -> AuthorResult:
-    """Run one authoring session to completion, or to its budget.
+    """Run one session to completion, or to its budget, and close the browser.
 
-    The redactor is built from the run's secret *values* before the tool
-    session exists, which is the existing invariant: registered before anything
-    is emitted. An agent makes it easier to break than a replay does, because
-    typing credentials into pages is most of what it does.
+    The one-shot form. A caller that has to answer an approval and carry on
+    wants :class:`AgentSession`, which keeps the browser open across the pause.
     """
-    request.run_id = request.run_id or uuid.uuid4().hex
-    redactor = Redactor((secrets or {}).values())
-
-    session = AgentToolSession(
-        provider,
-        allowed_domains=request.allowed_domains,
-        may_write=request.may_write,
-        redactor=redactor,
+    async with AgentSession(
+        request,
+        llm=llm,
+        provider=provider,
+        emit=emit,
         recorder=recorder,
-    )
-
-    async with session:
-        wiring = Wiring(
-            request=request,
-            tools=session,
-            llm=llm,
-            spend=Spend(budget=request.budget),
-            emit=emit,
-        )
-        state, awaiting = await _drive(
-            wiring, checkpointer, thread_id or request.run_id
-        )
-
-    if awaiting:
-        # Nothing to distil yet: the session is paused mid-recording, not over.
-        return _result(request, state, session, wiring, awaiting=awaiting)
-
-    return await _draft_and_verify(
-        request, state, session, wiring, name=name, replay=replay, secrets=secrets or {}
-    )
+        secrets=secrets,
+        checkpointer=checkpointer,
+        thread_id=thread_id,
+        replay=replay,
+        name=name,
+    ) as session:
+        return await session.start()
 
 
 async def _draft_and_verify(
@@ -195,44 +289,6 @@ def _result(
     )
 
 
-async def _drive(
-    wiring: Wiring, checkpointer: Any, thread_id: str
-) -> tuple[AuthorState, dict[str, Any] | None]:
-    """Run the graph, or say plainly that this deployment cannot.
-
-    There is no fallback loop. A hand-rolled `while` beside the graph would be
-    a second implementation of the control flow, drifting from the one that is
-    actually shipped -- and the two would disagree exactly where it matters,
-    on approval and on resume.
-    """
-    from . import graph as graph_module
-
-    if not graph_module.available():
-        raise RuntimeError(
-            "LangGraph is not installed here. The agent is an optional extra: "
-            "pip install -r backend/requirements-agent.txt"
-        )
-
-    compiled = graph_module.build(
-        wiring, checkpointer or graph_module.memory_checkpointer()
-    )
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 400}
-    # `astream` rather than `invoke` so a cancelled session stops between nodes
-    # rather than only at the end, and so the checkpoint after each node is
-    # written as the session goes rather than in one write at the finish.
-    final: AuthorState = initial_state()
-    async for state in compiled.astream(
-        initial_state(), config=config, stream_mode="values"
-    ):
-        final = state
-
-    # A graph that stopped for a human does not raise; it simply has somewhere
-    # left to go. Reporting that as a status rather than an exception is what
-    # lets a caller hold the session open and resume it with a decision -- see
-    # `resume_agent_session` below.
-    return final, await _awaiting(compiled, config)
-
-
 async def _awaiting(compiled: Any, config: dict[str, Any]) -> dict[str, Any] | None:
     """The question a suspended graph is waiting on, if it is waiting."""
     snapshot = await compiled.aget_state(config)
@@ -246,69 +302,5 @@ async def _awaiting(compiled: Any, config: dict[str, Any]) -> dict[str, Any] | N
     return None
 
 
-async def resume_agent_session(
-    request: AuthorRequest,
-    decision: str,
-    *,
-    llm: LLMClient,
-    provider: BrowserProvider,
-    emit: Any,
-    checkpointer: Any,
-    recorder: Recorder | None = None,
-    secrets: dict[str, str] | None = None,
-    thread_id: str = "",
-) -> AuthorResult:
-    """Continue a session a person was asked about.
 
-    The checkpointer must be the same one -- that is the whole mechanism. The
-    browser is opened again because the old one belonged to the process that
-    suspended, which is exactly the case a durable checkpoint exists for: the
-    conversation and the marks survive, the live objects do not.
-    """
-    redactor = Redactor((secrets or {}).values())
-    session = AgentToolSession(
-        provider,
-        allowed_domains=request.allowed_domains,
-        may_write=request.may_write,
-        redactor=redactor,
-        recorder=recorder,
-    )
-
-    async with session:
-        wiring = Wiring(
-            request=request,
-            tools=session,
-            llm=llm,
-            spend=Spend(budget=request.budget),
-            emit=emit,
-        )
-        from . import graph as graph_module
-        from langgraph.types import Command
-
-        compiled = graph_module.build(wiring, checkpointer)
-        config = {
-            "configurable": {"thread_id": thread_id or request.run_id},
-            "recursion_limit": 400,
-        }
-        final: AuthorState = initial_state()
-        async for state in compiled.astream(
-            Command(resume={"decision": decision}), config=config, stream_mode="values"
-        ):
-            final = state
-        awaiting = await _awaiting(compiled, config)
-
-    return AuthorResult(
-        run_id=request.run_id,
-        status="awaiting_approval" if awaiting else final.get("status", "failed"),
-        awaiting=awaiting,
-        summary=final.get("summary", ""),
-        stopped_by=final.get("stopped_by", ""),
-        steps=final.get("step", 0),
-        spend=wiring.spend.as_dict(),
-        trajectory=[call.as_dict() for call in session.calls],
-        marks=session.marks.as_dicts(),
-        unfinished=session.marks.unfinished(),
-    )
-
-
-__all__ = ["AuthorResult", "resume_agent_session", "run_agent_session"]
+__all__ = ["AgentSession", "AuthorResult", "run_agent_session"]

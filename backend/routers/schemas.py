@@ -361,3 +361,48 @@ __all__ = [
     "ScriptsRequest",
     "UpdateUserRequest",
 ]
+
+
+class StartAgentSessionRequest(BaseModel):
+    """Start an agent working on a task in a browser.
+
+    Budgets are on the request rather than only in configuration because they
+    are a per-session judgement: exploring an unfamiliar site is worth more
+    steps than re-recording one somebody already knows.
+    """
+
+    task: str = Field(min_length=1, max_length=4000)
+    #: Where to start. A target is preferred -- the deployment says where a
+    #: site lives, so nothing about the address is baked into what is recorded.
+    target: str = ""
+    start_url: str = ""
+    #: What to call the use case this produces. Optional; the task is used.
+    name: str = Field(default="", max_length=200)
+    #: A stored credential to bind. The slot names reach the model; the values
+    #: never do.
+    credential_id: str | None = None
+    #: Inline values, for a one-off. Same shape as a single-row execute.
+    secrets: dict[str, str] | None = None
+    #: One record to work through, so the agent has something concrete to do
+    #: and the draft has a row to be verified against.
+    sample: dict[str, Any] = Field(default_factory=dict)
+    #: Off by default. An agent sent to find out how a form works must not
+    #: submit it on the way.
+    may_write: bool = False
+
+    budget_steps: int | None = Field(default=40, ge=1, le=500)
+    budget_tokens: int | None = Field(default=120_000, ge=1000)
+    budget_seconds: float | None = Field(default=600.0, ge=10, le=3600)
+    budget_usd: float | None = Field(default=1.0, ge=0.01, le=100)
+
+
+class AgentDecisionRequest(BaseModel):
+    """A person's answer to a session that stopped to ask."""
+
+    decision: Literal["approved", "rejected"]
+
+
+class SaveAgentSessionRequest(BaseModel):
+    """Turn a finished session's draft into a use case."""
+
+    name: str = Field(default="", max_length=200)

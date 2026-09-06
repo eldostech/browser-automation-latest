@@ -33,6 +33,21 @@ def a_session(*turns):
     return FakeMCP({"browser_snapshot": INVITE}), ScriptedLLM(list(turns))
 
 
+async def _replays(use_case, inputs, secrets):
+    """Stand in for verification.
+
+    Every session here injects this, and that is not tidiness. Without a
+    replayer `verify` uses the real one, which opens a Chromium -- so a test
+    about the graph's *edges* would quietly become a browser test, take
+    seconds, and hang the moment it ran after something that had already taken
+    the event loop somewhere it did not expect. The real path is covered end to
+    end in test_agent_mcp_live.py.
+    """
+    from agent.verify import Verification
+
+    return Verification(ran=True, ok=True)
+
+
 def request(**kwargs) -> AuthorRequest:
     return AuthorRequest(
         task=kwargs.pop("task", "Read the balance for one account."),
@@ -70,7 +85,8 @@ async def test_a_session_runs_end_to_end_through_the_graph():
     events = []
 
     result = await run_agent_session(
-        request(), llm=llm, provider=provider, emit=lambda e: _keep(events, e)
+        request(), llm=llm, provider=provider, emit=lambda e: _keep(events, e),
+        replay=_replays,
     )
 
     assert result.status == "succeeded", result.stopped_by
@@ -85,7 +101,8 @@ async def test_the_trajectory_is_what_distillation_will_read():
     provider, llm = a_session(*a_complete_session())
 
     result = await run_agent_session(
-        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e)
+        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e),
+        replay=_replays,
     )
 
     assert [call["tool"] for call in result.trajectory] == [
@@ -107,7 +124,8 @@ async def test_the_browser_is_closed_when_the_session_ends():
     provider, llm = a_session(*a_complete_session())
 
     await run_agent_session(
-        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e)
+        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e),
+        replay=_replays,
     )
 
     assert provider.closed
@@ -127,6 +145,7 @@ async def test_a_step_budget_ends_the_session_rather_than_running_forever():
         llm=llm,
         provider=provider,
         emit=lambda e: _keep([], e),
+        replay=_replays,
     )
 
     assert result.status == "partial"
@@ -143,7 +162,8 @@ async def test_prose_goes_round_again_rather_than_ending_the_session():
     )
 
     result = await run_agent_session(
-        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e)
+        request(), llm=llm, provider=provider, emit=lambda e: _keep([], e),
+        replay=_replays,
     )
 
     assert result.status == "succeeded"
@@ -172,6 +192,7 @@ async def test_an_irreversible_action_suspends_the_graph_and_waits():
         provider=provider,
         emit=lambda e: _keep(events, e),
         checkpointer=checkpointer,
+        replay=_replays,
     )
 
     # Suspension is a status, not an exception. A person being needed is a fact
@@ -189,14 +210,13 @@ async def test_an_irreversible_action_suspends_the_graph_and_waits():
 
 
 async def test_resuming_with_an_approval_continues_from_where_it_stopped():
-    """The whole point of the checkpoint. Same thread id, a decision, and the
-    graph carries on -- four seconds later in a tab, or the next morning."""
-    from langgraph.types import Command
+    """The whole point of the checkpoint -- and of keeping the browser open.
 
-    from agent import graph as graph_module
-    from agent.author import Wiring, initial_state
-    from agent.budget import Spend
-    from agent.session import AgentToolSession
+    The agent is mid-workflow when it stops to ask. Closing the browser and
+    reopening it on resume would leave the graph acting on a blank tab, which
+    is why AgentSession owns the lifetime rather than each call owning its own.
+    """
+    from agent import AgentSession, graph as graph_module
 
     provider, llm = a_session(
         PLAN,
@@ -207,35 +227,27 @@ async def test_resuming_with_an_approval_continues_from_where_it_stopped():
         turn_calling(FINISH, summary="Deleted, as approved."),
     )
     events = []
-    checkpointer = graph_module.memory_checkpointer()
-    config = {"configurable": {"thread_id": "resumable"}, "recursion_limit": 400}
 
-    session = AgentToolSession(provider, allowed_domains=("vendor.test",), may_write=True)
-    async with session:
-        wiring = Wiring(
-            request=request(run_id="resumable"),
-            tools=session,
-            llm=llm,
-            spend=Spend(budget=Budget()),
-            emit=lambda e: _keep(events, e),
-        )
-        compiled = graph_module.build(wiring, checkpointer)
-        async for _ in compiled.astream(
-            initial_state(), config=config, stream_mode="values"
-        ):
-            pass
+    async with AgentSession(
+        request(run_id="resumable"),
+        llm=llm,
+        provider=provider,
+        emit=lambda e: _keep(events, e),
+        checkpointer=graph_module.memory_checkpointer(),
+        replay=_replays,
+    ) as session:
+        paused = await session.start()
+        assert paused.status == "awaiting_approval"
+        assert provider.calls[-1][0] == "browser_snapshot", "the click did not run"
+        assert not provider.closed, "the browser stays open while a person decides"
 
-        assert any(e.type == "approval_required" for e in events)
-        assert provider.calls[-1][0] == "browser_snapshot"
+        done = await session.resume("approved")
 
-        async for _ in compiled.astream(
-            Command(resume={"decision": "approved"}), config=config, stream_mode="values"
-        ):
-            pass
-
-    assert any(e.type == "approval_resolved" for e in events)
     assert "browser_click" in [name for name, _ in provider.calls], "it ran after approval"
+    assert done.status in {"succeeded", "partial"}
+    assert any(e.type == "approval_resolved" for e in events)
     assert any(e.type == "run_finished" for e in events)
+    assert provider.closed
 
 
 async def _keep(bucket, event):
@@ -274,6 +286,7 @@ async def test_the_budget_is_counted_where_it_is_checked():
         llm=llm,
         provider=provider,
         emit=lambda e: _keep([], e),
+        replay=_replays,
     )
 
     assert result.spend["steps"] == 3
@@ -293,6 +306,7 @@ async def test_a_session_that_stops_at_its_budget_still_says_it_is_over():
         llm=llm,
         provider=provider,
         emit=lambda e: _keep(events, e),
+        replay=_replays,
     )
 
     assert [e.type for e in events][-1] == "run_finished"

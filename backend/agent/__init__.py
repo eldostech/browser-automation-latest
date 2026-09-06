@@ -33,7 +33,7 @@ from .author import AuthorRequest, AuthorState
 from .budget import Budget, BudgetExhausted, Spend
 from .distil import Draft, distil
 from .marks import MARK_TOOLS, Described, Mark, Marks, describe_element
-from .run import AuthorResult, resume_agent_session, run_agent_session
+from .run import AgentSession, AuthorResult, run_agent_session
 from .verify import Verification, verify
 from .session import AgentToolSession, Recorder, ToolCallRecord
 from .tools import DISTILS_TO, GuardContext, Guarded, PERCEPTION, REFUSED, guard, offered
@@ -51,7 +51,7 @@ __all__ = [
     "Draft",
     "Verification",
     "distil",
-    "resume_agent_session",
+    "AgentSession",
     "run_agent_session",
     "verify",
     "Described",

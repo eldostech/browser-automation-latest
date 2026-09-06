@@ -578,3 +578,68 @@ export interface CredentialSummary {
   created_at: string;
   last_used_at: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// The agent
+// ---------------------------------------------------------------------------
+
+/** Everything a session needs to start. Budgets are per-session because they
+ *  are a judgement: exploring an unfamiliar site is worth more steps than
+ *  re-recording one somebody already knows. */
+export interface StartAgentSession {
+  task: string;
+  target?: string;
+  start_url?: string;
+  name?: string;
+  credential_id?: string | null;
+  sample?: Record<string, string>;
+  may_write?: boolean;
+  budget_steps?: number;
+  budget_usd?: number;
+}
+
+/** What a session cost so far. */
+export interface AgentSpend {
+  steps: number;
+  tokens: number;
+  usd: number;
+  llm_calls: number;
+  seconds: number;
+}
+
+/** Whether the distilled draft replays. The whole point of the phase: the
+ *  agent does not get to claim it recorded something. */
+export interface AgentVerification {
+  ran: boolean;
+  ok: boolean;
+  failed_step: string;
+  error: string;
+  outputs: Record<string, unknown>;
+  duration_ms: number;
+  skipped: string;
+}
+
+export interface AgentSessionDetail {
+  id: string;
+  run_id: string;
+  task: string;
+  start_url: string;
+  /** running · awaiting_approval · succeeded · partial · failed · cancelled */
+  status: string;
+  error: string | null;
+  /** Set while it is stopped, waiting for a person. */
+  awaiting: {
+    approval_id: string;
+    call: { id: string; name: string; input: Record<string, unknown> };
+    categories: string;
+  } | null;
+  summary: string;
+  stopped_by: string;
+  spend: Partial<AgentSpend>;
+  steps: number;
+  marks: { kind: string; name: string; after_call: number }[];
+  unfinished: string;
+  use_case: UseCase | null;
+  draft_warnings: string[];
+  verification: Partial<AgentVerification>;
+}

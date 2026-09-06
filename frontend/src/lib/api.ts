@@ -9,6 +9,7 @@
 
 import type {
   AgentEvent,
+  AgentSessionDetail,
   AuditEntry,
   BatchDetail,
   BatchSummary,
@@ -22,6 +23,7 @@ import type {
   RunDetail,
   RunSummary,
   ServerConfig,
+  StartAgentSession,
   Target,
   UseCase,
   UseCaseSummary,
@@ -498,6 +500,35 @@ export const api = {
 
   deleteCredential: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/api/credentials/${id}`, { method: 'DELETE' }),
+
+  // --- the agent -----------------------------------------------------------
+  // Deliberately the same shape as the recording endpoints: start, watch,
+  // save. Two ways of producing the same artifact should read the same way.
+  startAgentSession: (body: StartAgentSession) =>
+    request<AgentSessionDetail>('/api/agent-sessions', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  getAgentSession: (sessionId: string) =>
+    request<AgentSessionDetail>(`/api/agent-sessions/${sessionId}`),
+
+  decideAgentSession: (sessionId: string, decision: 'approved' | 'rejected') =>
+    request<{ decision: string }>(`/api/agent-sessions/${sessionId}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision }),
+    }),
+
+  cancelAgentSession: (sessionId: string) =>
+    request<{ status: string }>(`/api/agent-sessions/${sessionId}/cancel`, {
+      method: 'POST',
+    }),
+
+  saveAgentSession: (sessionId: string, name: string) =>
+    request<{ usecase_id: string; version: number; warnings: string[] }>(
+      `/api/agent-sessions/${sessionId}/save`,
+      { method: 'POST', body: JSON.stringify({ name }) },
+    ),
 };
 
 /** Download URL for a finished batch's results. */

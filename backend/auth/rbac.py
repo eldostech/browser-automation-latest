@@ -62,6 +62,15 @@ class Permission(StrEnum):
     #: authorities.
     SCRIPT_ENABLE = "script:enable"
 
+    #: Starting an authoring session that drives a browser with a model.
+    #:
+    #: Its own permission rather than part of USECASE_CREATE, because the two
+    #: are different authorities: recording with codegen costs nothing and
+    #: touches only what the person clicks, while an agent session spends money
+    #: and decides for itself what to touch next. A workspace can reasonably
+    #: let everybody record and only some people spend.
+    AGENT_AUTHOR = "agent:author"
+
     # -- administration -----------------------------------------------------
     USER_MANAGE = "user:manage"
     AUDIT_READ = "audit:read"
@@ -88,8 +97,10 @@ _OPERATOR: frozenset[Permission] = _VIEWER | {
     Permission.CREDENTIAL_WRITE,
 }
 
-#: Can design, publish and repair use cases.
+#: Can design, publish and repair use cases -- including with the agent, which
+#: is the same job done a different way and lands in the same review screen.
 _AUTHOR: frozenset[Permission] = _OPERATOR | {
+    Permission.AGENT_AUTHOR,
     Permission.USECASE_CREATE,
     Permission.USECASE_PUBLISH,
     Permission.USECASE_DELETE,

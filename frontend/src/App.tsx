@@ -4,7 +4,7 @@ import { session, type CurrentUser } from './lib/session';
 import { HealingMemory } from './components/HealingMemory';
 import { Targets } from './components/Targets';
 import { Help } from './components/Help';
-import { RecordWorkflow } from './components/RecordWorkflow';
+import { NewUseCase } from './components/NewUseCase';
 import { RunHistory } from './components/RunHistory';
 import { SignIn } from './components/SignIn';
 import { RunView } from './components/RunView';
@@ -211,9 +211,7 @@ export default function App() {
         )}
 
         {view.name === 'record' && session.can('usecase:create') && (
-          <RecordWorkflow
-            onSaved={(usecaseId) => navigate({ name: 'usecase', usecaseId })}
-          />
+          <NewUseCase onSaved={(usecaseId) => navigate({ name: 'usecase', usecaseId })} />
         )}
 
         {view.name === 'memory' && <HealingMemory />}

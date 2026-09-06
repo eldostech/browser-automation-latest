@@ -16,6 +16,8 @@ import type { RecordingDetail } from '../lib/events';
 
 type Props = {
   onSaved: (usecaseId: string) => void;
+  /** Back to the fork. Absent when this screen is reached directly. */
+  onBack?: () => void;
 };
 
 type FieldChoice = {
@@ -70,7 +72,7 @@ function looksSecret(value: string): boolean {
   return value.length >= 8 && /[^a-zA-Z0-9]/.test(value) && /\d/.test(value);
 }
 
-export function RecordWorkflow({ onSaved }: Props) {
+export function RecordWorkflow({ onSaved, onBack }: Props) {
   const [available, setAvailable] = useState<{ ok: boolean; reason: string } | null>(null);
   const [startUrl, setStartUrl] = useState('');
   const [name, setName] = useState('');
@@ -197,7 +199,14 @@ export function RecordWorkflow({ onSaved }: Props) {
   if (available && !available.ok) {
     return (
       <div className="card">
-        <h3>Record a workflow</h3>
+        <h3>
+        Record a workflow
+        {onBack && (
+          <button type="button" className="linkish" style={{ marginLeft: 12 }} onClick={onBack}>
+            Back
+          </button>
+        )}
+      </h3>
         <p className="hint">{available.reason}</p>
       </div>
     );
@@ -205,7 +214,14 @@ export function RecordWorkflow({ onSaved }: Props) {
 
   return (
     <div className="card">
-      <h3>Record a workflow</h3>
+      <h3>
+        Record a workflow
+        {onBack && (
+          <button type="button" className="linkish" style={{ marginLeft: 12 }} onClick={onBack}>
+            Back
+          </button>
+        )}
+      </h3>
 
       {error && <p className="error">{error}</p>}
 
