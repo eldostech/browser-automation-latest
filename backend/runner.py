@@ -48,7 +48,7 @@ from redaction import NULL_REDACTOR, Redactor
 from browser import BrowserConfig, BrowserError, PlaywrightSession
 from engine import RowResult, UseCaseExecutor, emit_replay_error
 from store import Store, WorkspaceStore
-from usecase import resolve_base_url, UseCase
+from usecase import effective_mode, resolve_base_url, Mode, UseCase
 
 log = logging.getLogger(__name__)
 
@@ -234,18 +234,34 @@ class ReplayManager:
         """
         return self.store.workspace(workspace_id)
 
-    def make_healer(self, workspace_id: str = "", usecase_id: str | None = None) -> Any:
-        """A healer, or None when healing is off.
+    def make_healer(
+        self,
+        workspace_id: str = "",
+        usecase_id: str | None = None,
+        *,
+        mode: "Mode | None" = None,
+    ) -> Any:
+        """A healer, or None when this use case runs strictly.
 
         Returning None is the common case and is what keeps the executor's
         zero-token guarantee true by construction.
+
+        Whether a run may spend a token is a property of the *use case*, not of
+        the installation: one workflow runs against a site that is rebuilt every
+        sprint and another against a form that has not changed in four years,
+        and a single environment variable cannot be right for both. The setting
+        remains as a ceiling -- see :func:`effective_mode`.
 
         The memory is attached here rather than inside the healer so that the
         one object which can reach a model is also the one that decides whether
         it may read what other runs learned -- and so that a workspace's fixes
         are looked up through its own scoped store.
         """
-        if not self.settings.replay_healing_enabled or self.llm_factory is None:
+        if self.llm_factory is None:
+            return None
+        if effective_mode(
+            mode, healing_enabled=self.settings.replay_healing_enabled
+        ) != "guided":
             return None
         from healing import HealingBudget, StepHealer
 
@@ -660,7 +676,9 @@ class ReplayManager:
                     ),
                     screenshots=self.settings.replay_screenshots,
                     healer=self.make_healer(
-                        request.workspace_id, request.usecase.id
+                        request.workspace_id,
+                        request.usecase.id,
+                        mode=request.usecase.mode,
                     ),
                     baselines=baselines,
                     read_artifact=sink.read_artifact,
@@ -830,7 +848,9 @@ async def _drive_batch(
                     usecase, request.workspace_id, request.base_url
                 ),
                 screenshots=manager.settings.replay_screenshots,
-                healer=manager.make_healer(request.workspace_id, usecase.id),
+                healer=manager.make_healer(
+                    request.workspace_id, usecase.id, mode=usecase.mode
+                ),
                 baselines=baselines,
                 read_artifact=sink.read_artifact,
             )

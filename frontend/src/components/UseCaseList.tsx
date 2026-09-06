@@ -75,6 +75,7 @@ export function UseCaseList({ onOpen }: Props) {
             <tr>
               <th>Status</th>
               <th>Name</th>
+              <th>Runs as</th>
               <th>Updated</th>
               <th>Version</th>
             </tr>
@@ -95,6 +96,25 @@ export function UseCaseList({ onOpen }: Props) {
                     <div style={{ color: 'var(--text-faint)', fontSize: 12, marginTop: 4 }}>
                       {truncate(row.description, 160)}
                     </div>
+                  )}
+                </td>
+                <td style={{ whiteSpace: 'nowrap' }}>
+                  <span
+                    className="tag mode"
+                    title={
+                      row.mode
+                        ? row.mode === 'strict'
+                          ? 'No model can run on this use case.'
+                          : 'A repair may run when a step stops matching.'
+                        : 'Nothing chosen here, so it follows the deployment.'
+                    }
+                  >
+                    {row.mode ?? 'deployment'}
+                  </span>
+                  {row.authored_by === 'agent' && (
+                    <span className="tag" style={{ marginLeft: 6 }} title="Distilled from an agent session">
+                      agent
+                    </span>
                   )}
                 </td>
                 <td style={{ color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>

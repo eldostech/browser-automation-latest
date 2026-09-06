@@ -62,6 +62,23 @@ ELEMENT_ACTIONS: frozenset[str] = frozenset(
 OPTIONAL_LOCATOR_ACTIONS: frozenset[str] = frozenset({"press", "upload"})
 
 Status = Literal["draft", "ready", "archived"]
+
+#: How much a model is allowed to do while this use case runs.
+#:
+#: ``strict`` follows the recorded steps and cannot reach a model at all --
+#: ``engine.py`` does not import ``llm``, so this is a property of the code
+#: rather than a setting. ``guided`` runs exactly the same way until a step
+#: stops matching, at which point one budgeted call re-finds the control and
+#: the plan resumes; a row where nothing breaks costs nothing.
+#:
+#: There is deliberately no third value yet. A mode that works every row out
+#: from the page has no implementation behind it, and offering one that does
+#: nothing is worse than not offering it.
+Mode = Literal["strict", "guided"]
+
+#: Who produced this document. Recorded so a reviewer knows what they are
+#: looking at, and so the two authoring paths can be told apart in a list.
+AuthoredBy = Literal["person", "agent"]
 FailureMode = Literal["abort", "continue", "heal"]
 
 
@@ -135,6 +152,26 @@ def resolve_base_url(
             )
         return found.rstrip("/")
     return recorded.rstrip("/")
+
+
+def effective_mode(mode: "Mode | None", *, healing_enabled: bool) -> "Mode":
+    """What this use case actually does here, given what the deployment allows.
+
+    The deployment setting is a **ceiling, not a decision**. An operator who
+    turned healing off across an installation meant it, and a document arriving
+    from another environment must not be able to switch it back on -- so
+    ``healing_enabled=False`` answers ``strict`` whatever the document says.
+
+    Under that ceiling the document decides, and ``None`` means it never got
+    the chance: it was written before the field existed. Answering ``guided``
+    there is what keeps an upgrade from quietly changing how a published use
+    case behaves, because ``REPLAY_HEALING_ENABLED`` was the whole decision
+    until now.
+    """
+    if not healing_enabled:
+        return "strict"
+    return mode if mode is not None else "guided"
+
 
 class MissingValue(KeyError):
     """A template referenced an input or secret that was not supplied."""
@@ -643,6 +680,20 @@ class UseCase(BaseModel):
     #: a use case carries no address with it. Empty means "the URL recorded
     #: into this definition", which is what a single-environment install needs.
     target: str = ""
+    #: How this use case runs, or ``None`` for "whatever the deployment says".
+    #:
+    #: The three-way split is deliberate and the reason is upgrades. A document
+    #: written before this field existed has not chosen anything, and defaulting
+    #: it to ``strict`` would silently switch healing *off* in a deployment that
+    #: has ``REPLAY_HEALING_ENABLED=true`` today -- a behaviour change nobody
+    #: asked for, arriving with a schema addition. ``None`` therefore means
+    #: "inherit", and the moment somebody picks a mode on the screen it becomes
+    #: explicit and wins over the deployment either way.
+    mode: Mode | None = None
+    #: Who wrote this document. Recorded rather than inferred: a use case
+    #: distilled from an agent session and one recorded by hand are the same
+    #: shape on purpose, so the provenance has to be carried, not guessed.
+    authored_by: AuthoredBy = "person"
     version: int = 1
     source_run_id: str | None = None
 

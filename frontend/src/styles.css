@@ -1659,3 +1659,55 @@ table.mapping .examples {
 .hint.callout strong {
   color: var(--text);
 }
+
+/* --------------------------------------------------- how a use case runs */
+/* A radio list rather than a dropdown: three options whose differences are
+   the reason to pick one, so the reasons have to be on screen beside them. */
+.modes {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 4px 0 12px;
+}
+.mode-choice {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 11px 10px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mode-choice:last-child {
+  border-bottom: 0;
+}
+.mode-choice input {
+  width: auto;
+  margin-top: 3px;
+}
+.mode-choice.chosen {
+  background: var(--accent-dim);
+}
+.mode-choice.unavailable {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+.mode-choice strong {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.mode-price {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  padding-top: 3px;
+}
+/* On the list, beside the status. Deliberately quiet: it is a property worth
+   seeing at a glance, not an alert. */
+.tag.mode {
+  background: var(--bg-inset);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}

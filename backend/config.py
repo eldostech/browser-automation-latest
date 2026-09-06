@@ -211,6 +211,9 @@ class Settings(BaseSettings):
     #: lock, so one workspace cannot starve another.
     worker_workspace_concurrency: int = 1
 
+    #: The ceiling on healing, not the decision. A use case's own ``mode``
+    #: chooses within it; see :func:`usecase.effective_mode`. False here means
+    #: no use case in this deployment can reach a model however it is marked.
     replay_healing_enabled: bool = False
     replay_heal_max_attempts: int = 3
     replay_heal_max_tokens: int = 20_000

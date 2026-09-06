@@ -304,6 +304,15 @@ export interface SecretSpec {
   description: string;
 }
 
+/**
+ * How much a model may do while a use case runs.
+ *
+ * `null` means the document never chose and follows the deployment. It is not
+ * the same as "strict": a use case published before the choice existed was
+ * being healed if the deployment allowed it, and must keep being.
+ */
+export type UseCaseMode = 'strict' | 'guided';
+
 export interface UseCase {
   schema_version: number;
   id: string;
@@ -329,6 +338,10 @@ export interface UseCase {
   row_delay_seconds: number | null;
   /** Which target supplies the base URL; "" means the recorded one. */
   target: string;
+  /** How it runs; null follows the deployment. */
+  mode: UseCaseMode | null;
+  /** Which authoring path produced this document. */
+  authored_by: 'person' | 'agent';
   /** The origin this was recorded against, used when no target is named. */
   base_url: string;
   warnings: string[];
@@ -343,6 +356,9 @@ export interface UseCaseSummary {
   name: string;
   description: string;
   status: UseCaseStatus;
+  /** Mirrored from the definition so a list needs no extra query. */
+  mode: UseCaseMode | null;
+  authored_by: 'person' | 'agent';
   current_version: number;
   source_run_id: string | null;
   created_at: string;

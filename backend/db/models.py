@@ -342,6 +342,22 @@ class UseCase(Base):
     target: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default=""
     )
+    #: How much a model may do while this runs -- "strict", "guided", or empty
+    #: for "whatever the deployment says". Mirrored from the definition, which
+    #: stays the source of truth because the document has to carry it for
+    #: promotion; the column exists so a list can show a mode chip and filter
+    #: on it without reading every definition.
+    #:
+    #: Empty rather than a "strict" default on purpose: a use case published
+    #: before this column existed has not chosen, and saying it chose strict
+    #: would turn healing off underneath a deployment that has it on.
+    mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="", server_default=""
+    )
+    #: "person" or "agent". Which authoring path produced this document.
+    authored_by: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="person", server_default="person"
+    )
     #: A5. A ``script`` step is arbitrary JavaScript running inside a session
     #: that may hold someone else's credentials, so enabling it is a privileged
     #: act recorded on the resource -- not a per-request flag a caller can set.

@@ -7,6 +7,7 @@ import type {
   DatasetSummary,
   Target,
   UseCase,
+  UseCaseMode,
 } from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
 import {
@@ -35,6 +36,43 @@ type Mode = 'review' | 'single' | 'batch' | 'activity';
  * Review is not optional: distillation is a best guess over a noisy recording,
  * so a use case is created as a draft and only a person moves it to ready.
  */
+/**
+ * The three things a person can say, in the order of how much they permit.
+ *
+ * "Follow the deployment" is offered rather than hidden because it is what
+ * every use case recorded before this existed is doing, and a screen that
+ * showed one of the other two would be claiming a decision nobody made.
+ */
+const MODE_CHOICES: {
+  value: UseCaseMode | null;
+  label: string;
+  description: string;
+  price: string;
+}[] = [
+  {
+    value: 'strict',
+    label: 'Strict',
+    description:
+      'Follows the recorded steps. No model can run — the replay engine cannot reach one, so this is a property of the code rather than a setting.',
+    price: 'free',
+  },
+  {
+    value: 'guided',
+    label: 'Guided',
+    description:
+      'The same, until a step stops matching. Then one budgeted call re-finds the control from a list of what is actually on the page, and the run carries on.',
+    price: 'free on a good row',
+  },
+  {
+    value: null,
+    label: 'Follow the deployment',
+    description:
+      'Whatever this installation allows. What every use case did before this choice existed.',
+    price: 'depends',
+  },
+];
+
+
 export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [useCase, setUseCase] = useState<UseCase | null>(null);
   const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
@@ -67,6 +105,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
     outputs: Record<string, unknown>;
   } | null>(null);
   const [rowDelay, setRowDelay] = useState('');
+  // Whether this deployment permits healing at all. The card below has to be
+  // able to say what "following the deployment" actually resolves to, and it
+  // has to grey out Guided where the installation has turned it off -- a
+  // choice the screen offers but the run would not honour is a lie.
+  const [healingAllowed, setHealingAllowed] = useState<boolean | null>(null);
   // Which sites this deployment knows about, so the target can be chosen from
   // a list rather than typed from memory.
   const [targets, setTargets] = useState<Target[]>([]);
@@ -87,6 +130,10 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         .listTargets()
         .then((body) => setTargets(body.targets))
         .catch(() => setTargets([]));
+      api
+        .getConfig()
+        .then((body) => setHealingAllowed(Boolean(body.defaults?.healing)))
+        .catch(() => setHealingAllowed(null));
       api
         .listBatches(usecaseId)
         .then((body) => setPastBatches(body.batches))
@@ -216,6 +263,24 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     });
   };
+
+  // Like the target and the pace, the mode is part of the definition: it
+  // changes what executes, so it is versioned and audited as any other edit
+  // is. Null clears the choice and hands the decision back to the deployment.
+  const saveMode = (next: UseCaseMode | null) =>
+    act(async () => {
+      if (!useCase) return;
+      if (next === (useCase.mode ?? null)) return;
+      await api.updateUseCase(usecaseId, { ...useCase, mode: next } as UseCase);
+      setNotice(
+        next === null
+          ? 'Cleared; this use case follows the deployment. Saved as a new version.'
+          : next === 'strict'
+            ? 'Set to Strict. No model can run on this use case. Saved as a new version.'
+            : 'Set to Guided. A repair may run when a step stops matching. Saved as a new version.',
+      );
+      await load();
+    });
 
   // The target lives in the definition, because promotion carries the document
   // and each deployment answers the name for itself. Changing it is therefore
@@ -725,6 +790,66 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
                 {useCase.target
                   ? `Runs against whatever ${useCase.target} points at here.`
                   : `Runs against ${useCase.base_url || 'the recorded address'}. That is right for a single environment, and what you change before promoting.`}
+              </p>
+            )}
+          </div>
+
+          <div className="card">
+            <h3>How it runs</h3>
+            <p className="hint">
+              How much a model is allowed to do. This belongs to the workflow rather than
+              to the installation: one site is rebuilt every sprint and another has not
+              changed in four years, and one setting cannot be right for both.
+            </p>
+
+            <div className="modes">
+              {MODE_CHOICES.map((choice) => {
+                const chosen = (useCase.mode ?? null) === choice.value;
+                const unavailable = choice.value === 'guided' && healingAllowed === false;
+                return (
+                  <label
+                    key={String(choice.value)}
+                    className={`mode-choice${chosen ? ' chosen' : ''}${unavailable ? ' unavailable' : ''}`}
+                  >
+                    <input
+                      type="radio"
+                      name="usecase-mode"
+                      checked={chosen}
+                      disabled={!session.can('usecase:create') || unavailable}
+                      onChange={() => void saveMode(choice.value)}
+                    />
+                    <span>
+                      <strong>{choice.label}</strong>
+                      <span className="hint" style={{ margin: '2px 0 0' }}>
+                        {choice.description}
+                      </span>
+                      {unavailable && (
+                        <span className="hint" style={{ margin: '2px 0 0' }}>
+                          This deployment has healing switched off, so a repair would not
+                          run even if it were chosen here.
+                        </span>
+                      )}
+                    </span>
+                    <span className="mode-price">{choice.price}</span>
+                  </label>
+                );
+              })}
+            </div>
+
+            {useCase.mode === null || useCase.mode === undefined ? (
+              <p className="hint">
+                Nothing chosen, so this follows the deployment
+                {healingAllowed === null
+                  ? '.'
+                  : healingAllowed
+                    ? ' — which currently allows a repair (Guided).'
+                    : ' — which currently allows no model at all (Strict).'}{' '}
+                Pick one above to decide it here instead.
+              </p>
+            ) : (
+              <p className="hint">
+                Chosen on this use case, so it stays {useCase.mode === 'strict' ? 'Strict' : 'Guided'}{' '}
+                wherever it is promoted.
               </p>
             )}
           </div>

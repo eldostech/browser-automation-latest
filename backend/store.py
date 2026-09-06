@@ -675,6 +675,10 @@ class WorkspaceStore:
         # case list can show and filter on it without parsing every definition,
         # and it was previously never written, which made it a lie.
         target = str(definition.get("target") or "")
+        # Empty is meaningful here: it is "this document has not chosen a
+        # mode", which is not the same as choosing strict. See usecase.py.
+        mode = str(definition.get("mode") or "")
+        authored_by = str(definition.get("authored_by") or "person")
         now = utcnow()
 
         async with self._sessions() as session:
@@ -702,6 +706,8 @@ class WorkspaceStore:
                 description=description,
                 status=status,
                 target=target,
+                mode=mode,
+                authored_by=authored_by,
                 current_version=version,
                 source_run_id=definition.get("source_run_id"),
                 created_at=now,
@@ -715,6 +721,8 @@ class WorkspaceStore:
                         "description": upsert.excluded.description,
                         "status": upsert.excluded.status,
                         "target": upsert.excluded.target,
+                        "mode": upsert.excluded.mode,
+                        "authored_by": upsert.excluded.authored_by,
                         "current_version": upsert.excluded.current_version,
                         "updated_at": upsert.excluded.updated_at,
                     },
@@ -1551,6 +1559,10 @@ def _usecase_dict(row: UseCase) -> dict[str, Any]:
         # Which site this points at in this deployment. On the summary so the
         # list can show it without loading every definition.
         "target": row.target,
+        # "" means the document never chose, so the list can say "following the
+        # deployment" rather than claiming a mode nobody picked.
+        "mode": row.mode or None,
+        "authored_by": row.authored_by,
         "current_version": row.current_version,
         "source_run_id": row.source_run_id,
         "scripts_enabled": row.scripts_enabled,
