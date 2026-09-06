@@ -225,6 +225,7 @@ def system_prompt(request: AuthorRequest) -> str:
     return render(
         AUTHOR,
         allowed_domains=", ".join(request.allowed_domains) or "(nothing configured)",
+        secrets=", ".join(request.secrets) or "(none bound to this session)",
     )
 
 
@@ -235,8 +236,22 @@ async def plan(state: AuthorState, w: Wiring) -> AuthorState:
     "sign in, search, open the record, read the balance" the agent notices when
     it is on a page that fits none of those, which is the cheapest available
     signal that something has gone wrong.
+
+    Emits before it calls the model, not after. This is the only step in the
+    whole session where nothing touches the browser -- a person watching a
+    headed window sees it sit still while this one network call happens, and a
+    slow model turn here read as "the browser is taking a long time to open"
+    when the browser had, in fact, already opened. One line of visible
+    progress is the fix; the round trip itself is a provider's to speed up.
     """
     w.spend.check()
+    await w.emit(
+        Thinking(
+            run_id=w.request.run_id, seq=0, step=0,
+            text="Working out an approach before touching the browser…",
+            done=True,
+        )
+    )
     turn = await w.llm.run_turn(
         system=system_prompt(w.request),
         messages=[

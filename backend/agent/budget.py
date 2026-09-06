@@ -47,12 +47,21 @@ class BudgetExhausted(RuntimeError):
 class Budget:
     """The caps. Every field is optional; None means "no limit of this kind".
 
-    The defaults are deliberately small. A person who wants a longer session
-    can say so, and the failure mode of a generous default is a bill.
+    The defaults are deliberately small in dollars, and deliberately generous
+    in tokens. ``usd`` is the cap a person actually reasons about and the one
+    exposed on the start screen; ``tokens`` exists to stop a genuine runaway,
+    not to be the everyday constraint. It used to be both: a real session
+    against a real page burned 127,000 tokens in six ordinary turns -- almost
+    all of it the tool schema list, resent unchanged on every turn -- and hit a
+    120,000 ceiling before it had done more than sign in. That read as the
+    agent giving up or ignoring the task; it was budget starvation. Bedrock
+    prompt caching (see llm.py) cuts most of that repetition now, and the
+    token cap is sized to stay out of the way while ``usd`` does the actual
+    governing.
     """
 
     steps: int | None = 40
-    tokens: int | None = 120_000
+    tokens: int | None = 400_000
     seconds: float | None = 600.0
     usd: float | None = 1.0
 

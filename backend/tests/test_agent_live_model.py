@@ -132,6 +132,73 @@ async def test_a_real_model_records_a_workflow_that_replays():
     assert result.spend["usd"] > 0, "a real session that cost nothing did not happen"
 
 
+#: A page that proves, without ever showing the real value to anything that
+#: would store or print it, that the value which reached the browser was the
+#: real one. The title becomes "MATCH" only on an exact match, so seeing
+#: "MATCH" is proof the substitution worked, and the assertion for "never
+#: printed the secret" can be made on the very same trajectory.
+CREDENTIAL_PAGE = (
+    "data:text/html,<h1>Sign in</h1>"
+    "<label>Login code <input id=a oninput=\""
+    "document.title = (this.value === 'Live-Bedrock-Check-9f3') ? 'MATCH' : 'NOMATCH'"
+    "\"></label>"
+)
+REAL_SECRET = "Live-Bedrock-Check-9f3"
+
+
+async def test_a_real_model_types_a_bound_credential_it_never_sees():
+    """The bug two real sessions hit before this fix: told to sign in and
+    given nothing to type, a model fabricated "admin" / "password". It never
+    saw a real value either time -- there was no route from a bound
+    credential to a typed character at all.
+
+    This proves the route exists against a real model: the credential is
+    typed correctly, and the real value never appears anywhere this test can
+    see -- not in the trajectory, not in the summary, not in what gets
+    printed below.
+    """
+    from config import Settings
+    from llm import build_llm
+
+    events: list = []
+
+    result = await run_agent_session(
+        AuthorRequest(
+            task=(
+                "Type the login code into the field using the credential "
+                "provided. Afterwards take a snapshot and mark_as_output "
+                "whatever the page title says, calling the column 'check'."
+            ),
+            start_url=CREDENTIAL_PAGE,
+            allowed_domains=("data",),
+            secrets=("login",),
+            may_write=True,
+            budget=Budget(steps=15, tokens=200_000, seconds=180, usd=0.60),
+        ),
+        llm=build_llm(Settings()),
+        provider=LocalPlaywrightMCP(headless=True),
+        emit=lambda e: _keep(events, e),
+        secrets={"login": REAL_SECRET},
+        replay=_ok,
+        name="Types a credential",
+    )
+
+    dump = str(result.trajectory) + str(result.summary) + str(result.marks)
+    print(f"\nspent: {result.spend}")
+    for call in result.trajectory:
+        print(f"  {call['tool']:24} {call.get('detail','')[:80]!r}")
+
+    assert REAL_SECRET not in dump, "the real value leaked into the trail"
+    assert any(
+        "MATCH" in str(call.get("detail", "")) and "NOMATCH" not in str(call.get("detail", ""))
+        for call in result.trajectory
+    ), "the page never confirmed the typed value matched the real credential"
+
+
+async def _keep(bucket, event):
+    bucket.append(event)
+
+
 async def test_a_real_model_refuses_to_leave_the_allowlist():
     """The guard is enforcement, not instruction -- but a model that fights it
     for twenty turns is a prompt problem, and this is where that shows."""

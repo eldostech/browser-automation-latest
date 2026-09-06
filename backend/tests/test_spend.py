@@ -276,3 +276,54 @@ async def test_a_workspace_at_its_ceiling_is_refused_before_a_browser_opens():
     assert "$1.50" in str(caught.value), (
         "it says what was spent, not merely that it is over"
     )
+
+
+# --- prompt caching, priced correctly --------------------------------------
+#
+# A real session burned 127,000 tokens in six ordinary turns against a real
+# page, almost all of it the tool schema list resent verbatim every time.
+# Bedrock's prompt cache fixes the repetition; these tests are what stop the
+# cost model silently pretending it did not, once it is turned on.
+
+
+def test_a_cache_read_costs_a_tenth_of_a_fresh_token():
+    """Without this, turning caching on made every session look exactly as
+    expensive as before -- the same token count, priced as if none of it had
+    been a hit."""
+    fresh = price_of("claude-sonnet-5", {"input_tokens": 10_000})
+    cached = price_of(
+        "claude-sonnet-5",
+        {"input_tokens": 10_000, "cache_read_tokens": 10_000},
+    )
+    assert cached == pytest.approx(fresh * 0.1)
+
+
+def test_a_cache_write_costs_a_little_more_than_a_fresh_token():
+    written = price_of(
+        "claude-sonnet-5",
+        {"input_tokens": 10_000, "cache_creation_tokens": 10_000},
+    )
+    fresh = price_of("claude-sonnet-5", {"input_tokens": 10_000})
+    assert written == pytest.approx(fresh * 1.25)
+
+
+def test_cache_and_fresh_tokens_in_one_turn_are_priced_separately():
+    """The ordinary shape of a real turn: most of the input was cached, a
+    little of it -- the newest tool result -- was not."""
+    usage = {
+        "input_tokens": 10_000,
+        "cache_read_tokens": 9_000,
+        "cache_creation_tokens": 0,
+    }
+    cost = price_of("claude-sonnet-5", usage)
+    expected = (1_000 * 3.0 + 9_000 * 3.0 * 0.1) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
+def test_usage_with_no_cache_fields_prices_exactly_as_before():
+    """Every existing caller -- the healer, every scripted test -- passes
+    usage with no cache keys at all, and must keep costing what it always
+    did."""
+    assert price_of("claude-sonnet-5", {"input_tokens": 1000, "output_tokens": 200}) == (
+        pytest.approx((1000 * 3.0 + 200 * 15.0) / 1_000_000)
+    )

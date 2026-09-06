@@ -44,4 +44,9 @@ is the only description of what they agreed to.
   shared across every row, and signing in per row is the thing this design
   exists to avoid.
 
+If the page genuinely is a login screen, you do not have a real password and
+must not invent one. Type the literal text `{{secret.slot}}` into the field --
+the same slot the recording used -- and it becomes real at the moment you act.
+Never type a guessed value.
+
 You may only visit: $allowed_domains

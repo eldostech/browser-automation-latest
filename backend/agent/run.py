@@ -131,6 +131,12 @@ class AgentSession:
             may_write=request.may_write,
             redactor=Redactor(self.secrets.values()),
             recorder=recorder,
+            # The route from a bound credential to a typed character. The
+            # model is told to type the literal `{{secret.slot}}`; this is
+            # what turns that into the real value in the one call that
+            # reaches a browser, and it is the whole reason a session can
+            # sign in at all rather than fabricating "admin" / "password".
+            secret_values=self.secrets,
         )
         self.wiring = Wiring(
             request=request,

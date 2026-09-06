@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 
 from redaction import NULL_REDACTOR, Redactor
+from usecase import MissingValue, render_template
 
 from snapshot import Snapshot, parse as parse_snapshot
 
@@ -113,12 +114,22 @@ class AgentToolSession:
         may_write: bool = False,
         redactor: Redactor | None = None,
         recorder: Recorder | None = None,
+        secret_values: dict[str, str] | None = None,
     ) -> None:
         self.provider = provider
         self.allowed_domains = tuple(allowed_domains)
         self.may_write = may_write
         self.redactor = redactor or NULL_REDACTOR
         self.recorder = recorder
+        #: Real credential values, keyed by slot. Never shown to the model and
+        #: never stored: the model is told to type the literal text
+        #: ``{{secret.slot}}``, and this is what turns that placeholder into a
+        #: real value in the one call that actually reaches a browser. Without
+        #: this there was no route from a bound credential to a typed
+        #: character at all -- an agent asked to "log in with the credentials
+        #: provided" had nothing to type and fabricated "admin" / "password",
+        #: twice, in two different real sessions.
+        self.secret_values = dict(secret_values or {})
         self.calls: list[ToolCallRecord] = []
 
         self._session: MCPSession | None = None
@@ -187,6 +198,40 @@ class AgentToolSession:
             available=frozenset(spec.name for spec in self._specs) | frozenset(MARK_TOOLS),
         )
 
+    def _substitute_secrets(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """A copy of ``arguments`` with every ``{{secret.x}}`` made real.
+
+        Scoped to the argument keys that actually carry typed text --
+        ``browser_type``'s ``text``, ``browser_select_option``'s ``values``,
+        and each field's ``value`` in ``browser_fill_form``. A raw literal
+        with no ``{{...}}`` in it -- a guessed value, or ordinary text --
+        passes through unchanged: this only ever narrows what a placeholder
+        means, it never invents one.
+
+        Raises ``MissingValue`` -- caught by the caller -- when the model
+        names a slot this session has no value for, rather than typing the
+        literal placeholder text into a live page.
+        """
+        if not self.secret_values:
+            return arguments
+
+        def sub(value: Any) -> Any:
+            if not isinstance(value, str) or "{{" not in value:
+                return value
+            return render_template(value, inputs={}, secrets=self.secret_values, env={})
+
+        out = dict(arguments)
+        if "text" in out:
+            out["text"] = sub(out["text"])
+        if isinstance(out.get("values"), list):
+            out["values"] = [sub(v) for v in out["values"]]
+        if isinstance(out.get("fields"), list):
+            out["fields"] = [
+                {**f, "value": sub(f.get("value"))} if isinstance(f, dict) else f
+                for f in out["fields"]
+            ]
+        return out
+
     # -- the one method that matters ---------------------------------------
     async def call(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:
         """Guard, dispatch, record. Never raises for a refusal.
@@ -225,8 +270,29 @@ class AgentToolSession:
         # nothing at all.
         described = self._describe(str(arguments.get("target") or ""))
 
+        # `arguments` -- the placeholder-bearing version -- is what gets
+        # recorded, redacted and shown back to the model. `dispatched` is a
+        # copy with every `{{secret.x}}` turned into the real value, and it is
+        # the only one that ever reaches a browser. Keeping the two apart is
+        # what lets the trajectory read "typed {{secret.email}}" -- which is
+        # exactly the step a replay should carry -- while the actual sign-in
+        # still succeeds against a real account.
         try:
-            result = await self._session.call(name, arguments)
+            dispatched = self._substitute_secrets(arguments)
+        except MissingValue as exc:
+            known = ", ".join(sorted(self.secret_values)) or "(none bound to this session)"
+            return await self._finish(
+                name, arguments,
+                ToolResult.failed(
+                    f"{{{{{exc.args[0]}}}}} is not a credential this session has. "
+                    f"Bound slots: {known}. Use one of those, exactly as "
+                    "{{secret.slot}} -- do not type a guessed value."
+                ),
+                verdict, started, refused=True,
+            )
+
+        try:
+            result = await self._session.call(name, dispatched)
         except Exception as exc:  # noqa: BLE001 - a dead server is a tool error
             log.warning("tool call raised", extra={"tool": name, "error": str(exc)})
             result = ToolResult.failed(f"{name} failed: {exc}")

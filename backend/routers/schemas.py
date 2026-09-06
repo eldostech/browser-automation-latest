@@ -397,7 +397,10 @@ class StartAgentSessionRequest(BaseModel):
     headless: bool | None = None
 
     budget_steps: int | None = Field(default=40, ge=1, le=500)
-    budget_tokens: int | None = Field(default=120_000, ge=1000)
+    #: A backstop, not the everyday limit -- see agent.budget.Budget. The
+    #: frontend does not ask for this; ``budget_usd`` is the number a person
+    #: actually sets, and this stays out of its way.
+    budget_tokens: int | None = Field(default=400_000, ge=1000)
     budget_seconds: float | None = Field(default=600.0, ge=10, le=3600)
     budget_usd: float | None = Field(default=1.0, ge=0.01, le=100)
 

@@ -34,6 +34,15 @@ PRICES: dict[str, tuple[float, float]] = {
 #: new than to be free.
 DEFAULT_PRICE: tuple[float, float] = (3.0, 15.0)
 
+#: What Bedrock's prompt cache changes about the input rate. A cache read is
+#: nearly free because the provider skips reprocessing that prefix; a cache
+#: write costs a little more than an ordinary token, because writing the cache
+#: is itself work. Anthropic publishes these as fixed multipliers of the base
+#: input rate, the same ratio for every model, which is why they live here
+#: rather than in the per-model table above.
+CACHE_READ_MULTIPLIER = 0.1
+CACHE_WRITE_MULTIPLIER = 1.25
+
 
 def rates_for(model: str) -> tuple[float, float]:
     for known, rates in PRICES.items():
@@ -43,11 +52,26 @@ def rates_for(model: str) -> tuple[float, float]:
 
 
 def price_of(model: str, usage: dict[str, Any]) -> float:
-    """Dollars for one turn, from its own input/output split."""
+    """Dollars for one turn, from its own input/output split.
+
+    ``input_tokens`` already includes any cache read and cache write -- see
+    ``chat.usage_of`` -- so the fresh (regular-priced) portion is what is left
+    after taking those back out. Without this, enabling the cache would have
+    made every session look no cheaper than before it was turned on: the same
+    total token count, priced as if none of it had been a cache hit.
+    """
     read, written = rates_for(model)
     tokens_in = int(usage.get("input_tokens") or 0)
     tokens_out = int(usage.get("output_tokens") or 0)
-    return (tokens_in * read + tokens_out * written) / 1_000_000
+    cache_read = int(usage.get("cache_read_tokens") or 0)
+    cache_write = int(usage.get("cache_creation_tokens") or 0)
+    fresh = max(0, tokens_in - cache_read - cache_write)
+    return (
+        fresh * read
+        + cache_read * read * CACHE_READ_MULTIPLIER
+        + cache_write * read * CACHE_WRITE_MULTIPLIER
+        + tokens_out * written
+    ) / 1_000_000
 
 
 def price_of_total(model: str, tokens: int, *, output_share: float = 0.2) -> float:

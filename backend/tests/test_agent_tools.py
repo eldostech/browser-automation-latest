@@ -71,6 +71,8 @@ TOOLS = [
     ToolSpec("browser_snapshot", "", {}),
     ToolSpec("browser_click", "", {"required": ["target"]}),
     ToolSpec("browser_type", "", {"required": ["target", "text"]}),
+    ToolSpec("browser_select_option", "", {"required": ["target", "values"]}),
+    ToolSpec("browser_fill_form", "", {"required": ["fields"]}),
     ToolSpec("browser_evaluate", "", {"required": ["function"]}),
     ToolSpec("browser_run_code_unsafe", "", {}),
 ]
@@ -396,3 +398,90 @@ def test_the_config_endpoint_tells_a_deployment_apart_from_a_broken_one():
     # Whether it *can* run depends on the machine; what must be true is that it
     # answers about the machine rather than about the setting.
     assert "AGENT_ENABLED" not in (on["reason"] or "")
+
+
+# --- credentials: the route from a bound slot to a typed character ---------
+#
+# Found from real sessions against a real app. An agent told "log in with the
+# credentials provided" and given no real value to type fabricated "admin" and
+# "password" -- twice, in two separate sessions -- because nothing existed to
+# turn a bound credential into a character on the page. These tests pin the
+# fix: the model types a placeholder, and only the dispatch that actually
+# reaches the browser ever sees the real value.
+
+
+async def test_a_placeholder_becomes_the_real_value_only_in_what_reaches_the_browser():
+    async with await session(secret_values={"email": "ada@vendor.test"}) as tools:
+        await tools.call("browser_type", {"target": "e4", "text": "{{secret.email}}"})
+
+    dispatched_name, dispatched_args = tools.provider.calls[-1]
+    assert dispatched_args["text"] == "ada@vendor.test"
+
+    # What is kept -- the trajectory, the audit trail, what a reviewer sees --
+    # is the placeholder. That is also what a replay of this step should carry,
+    # so this is not a compromise made for secrecy; it is the correct value to
+    # store either way.
+    recorded = tools.calls[-1]
+    assert recorded.arguments["text"] == "{{secret.email}}"
+    assert "ada@vendor.test" not in str(recorded.arguments)
+    assert "ada@vendor.test" not in recorded.detail
+
+
+async def test_a_literal_guess_is_left_alone_rather_than_rejected():
+    """Substitution only ever narrows what a placeholder means. A model that
+    ignores the instruction and types a guess anyway gets exactly what it
+    typed -- wrong, but not silently rewritten into something else wrong."""
+    async with await session(secret_values={"email": "ada@vendor.test"}) as tools:
+        await tools.call("browser_type", {"target": "e4", "text": "admin"})
+
+    assert tools.provider.calls[-1][1]["text"] == "admin"
+
+
+async def test_an_unknown_slot_is_refused_before_it_reaches_the_browser():
+    """Typing the literal, unresolved placeholder into a real page is worse
+    than refusing: the page silently rejects garbage and nothing explains why
+    the rest of the task became impossible. This is caught first."""
+    async with await session(secret_values={"email": "ada@vendor.test"}) as tools:
+        before = len(tools.provider.calls)
+        result = await tools.call("browser_type", {"target": "e4", "text": "{{secret.password}}"})
+
+    assert result.is_error
+    assert "email" in result.text, "it names what is actually bound, to fix the call"
+    assert len(tools.provider.calls) == before, "nothing reached the browser"
+
+
+async def test_select_option_values_are_substituted_too():
+    async with await session(secret_values={"role": "administrator"}) as tools:
+        await tools.call(
+            "browser_select_option", {"target": "e4", "values": ["{{secret.role}}"]}
+        )
+
+    assert tools.provider.calls[-1][1]["values"] == ["administrator"]
+
+
+async def test_fill_form_substitutes_each_fields_own_value():
+    """`browser_fill_form` batches several fields in one call, so each one's
+    `value` has to be handled on its own rather than as a single string."""
+    async with await session(secret_values={"email": "ada@vendor.test", "password": "s3cret"}) as tools:
+        await tools.call(
+            "browser_fill_form",
+            {
+                "fields": [
+                    {"name": "Email", "target": "e4", "value": "{{secret.email}}"},
+                    {"name": "Password", "target": "e9", "value": "{{secret.password}}"},
+                ]
+            },
+        )
+
+    sent = tools.provider.calls[-1][1]["fields"]
+    assert [f["value"] for f in sent] == ["ada@vendor.test", "s3cret"]
+
+
+async def test_a_session_with_no_bound_credentials_substitutes_nothing():
+    """The common case, and it must cost nothing: most calls carry no
+    placeholder at all, and a session recording a workflow with no sign-in
+    should not pay for a lookup that can never match."""
+    async with await session() as tools:  # no secret_values
+        await tools.call("browser_type", {"target": "e4", "text": "ordinary text"})
+
+    assert tools.provider.calls[-1][1]["text"] == "ordinary text"

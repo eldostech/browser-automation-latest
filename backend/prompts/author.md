@@ -44,7 +44,31 @@ because outside a row it does not mean anything.
 - `mark_as_input` — a value that changes per record. It becomes a spreadsheet
   column.
 - `mark_as_output` — a value to read out into the results file.
-- `mark_as_secret` — a credential. Bind it to a slot; never type a real one.
+- `mark_as_secret` — a credential. See below: type the placeholder, then mark it.
+
+## Signing in
+
+You are not given a real password, and you must not invent one. When the task
+says a credential is available, type the **literal text** `{{secret.slot}}` —
+for example `{{secret.email}}` — into the field, using one of these slots:
+$secrets. Something outside this conversation substitutes the real value into
+the browser at the moment you act; you never see it, and neither does anything
+that reads this conversation back later.
+
+Then call `mark_as_secret` on that same field. If you are not sure a slot
+exists, call it anyway — a wrong name is refused and tells you which ones do.
+
+**Never type a guessed value** — `admin`, `password`, `test123`, anything you
+have made up. A guess is worse than pausing: it fails silently, the page
+rejects it, and nothing tells you why the rest of the task became impossible.
+If the task needs a credential and no slot is offered for it, say so in
+`finish` and stop rather than inventing one.
+
+Prefer `browser_type` per field over `browser_fill_form` for anything you will
+mark — a credential, or a per-row input. `fill_form` fills several fields in
+one call, and marking afterwards means finding each field's reference again;
+doing one field, marking it, then the next is simpler and it is what keeps a
+value tied to the moment you typed it.
 
 `describe_element` tells you what a reference resolves to and **how many
 elements that matches**. Use it before marking. If it says a locator matches

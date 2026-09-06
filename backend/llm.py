@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -159,9 +160,21 @@ class LangChainLLM:
         model = self._model.bind_tools(tools) if tools else self._model
         history = to_langchain(system, messages)
 
+        # Bedrock's prompt cache. The system prompt and the tool schemas are
+        # identical on every turn of a session -- an agent loop resends its
+        # whole history every time, because the Messages API is stateless --
+        # and without this each of those turns is billed and reprocessed from
+        # nothing. A real session measured 127,000 tokens across six turns
+        # against a real page, almost all of it the ~20-tool schema list
+        # repeated verbatim; caching turns everything after the first hit into
+        # roughly a tenth of the price and skips reprocessing the cached
+        # prefix, which is also most of what a slow turn is spending time on.
+        # `ChatBedrockConverse` inserts the cache breakpoints; this only says
+        # to use them.
+        started = time.monotonic()
         try:
             final: Any = None
-            async for chunk in model.astream(history):
+            async for chunk in model.astream(history, cache_control={"ttl": "5m"}):
                 if on_text_delta is not None:
                     piece = text_of(chunk)
                     if piece:
@@ -169,6 +182,19 @@ class LangChainLLM:
                 final = chunk if final is None else final + chunk
         except Exception as exc:  # noqa: BLE001 - narrowed by _translate
             raise self._translate(exc) from exc
+        finally:
+            # The only place this call's wall time is recorded. Without it, a
+            # slow turn is invisible until somebody reconstructs it from the
+            # gap between two events -- which is how the 95-second stall
+            # above was actually found.
+            log.info(
+                "model turn",
+                extra={
+                    "model": self.model,
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "tool_count": len(tools),
+                },
+            )
 
         if final is None:
             return LLMTurn()

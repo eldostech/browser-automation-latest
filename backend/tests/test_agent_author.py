@@ -195,6 +195,24 @@ async def test_planning_costs_one_call_and_produces_prose_not_steps():
     assert state["messages"][-1]["role"] == "user"
 
 
+async def test_planning_says_something_before_it_calls_the_model():
+    """Not after. This is the one node with nothing on the browser to show for
+    it, and a slow turn here reads as "the browser has not opened" to a person
+    watching a headed window -- when the browser, in fact, already had. One
+    line of visible progress the moment the node starts is the fix; the round
+    trip itself is a provider's to speed up, not this graph's."""
+    state, w = await build_state(
+        LLMTurn(text="Sign in, then read the balance.",
+                usage={"input_tokens": 100, "output_tokens": 20})
+    )
+
+    await plan(state, w)
+
+    kinds = [e.type for e in w.events]
+    assert kinds[0] == "thinking", "said something before the slow part, not after"
+    assert "before touching the browser" in w.events[0].text
+
+
 async def test_deciding_offers_the_browser_tools_the_marks_and_finish():
     state, w = await build_state(turn_calling("browser_snapshot"))
 

@@ -162,11 +162,22 @@ def tool_calls_of(message: Any) -> list[dict[str, Any]]:
 
 
 def usage_of(message: Any) -> dict[str, int]:
-    """Token usage in this codebase's shape, whatever the provider reported."""
+    """Token usage in this codebase's shape, whatever the provider reported.
+
+    ``input_tokens`` already includes any cache read and cache write --
+    ``langchain_aws`` sums them in, because a cached token is still a token
+    Bedrock had to be told about, and the budget cares about that total. The
+    two are broken out as well because they are not priced the same: a cache
+    read costs a tenth of a fresh input token, and pricing that ignores the
+    difference overstates the cost of exactly the thing caching exists to cut.
+    """
     usage = getattr(message, "usage_metadata", None) or {}
+    details = usage.get("input_token_details") or {}
     return {
         "input_tokens": int(usage.get("input_tokens", 0) or 0),
         "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        "cache_read_tokens": int(details.get("cache_read", 0) or 0),
+        "cache_creation_tokens": int(details.get("cache_creation", 0) or 0),
     }
 
 

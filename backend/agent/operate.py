@@ -637,6 +637,11 @@ async def run_row_with_agent(
         # to look at the obstacle and nothing else.
         may_write=True,
         redactor=redactor,
+        # The executor already holds this row's real credential values --
+        # same route the author graph uses, so a recovery that has to sign in
+        # again on a login screen can type `{{secret.slot}}` rather than
+        # guess.
+        secret_values=getattr(executor, "secrets", None),
     )
     async with session:
         wiring = OperateWiring(
