@@ -55,6 +55,15 @@ log = logging.getLogger(__name__)
 ApprovalDecision = Literal["approved", "rejected", "timeout"]
 
 
+class ModeUnavailable(RuntimeError):
+    """A use case asks for a mode this deployment cannot provide.
+
+    Raised rather than degraded. Every other mode difference here is a matter
+    of how much a run may spend; this one is whether the run does the work at
+    all, and quietly doing nothing is not a cheaper version of doing it.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Pub/sub
 # ---------------------------------------------------------------------------
@@ -320,18 +329,34 @@ class ReplayManager:
         """
         if self.llm_factory is None:
             return None
-        if effective_mode(
+        mode = effective_mode(
             usecase.mode, healing_enabled=self.settings.replay_healing_enabled
-        ) != "guided":
+        )
+        if mode not in {"guided", "explore"}:
             return None
-        if not getattr(self.settings, "agent_enabled", False):
-            return None
-        try:
-            from agent.graph import available
-            from agent.operate import run_row_with_agent
-        except ImportError:
-            return None
-        if not available():
+        reachable = getattr(self.settings, "agent_enabled", False)
+        if reachable:
+            try:
+                from agent.graph import available
+                from agent.operate import run_row_with_agent
+            except ImportError:
+                reachable = False
+            else:
+                reachable = available()
+
+        if not reachable:
+            if mode == "explore":
+                # Refused, not downgraded. A use case in Explore has no plan to
+                # follow, so falling back to the engine would replay an empty
+                # step list and report every row as a success -- the worst
+                # possible outcome, because nobody goes looking for it.
+                raise ModeUnavailable(
+                    f"{usecase.name!r} runs in Explore mode, which works each row "
+                    "out with a model, and the agent is not available in this "
+                    "deployment. Enable it (AGENT_ENABLED, plus "
+                    "requirements-agent.txt and Node), or record the workflow and "
+                    "run it in Strict or Guided."
+                )
             return None
 
         llm = self.llm_factory()
@@ -346,6 +371,8 @@ class ReplayManager:
                 run_id=run_id,
                 allowed_domains=allowed,
                 redactor=redactor,
+                explore=mode == "explore",
+                usecase=usecase,
             )
 
         return run
@@ -751,6 +778,9 @@ class ReplayManager:
                         await emit_replay_error(
                             sink, run_id, "row_failed", result.error or "row failed"
                         )
+        except ModeUnavailable as exc:
+            await emit_replay_error(sink, run_id, "mode_unavailable", str(exc))
+            result = RowResult(ok=False, error=str(exc))
         except BrowserError as exc:
             await emit_replay_error(sink, run_id, "browser_unavailable", str(exc))
             result = RowResult(ok=False, error=str(exc))

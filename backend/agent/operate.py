@@ -44,7 +44,7 @@ from typing import Any, Awaitable, Callable, TypedDict
 
 from events import ErrorEvent, Thinking, ToolCall, ToolResult as ToolResultEvent
 from llm import LLMClient
-from prompt_loader import RECOVER, render
+from prompt_loader import EXPLORE, RECOVER, render
 
 from .budget import Budget, BudgetExhausted, Spend
 from .inprocess import EngineBrowser
@@ -72,6 +72,29 @@ RECOVERY_TOOLS: dict[str, dict[str, Any]] = {
     GIVE_UP: {
         "description": (
             "You cannot get the page there. Say what is in the way; the row "
+            "fails with your reason attached."
+        ),
+        "properties": {"reason": {"type": "string"}},
+        "required": ["reason"],
+    },
+}
+
+
+#: Explore's terminal tools, plus the one that reports a value.
+FINISH = "finish"
+RECORD = "record_value"
+
+EXPLORE_TOOLS: dict[str, dict[str, Any]] = {
+    FINISH: {
+        "description": (
+            "This record is done and every value asked for has been recorded."
+        ),
+        "properties": {"note": {"type": "string"}},
+        "required": [],
+    },
+    GIVE_UP: {
+        "description": (
+            "You cannot complete this record. Say what stopped you; the row "
             "fails with your reason attached."
         ),
         "properties": {"reason": {"type": "string"}},
@@ -133,6 +156,18 @@ class OperateWiring:
     max_attempts: int = 2
     #: Tool calls within one rescue.
     max_actions: int = 6
+    #: The use case, for Explore -- its task text and the values it declares.
+    usecase: Any = None
+    #: Tool calls one Explore row may make. Larger than a rescue's, because it
+    #: is doing the work rather than clearing an obstacle, and still bounded.
+    max_explore_actions: int = 24
+    #: Set by the explore node so `record_value` can reach it.
+    on_record: Any = None
+    #: Whether this row is worked out rather than replayed. A property of the
+    #: use case's mode, decided by the caller: this module does not read
+    #: settings, and a graph that decided its own shape from configuration
+    #: would be a graph nobody could test one branch of.
+    explore: bool = False
     #: The last RowResult. On the wiring rather than in the state for the same
     #: reason the tool session is: the state is what gets checkpointed, and a
     #: result object full of StepOutcomes is not something to write to Postgres
@@ -189,30 +224,89 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
         )
     )
 
-    system = render(
-        RECOVER,
-        step=state.get("failed_step_id") or "(unknown)",
-        error=state.get("error") or "(no reason recorded)",
-        allowed_domains=", ".join(w.allowed_domains) or "(nothing configured)",
+    ending = await agent_loop(
+        w,
+        system=render(
+            RECOVER,
+            step=state.get("failed_step_id") or "(unknown)",
+            error=state.get("error") or "(no reason recorded)",
+            allowed_domains=", ".join(w.allowed_domains) or "(nothing configured)",
+        ),
+        opening="Take a snapshot and decide what is in the way.",
+        terminals=RECOVERY_TOOLS,
+        step=state.get("start_at", 0),
     )
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": "Take a snapshot and decide what is in the way.",
-        }
-    ]
 
-    for _ in range(w.max_actions):
+    if ending.tool == RESUME:
+        note = str(ending.arguments.get("note") or "cleared the way")
+        state.setdefault("notes", []).append(note)
+        await w.emit(
+            Thinking(run_id=w.run_id, seq=0, step=state.get("start_at", 0),
+                     text=f"Resuming: {note}", done=True)
+        )
+        return state
+
+    if ending.tool == GIVE_UP:
+        reason = str(ending.arguments.get("reason") or "could not clear the way")
+        state["error"] = f"{state.get('error', '')} The agent could not help: {reason}"
+        state["done"] = True
+        return state
+
+    # Out of actions without saying either way. Resuming anyway would be a
+    # guess about a page nobody looked at the end state of.
+    state.setdefault("notes", []).append(
+        "ran out of recovery steps without reaching the page"
+    )
+    state["done"] = True
+    return state
+
+
+@dataclass
+class Ending:
+    """How an agent turn ended: which terminal tool, and what it said."""
+
+    tool: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    #: Set when the loop ran out of actions without the agent saying either
+    #: way. Not a success and not a refusal -- a third thing, and one that must
+    #: not be mistaken for the page being ready.
+    exhausted: bool = False
+
+
+async def agent_loop(
+    w: OperateWiring,
+    *,
+    system: str,
+    opening: str,
+    terminals: dict[str, dict[str, Any]],
+    step: int = 0,
+    max_actions: int | None = None,
+) -> Ending:
+    """Perceive, decide, act -- until the agent calls one of ``terminals``.
+
+    One implementation for both things that drive a browser here: clearing an
+    obstacle mid-replay, and working a row out from scratch. They differ in
+    their prompt and in which tools end them, and in nothing else -- so a
+    second copy of this would be a second place for the budget check, the
+    redaction and the tool-result plumbing to drift.
+    """
+    messages: list[dict[str, Any]] = [{"role": "user", "content": opening}]
+    schemas = _schemas(w, terminals)
+
+    for _ in range(max_actions if max_actions is not None else w.max_actions):
         try:
             w.spend.check()
         except BudgetExhausted as exc:
-            state["error"] = str(exc)
-            return state
+            return Ending(tool=GIVE_UP, arguments={"reason": str(exc)})
 
-        turn = await w.llm.run_turn(
-            system=system, messages=messages, tools=_schemas(w)
-        )
+        turn = await w.llm.run_turn(system=system, messages=messages, tools=schemas)
         w.spend.turn(turn.usage, w.llm.model)
+        if turn.text.strip():
+            await w.emit(
+                Thinking(
+                    run_id=w.run_id, seq=0, step=step, text=turn.text.strip(), done=True
+                )
+            )
         if turn.raw_content:
             messages.append({"role": "assistant", "content": turn.raw_content})
         elif turn.text:
@@ -220,38 +314,58 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
 
         if not turn.tool_calls:
             messages.append(
-                {"role": "user", "content": "Call a tool, or call resume or give_up."}
+                {
+                    "role": "user",
+                    "content": (
+                        "Call a tool, or call "
+                        + " or ".join(sorted(terminals))
+                        + ". Prose alone does not move the browser."
+                    ),
+                }
             )
             continue
 
         call = turn.tool_calls[0]
-        if call.name == RESUME:
-            note = str(call.input.get("note") or "cleared the way")
-            state.setdefault("notes", []).append(note)
-            await w.emit(
-                Thinking(run_id=w.run_id, seq=0, step=state.get("start_at", 0),
-                         text=f"Resuming: {note}", done=True)
+        if call.name in terminals:
+            return Ending(tool=call.name, arguments=dict(call.input))
+
+        if call.name == RECORD and w.on_record is not None:
+            # Ours, and it never reaches the browser. Answered inline so a
+            # value is banked the moment it is seen rather than at the end,
+            # when the page it came from is several pages back.
+            name = str(call.input.get("name") or "")
+            value = str(call.input.get("value") or "")
+            said = (
+                await w.on_record(name, value)
+                if name
+                else "record_value needs a name."
             )
-            return state
-        if call.name == GIVE_UP:
-            reason = str(call.input.get("reason") or "could not clear the way")
-            state["error"] = f"{state.get('error', '')} The agent could not help: {reason}"
-            state["done"] = True
-            return state
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call.id,
+                            "content": w.tools.redactor.text(said),
+                            "is_error": not name,
+                        }
+                    ],
+                }
+            )
+            continue
 
         await w.emit(
             ToolCall(
-                run_id=w.run_id, seq=0, step=state.get("start_at", 0),
-                call_id=call.id, name=call.name,
+                run_id=w.run_id, seq=0, step=step, call_id=call.id, name=call.name,
                 arguments=w.tools.redactor.structure(dict(call.input)),
             )
         )
         result = await w.tools.call(call.name, dict(call.input))
         await w.emit(
             ToolResultEvent(
-                run_id=w.run_id, seq=0, step=state.get("start_at", 0),
-                call_id=call.id, name=call.name, ok=not result.is_error,
-                duration_ms=0, text=result.text[:2000],
+                run_id=w.run_id, seq=0, step=step, call_id=call.id, name=call.name,
+                ok=not result.is_error, duration_ms=0, text=result.text[:2000],
             )
         )
         messages.append(
@@ -268,11 +382,94 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
             }
         )
 
-    # Out of actions without saying either way. Resuming anyway would be a
-    # guess about a page nobody looked at the end state of.
-    state["notes"].append("ran out of recovery steps without reaching the page")
+    return Ending(exhausted=True)
+
+
+async def explore(state: OperateState, w: OperateWiring) -> OperateState:
+    """Work one row out from the page, with no plan to follow.
+
+    The expensive mode, and the product should say so rather than hide it: this
+    is a model call per decision, per row, and four thousand rows is four
+    thousand times. It exists because some work genuinely cannot be recorded --
+    a page that differs per record, a task whose next step depends on what the
+    last one said -- and refusing to offer it does not make that work go away,
+    it just makes somebody do it by hand.
+
+    Values are reported as they are seen rather than collected at the end. The
+    page a value was on is three pages back by the time a row finishes, and a
+    value the agent meant to report and did not is a row somebody redoes.
+    """
+    usecase = w.usecase
+    wanted = list(getattr(usecase, "outputs", []) or [])
+
+    recorded: dict[str, Any] = dict(state.get("outputs") or {})
+
+    async def record(name: str, value: str) -> str:
+        recorded[name] = value
+        return f"recorded {name}"
+
+    w.on_record = record
+
+    ending = await agent_loop(
+        w,
+        system=render(
+            EXPLORE,
+            task=getattr(usecase, "description", "") or getattr(usecase, "name", ""),
+            inputs=_as_lines(w.inputs) or "(no values given)",
+            outputs=", ".join(wanted) or "(nothing -- just do the task)",
+            allowed_domains=", ".join(w.allowed_domains) or "(nothing configured)",
+        ),
+        opening="Take a snapshot and begin.",
+        terminals=EXPLORE_TOOLS,
+        max_actions=w.max_explore_actions,
+    )
+
+    state["outputs"] = recorded
+    missing = [name for name in wanted if name not in recorded]
+
+    if ending.tool == GIVE_UP:
+        reason = str(ending.arguments.get("reason") or "could not complete the record")
+        state["ok"] = False
+        state["error"] = f"The agent stopped: {reason}"
+    elif ending.exhausted:
+        state["ok"] = False
+        state["error"] = (
+            "The agent ran out of steps for this row without finishing. Raise the "
+            "per-row budget, or record this workflow so it does not have to be "
+            "worked out every time."
+        )
+    elif missing:
+        # Finishing without the values is a failed row, not a successful one:
+        # a results file with blank columns is worse than a row marked failed,
+        # because nobody goes looking for it.
+        state["ok"] = False
+        state["error"] = (
+            "The agent finished without reporting: " + ", ".join(missing) + "."
+        )
+    else:
+        state["ok"] = True
+        state["error"] = ""
+
+    w.result = _as_row_result(state, w)
     state["done"] = True
     return state
+
+
+def _as_lines(values: dict[str, Any]) -> str:
+    return chr(10).join(f"- {key}: {value}" for key, value in (values or {}).items())
+
+
+def _as_row_result(state: OperateState, w: OperateWiring) -> Any:
+    from engine import RowResult
+
+    return RowResult(
+        ok=bool(state.get("ok")),
+        outputs=dict(state.get("outputs") or {}),
+        error=state.get("error") or None,
+        llm_calls=w.spend.llm_calls,
+        llm_tokens=w.spend.tokens,
+        llm_usd=w.spend.usd,
+    )
 
 
 async def learn(state: OperateState, w: OperateWiring) -> OperateState:
@@ -303,7 +500,9 @@ async def learn(state: OperateState, w: OperateWiring) -> OperateState:
     return state
 
 
-def _schemas(w: OperateWiring) -> list[dict[str, Any]]:
+def _schemas(
+    w: OperateWiring, terminals: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
     schemas = [
         {
             "name": spec.name,
@@ -312,7 +511,25 @@ def _schemas(w: OperateWiring) -> list[dict[str, Any]]:
         }
         for spec in w.tools.tools
     ]
-    for name, spec in RECOVERY_TOOLS.items():
+    if w.on_record is not None:
+        schemas.append(
+            {
+                "name": RECORD,
+                "description": (
+                    "Report one of the values this row was asked for. Call it "
+                    "the moment you can see the value, on the page it is on."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The column."},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["name", "value"],
+                },
+            }
+        )
+    for name, spec in terminals.items():
         schemas.append(
             {
                 "name": name,
@@ -351,9 +568,18 @@ def build(w: OperateWiring, checkpointer: Any = None):
 
     graph.add_node("replay", node(replay))
     graph.add_node("recover", node(recover))
+    graph.add_node("explore", node(explore))
     graph.add_node("learn", node(learn))
 
-    graph.add_edge(START, "replay")
+    def entry(_state: OperateState) -> str:
+        # Explore has no plan to replay, so it does not pass through the
+        # engine at all. Everything else starts where it always did.
+        return "explore" if w.explore else "replay"
+
+    graph.add_conditional_edges(
+        START, entry, {"explore": "explore", "replay": "replay"}
+    )
+    graph.add_edge("explore", "learn")
 
     def after_replay(state: OperateState) -> str:
         if state.get("ok"):
@@ -391,6 +617,8 @@ async def run_row_with_agent(
     budget: Budget | None = None,
     redactor: Any = None,
     max_attempts: int = 2,
+    explore: bool = False,
+    usecase: Any = None,
 ) -> Any:
     """One row, replay-first, with an agent on call. Returns the RowResult.
 
@@ -418,6 +646,8 @@ async def run_row_with_agent(
             run_id=run_id,
             allowed_domains=allowed_domains,
             max_attempts=max_attempts,
+            explore=explore,
+            usecase=usecase if usecase is not None else getattr(executor, "usecase", None),
         )
         from . import graph as graph_module
 

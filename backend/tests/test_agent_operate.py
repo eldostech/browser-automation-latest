@@ -379,3 +379,137 @@ def test_healing_switched_off_is_still_a_ceiling(tmp_path):
     manager = a_manager(tmp_path, replay_healing_enabled=False, agent_enabled=True)
 
     assert manager.make_row_runner(None, a_use_case("guided"), "r", None, None) is None
+
+
+# --- explore ---------------------------------------------------------------
+
+
+def an_explore_use_case(outputs=("balance",)):
+    from usecase import UseCase
+
+    return UseCase(
+        name="Read balances",
+        description="Open the account in this row and read its balance.",
+        mode="explore",
+        allowed_domains=["vendor.test"],
+        outputs=list(outputs),
+    )
+
+
+async def explore_row(*turns, outputs=("balance",), inputs=None):
+    executor = FakeExecutor(failures=0)
+    llm = a_model(*turns)
+    result = await run_row_with_agent(
+        executor,
+        inputs or {"account": "A-1001"},
+        llm=llm,
+        emit=_ignore,
+        allowed_domains=("vendor.test",),
+        explore=True,
+        usecase=an_explore_use_case(outputs),
+    )
+    return result, llm, executor
+
+
+async def test_explore_never_touches_the_engine():
+    """There is no plan to replay. A use case in Explore that fell through to
+    the engine would run an empty step list and report success, which is the
+    worst possible outcome because nobody goes looking for it."""
+    result, _llm, executor = await explore_row(
+        turn_calling("record_value", name="balance", value="1,240.55"),
+        turn_calling("finish"),
+    )
+
+    assert result.ok
+    assert executor.calls == [], "the engine was asked to replay something"
+
+
+async def test_a_value_is_banked_when_it_is_seen():
+    """Not collected at the end. The page a value was on is three pages back
+    by the time a row finishes."""
+    result, _llm, _ = await explore_row(
+        turn_calling("browser_snapshot"),
+        turn_calling("record_value", name="balance", value="1,240.55"),
+        turn_calling("finish"),
+    )
+
+    assert result.outputs == {"balance": "1,240.55"}
+
+
+async def test_finishing_without_the_values_is_a_failed_row():
+    """A results file with blank columns is worse than a row marked failed,
+    because nobody goes looking for it."""
+    result, _llm, _ = await explore_row(turn_calling("finish", note="all done"))
+
+    assert not result.ok
+    assert "balance" in result.error
+
+
+async def test_giving_up_says_what_stopped_it():
+    result, _llm, _ = await explore_row(
+        turn_calling(GIVE_UP, reason="the account does not exist")
+    )
+
+    assert not result.ok
+    assert "does not exist" in result.error
+
+
+async def test_a_row_that_runs_out_of_steps_says_what_to_do_about_it():
+    """"It stopped" is not enough: the two fixes are opposite -- raise the
+    budget, or stop working it out every time and record it."""
+    result, _llm, _ = await explore_row(*[turn_calling("browser_snapshot")] * 40)
+
+    assert not result.ok
+    assert "record this workflow" in result.error
+
+
+async def test_the_row_is_told_its_own_values_and_what_to_report():
+    result, llm, _ = await explore_row(
+        turn_calling("record_value", name="balance", value="1"),
+        turn_calling("finish"),
+        inputs={"account": "A-1001"},
+    )
+
+    system = llm.asked[0]["system"]
+    assert "A-1001" in system
+    assert "balance" in system
+    assert "Do not sign in" in system, (
+        "the session is shared across rows, and signing in per row is the "
+        "thing this whole design exists to avoid"
+    )
+
+
+async def test_explore_reports_what_the_row_cost():
+    """Per-row, because that is the number that multiplies by four thousand."""
+    result, _llm, _ = await explore_row(
+        turn_calling("record_value", name="balance", value="1"),
+        turn_calling("finish"),
+    )
+
+    assert result.llm_calls == 2
+    assert result.llm_tokens > 0
+    assert result.llm_usd > 0
+
+
+def test_explore_without_an_agent_is_refused_rather_than_downgraded(tmp_path):
+    """The one mode difference that is not about how much a run may spend.
+
+    Falling back to the engine would replay nothing and mark every row
+    succeeded. Refusing is the only honest answer.
+    """
+    from runner import ModeUnavailable
+
+    manager = a_manager(tmp_path, replay_healing_enabled=True, agent_enabled=False)
+    usecase = a_use_case("explore")
+
+    with pytest.raises(ModeUnavailable) as caught:
+        manager.make_row_runner(None, usecase, "r", None, None)
+
+    assert "Explore mode" in str(caught.value)
+    assert "AGENT_ENABLED" in str(caught.value)
+
+
+def test_explore_gets_the_graph_where_the_agent_is_available(tmp_path):
+    manager = a_manager(tmp_path, replay_healing_enabled=True, agent_enabled=True)
+
+    assert manager.make_row_runner(None, a_use_case("explore"), "r", None, None)

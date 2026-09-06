@@ -9,6 +9,7 @@
 
 import type {
   AgentEvent,
+  BatchEstimate,
   AgentSessionDetail,
   AuditEntry,
   BatchDetail,
@@ -501,6 +502,9 @@ export const api = {
 
   deleteCredential: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/api/credentials/${id}`, { method: 'DELETE' }),
+
+  estimateBatch: (usecaseId: string, rows: number) =>
+    request<BatchEstimate>(`/api/usecases/${usecaseId}/estimate?rows=${rows}`),
 
   getSpend: () => request<WorkspaceSpend>('/api/admin/spend'),
 

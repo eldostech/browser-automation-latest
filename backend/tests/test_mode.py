@@ -47,15 +47,34 @@ def test_choosing_strict_wins_over_a_deployment_that_allows_healing():
     assert effective_mode("strict", healing_enabled=True) == "strict"
 
 
-def test_only_the_two_implemented_modes_are_accepted():
-    """A mode with nothing behind it is worse than no mode.
+def test_only_a_mode_with_something_behind_it_is_accepted():
+    """A mode that takes the choice and does not honour it is worse than none.
 
-    "Explore" belongs to a later phase. Offering it now would take the choice
-    and then not honour it.
+    Explore was refused until there was an operate graph for it to run in.
+    Now there is one, so the schema accepts it and a made-up value still does
+    not.
     """
     assert UseCase(name="x", mode="guided").mode == "guided"
+    assert UseCase(name="x", mode="explore").mode == "explore"
     with pytest.raises(ValueError):
-        UseCase(name="x", mode="explore")
+        UseCase(name="x", mode="autopilot")
+
+
+def test_which_modes_cost_money_on_every_row():
+    """The question a batch estimate is built on.
+
+    Strict cannot spend anything at all. Guided spends only on the rows that
+    break, which is usually none of them. Explore spends on all of them, and
+    four thousand rows is four thousand times.
+    """
+    from usecase import runs_a_model_per_row
+
+    assert not runs_a_model_per_row("strict", healing_enabled=True)
+    assert not runs_a_model_per_row("guided", healing_enabled=True)
+    assert runs_a_model_per_row("explore", healing_enabled=True)
+    assert not runs_a_model_per_row("explore", healing_enabled=False), (
+        "the deployment ceiling still only ever restricts"
+    )
 
 
 # --- what that means for a run --------------------------------------------

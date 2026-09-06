@@ -19,7 +19,15 @@ from batch import results_csv, validate_rows
 from ingest import BatchInputError, Dataset, rows_from_json
 from mapping import apply_mapping
 from store import WorkspaceStore
-from deps import WorkspaceData, batch_or_404, get_replays, get_vault, require
+from config import Settings
+from deps import (
+    WorkspaceData,
+    batch_or_404,
+    get_config,
+    get_replays,
+    get_vault,
+    require,
+)
 from credentials import Vault
 from routers.schemas import BatchRequestBody, ExecuteRequest
 from runner import BatchRequest, ExecutionRequest, ReplayManager
@@ -418,3 +426,35 @@ async def list_usecase_batches(
     _: Annotated[Principal, Depends(require(Permission.BATCH_READ))],
 ) -> dict[str, Any]:
     return {"batches": await data.list_batches(usecase_id=usecase_id)}
+
+
+@router.get("/usecases/{usecase_id}/estimate")
+async def estimate(
+    usecase_id: str,
+    data: WorkspaceData,
+    settings: Annotated[Settings, Depends(get_config)],
+    _: Annotated[Principal, Depends(require(Permission.BATCH_READ))],
+    rows: int = Query(default=1, ge=1, le=1_000_000),
+) -> dict[str, Any]:
+    """What running this many rows would cost, before anybody commits to it.
+
+    A limit is what stops a mistake; an estimate is what prevents one. They are
+    different jobs, and this is the cheaper of the two -- an agent loop over a
+    spreadsheet is the easiest way to spend a lot of money here, and the number
+    that matters is visible before the button rather than after the bill.
+    """
+    from estimates import estimate_batch
+
+    definition = await data.get_usecase(usecase_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="No such use case.")
+    use_case = UseCase.model_validate(definition)
+    spend = await data.spend_this_month()
+
+    return estimate_batch(
+        use_case,
+        rows,
+        model=settings.llm_repair_model,
+        healing_enabled=settings.replay_healing_enabled,
+        remaining_usd=spend.get("remaining_usd"),
+    ).as_dict()

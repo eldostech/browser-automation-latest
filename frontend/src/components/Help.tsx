@@ -127,6 +127,34 @@ export function Help({ onClose }: Props) {
             pull the detail. One pass to find what exists, one to fetch it.
           </p>
 
+          <h3>How much a model is allowed to do</h3>
+          <p>
+            Each use case chooses, under <em>How it runs</em>, and the choice travels
+            with it when it is promoted.
+          </p>
+          <ul>
+            <li>
+              <strong>Strict</strong> follows the recorded steps. No model can run &mdash;
+              the replay engine cannot reach one &mdash; so this costs nothing, ever.
+            </li>
+            <li>
+              <strong>Guided</strong> is the same until a step stops matching. Then one
+              budgeted call re-finds the control and the run carries on. A row where
+              nothing breaks costs nothing, which on a site that has not changed is all
+              of them.
+            </li>
+            <li>
+              <strong>Explore</strong> has no plan at all: it works each row out from the
+              page and the task. That costs on <em>every</em> row, so four thousand rows
+              is four thousand times. It is for work that genuinely cannot be recorded.
+            </li>
+          </ul>
+          <p>
+            Before a batch starts you are shown what it will cost. If a workspace has a
+            monthly limit (under <strong>Targets</strong>), a run stops when it is
+            reached rather than going past it.
+          </p>
+
           <h3>Running the same workflow in dev, UAT and production</h3>
           <p>
             A use case names a <strong>target</strong>; each deployment says what address

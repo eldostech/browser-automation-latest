@@ -5,6 +5,7 @@ import type {
   BatchSummary,
   CredentialSummary,
   DatasetSummary,
+  BatchEstimate,
   Target,
   UseCase,
   UseCaseMode,
@@ -64,6 +65,13 @@ const MODE_CHOICES: {
     price: 'free on a good row',
   },
   {
+    value: 'explore',
+    label: 'Explore',
+    description:
+      'No plan at all: it works each row out from the page and the task text. For work that genuinely cannot be recorded — a page that differs per record, a next step that depends on what the last one said.',
+    price: 'costs on every row',
+  },
+  {
     value: null,
     label: 'Follow the deployment',
     description:
@@ -110,6 +118,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // has to grey out Guided where the installation has turned it off -- a
   // choice the screen offers but the run would not honour is a lie.
   const [healingAllowed, setHealingAllowed] = useState<boolean | null>(null);
+  // What a batch of the size on screen would cost. Fetched when a file is
+  // mapped rather than up front, because the row count is most of the answer.
+  const [estimate, setEstimate] = useState<BatchEstimate | null>(null);
   // Which sites this deployment knows about, so the target can be chosen from
   // a list rather than typed from memory.
   const [targets, setTargets] = useState<Target[]>([]);
@@ -805,7 +816,13 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             <div className="modes">
               {MODE_CHOICES.map((choice) => {
                 const chosen = (useCase.mode ?? null) === choice.value;
-                const unavailable = choice.value === 'guided' && healingAllowed === false;
+                // Both modes that can reach a model are unavailable where the
+                // deployment has switched healing off: the ceiling only ever
+                // restricts, and offering a choice a run would not honour is
+                // worse than not offering it.
+                const unavailable =
+                  (choice.value === 'guided' || choice.value === 'explore') &&
+                  healingAllowed === false;
                 return (
                   <label
                     key={String(choice.value)}
@@ -830,7 +847,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
                         </span>
                       )}
                     </span>
-                    <span className="mode-price">{choice.price}</span>
+                    <span
+                      className={`mode-price${choice.value === 'explore' ? ' paid' : ''}`}
+                    >
+                      {choice.price}
+                    </span>
                   </label>
                 );
               })}
@@ -848,7 +869,12 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               </p>
             ) : (
               <p className="hint">
-                Chosen on this use case, so it stays {useCase.mode === 'strict' ? 'Strict' : 'Guided'}{' '}
+                Chosen on this use case, so it stays{' '}
+                {useCase.mode === 'strict'
+                  ? 'Strict'
+                  : useCase.mode === 'guided'
+                    ? 'Guided'
+                    : 'Explore'}{' '}
                 wherever it is promoted.
               </p>
             )}
@@ -1017,9 +1043,18 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             shared session so the workflow signs in once.
           </p>
 
+          {estimate && <CostBeforeCommitting estimate={estimate} />}
+
           <DatasetMapper
             useCase={useCase}
             usecaseId={usecaseId}
+            onRowCount={(rows) => {
+              // A limit is what stops a mistake; this is what prevents one.
+              void api
+                .estimateBatch(usecaseId, Math.max(1, rows))
+                .then(setEstimate)
+                .catch(() => setEstimate(null));
+            }}
             busy={busy}
             disabled={missingSlots.length > 0}
             disabledReason={
@@ -1032,6 +1067,34 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
 
           {batch && <BatchProgressPanel batch={batch} onOpenRun={onOpenRun} onResume={resume} />}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** What this batch is expected to cost, said before the button rather than
+ *  after the bill. A range, because how many turns a row takes depends on the
+ *  site and a single figure would imply an accuracy this cannot have. */
+function CostBeforeCommitting({ estimate }: { estimate: BatchEstimate }) {
+  const free = estimate.high_usd === 0;
+  return (
+    <div className={estimate.over_budget ? 'banner error' : free ? 'verified' : 'banner'}>
+      <strong>
+        {free
+          ? 'This batch costs nothing.'
+          : estimate.low_usd === estimate.high_usd
+            ? `About $${estimate.high_usd.toFixed(2)}.`
+            : `Between $${estimate.low_usd.toFixed(2)} and $${estimate.high_usd.toFixed(2)}.`}
+      </strong>{' '}
+      {estimate.note}
+      {estimate.over_budget && (
+        <>
+          {' '}
+          <strong>
+            That is more than this workspace has left this month, so it would stop part
+            way through.
+          </strong>
+        </>
       )}
     </div>
   );

@@ -71,10 +71,11 @@ Status = Literal["draft", "ready", "archived"]
 #: stops matching, at which point one budgeted call re-finds the control and
 #: the plan resumes; a row where nothing breaks costs nothing.
 #:
-#: There is deliberately no third value yet. A mode that works every row out
-#: from the page has no implementation behind it, and offering one that does
-#: nothing is worse than not offering it.
-Mode = Literal["strict", "guided"]
+#: ``explore`` works each row out from the page and the task, with no plan to
+#: follow. It costs a model call per decision, per row -- four thousand rows is
+#: four thousand times -- so it is the mode this product argues against, offers
+#: honestly, and always shows a price for.
+Mode = Literal["strict", "guided", "explore"]
 
 #: Who produced this document. Recorded so a reviewer knows what they are
 #: looking at, and so the two authoring paths can be told apart in a list.
@@ -171,6 +172,16 @@ def effective_mode(mode: "Mode | None", *, healing_enabled: bool) -> "Mode":
     if not healing_enabled:
         return "strict"
     return mode if mode is not None else "guided"
+
+
+def runs_a_model_per_row(mode: "Mode | None", *, healing_enabled: bool) -> bool:
+    """Whether every row of a batch in this mode will cost money.
+
+    Asked before a batch starts, so an estimate can be shown. Strict cannot
+    spend anything; Guided spends only on the rows that break, which is
+    usually none; Explore spends on all of them.
+    """
+    return effective_mode(mode, healing_enabled=healing_enabled) == "explore"
 
 
 class MissingValue(KeyError):
@@ -879,6 +890,11 @@ class UseCase(BaseModel):
         """
         if self.status != "ready":
             return self
+        if self.mode == "explore":
+            # Same exception, same reason: there are no steps to read an input,
+            # and the row's values are handed to the agent as the record it is
+            # working on rather than substituted into anything.
+            return self
         referenced = {
             name for step in self.all_steps for kind, name in step.references() if kind == "input"
         }
@@ -894,6 +910,20 @@ class UseCase(BaseModel):
 
     @model_validator(mode="after")
     def _declared_outputs_match_extract_steps(self) -> "UseCase":
+        """Every declared output has to come from somewhere.
+
+        For a recorded use case that somewhere is a step, and a declared output
+        no step produces is a column that would be blank on every row.
+
+        ``explore`` is the exception, and it is a real one rather than a hole:
+        that mode has no steps at all -- the agent works each row out and
+        reports values as it sees them -- so the declared outputs are the
+        *instruction*, not a summary of the steps. They are what the agent is
+        told to look for, and a row that finishes without them is failed by the
+        operate graph rather than returned with blanks.
+        """
+        if self.mode == "explore":
+            return self
         produced = {
             s.output
             for s in self.all_steps

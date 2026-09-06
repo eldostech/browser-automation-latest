@@ -27,6 +27,9 @@ type Props = {
   usecaseId: string;
   /** Called with the confirmed mapping when the user is ready to run. */
   onReady: (dataset: DatasetSummary, mapping: Record<string, string>) => void;
+  /** How many rows are about to run, the moment that is known. The screen
+   *  above uses it to price the batch before anybody presses the button. */
+  onRowCount?: (rows: number) => void;
   busy?: boolean;
   disabled?: boolean;
   disabledReason?: string;
@@ -43,6 +46,7 @@ export function DatasetMapper({
   useCase,
   usecaseId,
   onReady,
+  onRowCount,
   busy = false,
   disabled = false,
   disabledReason,
@@ -75,6 +79,7 @@ export function DatasetMapper({
         const full = await api.getDataset(summary.id);
         const result = await api.suggestMapping(usecaseId, summary.id);
         setDataset(full);
+        onRowCount?.(full.row_count ?? 0);
         setSuggestions(result.suggestions);
         setChosen(
           Object.fromEntries(

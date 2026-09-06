@@ -37,5 +37,8 @@ markers = [
   # drive Playwright directly, which is the whole point of them.
   "e2e: records and replays against a real Chromium (set RUN_E2E=1)",
   "mcp: drives a real `npx @playwright/mcp` server (set RUN_MCP=1)",
+  # Off by default because it spends money. No test should be able to bill
+  # somebody by being run.
+  "llm: calls a real Bedrock model (set RUN_LLM=1 -- this costs a few cents)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]

@@ -313,7 +313,7 @@ export interface SecretSpec {
  * the same as "strict": a use case published before the choice existed was
  * being healed if the deployment allowed it, and must keep being.
  */
-export type UseCaseMode = 'strict' | 'guided';
+export type UseCaseMode = 'strict' | 'guided' | 'explore';
 
 export interface UseCase {
   schema_version: number;
@@ -655,4 +655,15 @@ export interface WorkspaceSpend {
   since: string;
   limit_usd: number | null;
   remaining_usd: number | null;
+}
+
+/** What a batch is expected to cost, as a range. Ranges rather than numbers
+ *  because precision here would imply an accuracy the estimate cannot have. */
+export interface BatchEstimate {
+  mode: UseCaseMode;
+  rows: number;
+  low_usd: number;
+  high_usd: number;
+  note: string;
+  over_budget: boolean;
 }
