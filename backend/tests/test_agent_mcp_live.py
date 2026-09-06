@@ -148,3 +148,56 @@ async def test_describe_element_reads_a_real_snapshot(tools):
         "'Invite' is a substring of '+ Invite User', so the recorded locator "
         "has to require the whole accessible name"
     )
+
+
+#: A two-page site as data URLs: type an account, open it, read the balance.
+#: Small enough to be a fixture, real enough that the engine has to resolve
+#: locators against a browser rather than against a snapshot we wrote.
+FORM_PAGE = (
+    "data:text/html,<h1>Accounts</h1>"
+    "<label>Account <input id=a></label>"
+    "<button onclick=\"document.getElementById('out').textContent='1,240.55'\">Open</button>"
+    "<p>Balance <span id=out></span></p>"
+)
+
+
+async def test_a_distilled_draft_replays_against_a_real_browser(tools):
+    """The claim the whole phase rests on, with nothing stubbed on either side.
+
+    An agent's tool calls become a use case, and that use case is then run by
+    `engine.py` -- the code that cannot import a model -- against a real
+    Chromium. If the locators the session captured do not resolve, this fails.
+    """
+    from agent import distil, verify
+
+    await tools.call("browser_navigate", {"url": FORM_PAGE})
+    await tools.call("browser_snapshot", {})
+    named = {node.name: node.ref for node in tools.snapshot if node.name}
+
+    await tools.call("mark_setup_complete", {})
+    await tools.call("begin_row", {"key": "A-1001"})
+    await tools.call(
+        "browser_type",
+        {"target": named["Account"], "text": "A-1001", "element": "the account field"},
+    )
+    await tools.call("mark_as_input", {"ref": named["Account"], "name": "account"})
+    await tools.call(
+        "browser_click", {"target": named["Open"], "element": "the open button"}
+    )
+    await tools.call("browser_snapshot", {})
+    await tools.call("end_row", {})
+
+    draft = distil(
+        tools.calls,
+        tools.marks,
+        name="Read a balance",
+        start_url=FORM_PAGE,
+        allowed_domains=("data",),
+    )
+
+    assert [s.action for s in draft.use_case.row_steps] == ["fill", "click"]
+    assert draft.sample_inputs == {"account": "A-1001"}
+
+    report = await verify(draft.use_case, draft.sample_inputs, {})
+    assert report.ran, report.skipped
+    assert report.ok, f"{report.failed_step}: {report.error}"

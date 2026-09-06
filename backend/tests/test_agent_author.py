@@ -104,9 +104,15 @@ class ScriptedLLM:
         return {"model": self.model}
 
 
-def turn_calling(name: str, **arguments) -> LLMTurn:
+def turn_calling(tool: str, **arguments) -> LLMTurn:
+    """A turn that calls one tool.
+
+    The parameter is `tool` and not `name` because `mark_as_input` takes a
+    `name` of its own, and a helper that cannot express the call it is meant to
+    make is a helper that quietly narrows the tests.
+    """
     return LLMTurn(
-        tool_calls=[ToolCallRequest(id=f"c{name}", name=name, input=arguments)],
+        tool_calls=[ToolCallRequest(id=f"c{tool}", name=tool, input=arguments)],
         usage={"input_tokens": 100, "output_tokens": 20},
     )
 

@@ -167,7 +167,7 @@ stateDiagram-v2
 | `act` | | Dispatch the tool. Deterministic. |
 | `record` | | Append to trajectory, emit the same event types a replay emits. |
 | `distil` | | Trajectory → draft `UseCase`. Mechanical (§6). |
-| `verify` | | **Run the draft through `engine.py`, in the same browser session, against the same row.** Deterministic. |
+| `verify` | | **Run the draft through `engine.py`, from a cold browser, against the same row.** Deterministic. |
 | `repair` | ⬤ | Only if verification failed. Sees the failing step and a numbered candidate list. |
 | `annotate` | | Attach the verification report, cost, and trajectory to the draft. |
 
@@ -176,6 +176,16 @@ stateDiagram-v2
 engine — the same code that will run the 4,000 rows — and a draft that does not
 replay is a draft that says so, on the review screen, before anyone publishes
 it.
+
+> **Corrected while building phase E.** This said "in the same browser session".
+> That is not possible: the agent's browser lives behind Playwright MCP in a
+> Node subprocess and the engine drives a Playwright `Page` directly, so there
+> is no session to share. It is also not what you want. Verifying from a **cold
+> browser** is the stronger check, because a use case that only replays inside
+> the session that recorded it is not a use case — the batch will open a fresh
+> browser, sign in, and work a row, which is exactly what `verify` now does.
+> The half that was right, *against the same row*, is kept: the record the
+> agent worked through is the only one whose answer is known.
 
 ### 3.2 The operate graph — "run with AI"
 

@@ -57,6 +57,21 @@ class ToolCallRecord:
     duration_ms: int = 0
     #: Which ``Step.action`` this would distil into, or "" for perception.
     action: str = ""
+    #: The durable locator ladder for whatever this call acted on, resolved
+    #: **before** it ran. That timing is the whole point: a ref is an index
+    #: into the snapshot it came from, and by the time the call returns the
+    #: page has moved on and the ref means something else or nothing. Captured
+    #: for every acting call rather than only for marked ones, because
+    #: distillation needs a locator for each step and not just the interesting
+    #: ones.
+    locators: list[dict[str, Any]] = field(default_factory=list)
+    #: How a person would read that locator, for the review screen.
+    element: str = ""
+    #: Where the browser was when this call finished. Read off the server's own
+    #: reply, which carries it. Needed because `browser_navigate_back` records
+    #: no destination -- the page it landed on is the only thing that says
+    #: where a replay should go.
+    page_url: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -69,6 +84,9 @@ class ToolCallRecord:
             "category": self.category,
             "duration_ms": self.duration_ms,
             "action": self.action,
+            "locators": self.locators,
+            "element": self.element,
+            "page_url": self.page_url,
             "detail": self.detail,
         }
 
@@ -202,6 +220,11 @@ class AgentToolSession:
                 "The tool session is not open. Use it as an async context manager."
             )
 
+        # Resolved here, before dispatch, and not afterwards. After the call
+        # the page has re-rendered and this ref names something else or
+        # nothing at all.
+        described = self._describe(str(arguments.get("target") or ""))
+
         try:
             result = await self._session.call(name, arguments)
         except Exception as exc:  # noqa: BLE001 - a dead server is a tool error
@@ -218,7 +241,9 @@ class AgentToolSession:
             # against have to be the same page.
             self._snapshot = parse_snapshot(result.text)
 
-        return await self._finish(name, arguments, result, verdict, started)
+        return await self._finish(
+            name, arguments, result, verdict, started, described=described
+        )
 
     # -- our own tools ------------------------------------------------------
     def _mark(self, name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -263,6 +288,7 @@ class AgentToolSession:
         started: float,
         *,
         refused: bool = False,
+        described: "Described | None" = None,
     ) -> ToolResult:
         record = ToolCallRecord(
             seq=self._seq,
@@ -278,6 +304,12 @@ class AgentToolSession:
             category=getattr(verdict, "category", "") or "",
             duration_ms=int((time.monotonic() - started) * 1000),
             action="" if name in PERCEPTION else DISTILS_TO.get(name, ""),
+            locators=[
+                loc.model_dump(mode="json", exclude_none=True)
+                for loc in (described.ladder if described else [])
+            ],
+            element=described.describe_first() if described and described.ladder else "",
+            page_url=self._snapshot.page_url if self._snapshot else "",
         )
         self.calls.append(record)
         if self.recorder is not None:

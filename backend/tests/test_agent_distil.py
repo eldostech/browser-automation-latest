@@ -1,0 +1,348 @@
+"""The bridge: a session becomes a document, and the document is proved.
+
+Everything before this phase is a browser-using chatbot with an audit log.
+These tests cover the two halves that change that.
+
+**Distillation is bookkeeping**, and that is the achievement. The hard version
+-- read four hundred near-identical sub-trajectories and work out where a
+record's work begins -- is a question the agent was asked while it still had
+the page in front of it, so this cuts on declared boundaries instead of
+guessing at repeated shapes.
+
+**Verification is what makes it trustworthy.** The draft is replayed by the
+engine, from a cold start, before anybody sees it.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agent import distil, verify
+from agent.author import FINISH
+from agent.verify import Verification
+from test_agent_author import ScriptedLLM, turn_calling
+from test_agent_graph import PLAN, a_session, request
+from test_agent_marks import INVITE
+from test_agent_tools import FakeMCP
+
+pytestmark = pytest.mark.anyio
+
+
+#: A page with a field to type into and a value to read, which is the smallest
+#: thing that exercises an input and an output at once.
+ACCOUNT = """### Page
+- Page URL: https://vendor.test/accounts
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - textbox "Account" [ref=e2]
+  - button "Open" [ref=e3]
+  - text "Balance" [ref=e4]
+```
+"""
+
+
+def a_recording():
+    """Sign in, then one record: type an account, open it, read the balance."""
+    return [
+        PLAN,
+        turn_calling("browser_navigate", url="https://vendor.test/login"),
+        turn_calling("browser_snapshot"),
+        turn_calling("browser_type", target="e2", text="secret-sign-in-value"),
+        turn_calling("mark_as_secret", ref="e2", slot="vendor_login"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("browser_type", target="e2", text="A-1001"),
+        turn_calling("mark_as_input", ref="e2", name="account"),
+        turn_calling("browser_click", target="e3"),
+        turn_calling("mark_as_output", ref="e4", column="balance"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="Read the balance for A-1001."),
+    ]
+
+
+async def a_run(*, replay=None, turns=None):
+    from agent import run_agent_session
+
+    provider = FakeMCP({name: ACCOUNT for name in
+                        ("browser_snapshot", "browser_navigate", "browser_type", "browser_click")})
+    llm = ScriptedLLM(list(turns or a_recording()))
+    return await run_agent_session(
+        request(),
+        llm=llm,
+        provider=provider,
+        emit=_ignore,
+        replay=replay or _replays_cleanly,
+        name="Pull balances",
+    )
+
+
+async def _ignore(event):
+    return None
+
+
+async def _replays_cleanly(use_case, inputs, secrets):
+    return Verification(ran=True, ok=True, outputs={"balance": "1,240.55"}, duration_ms=6200)
+
+
+# --- what a session becomes ------------------------------------------------
+
+
+async def test_a_session_becomes_a_draft_use_case():
+    result = await a_run()
+
+    assert result.use_case is not None
+    assert result.use_case["status"] == "draft", "a person reviews it, always"
+    assert result.use_case["authored_by"] == "agent"
+    assert result.use_case["name"] == "Pull balances"
+
+
+async def test_setup_and_row_are_split_where_the_agent_said_they_were():
+    """The boundary is declared, not inferred. Get it wrong and a batch signs
+    in four thousand times."""
+    result = await a_run()
+
+    setup = [s["action"] for s in result.use_case["setup_steps"]]
+    row = [s["action"] for s in result.use_case["row_steps"]]
+
+    assert setup == ["navigate", "fill"], "the sign-in runs once per batch"
+    assert row == ["fill", "click", "extract"], "the work runs once per row"
+
+
+async def test_a_marked_value_becomes_a_template_and_a_declared_input():
+    result = await a_run()
+
+    fill = result.use_case["row_steps"][0]
+    assert fill["value"] == "{{input.account}}"
+    assert [i["name"] for i in result.use_case["inputs"]] == ["account"]
+
+
+async def test_a_marked_credential_never_carries_its_value():
+    """The slot travels; the secret does not. Same rule the replay path has."""
+    result = await a_run()
+
+    sign_in = result.use_case["setup_steps"][1]
+    assert sign_in["value"] == "{{secret.vendor_login}}"
+    assert "secret-sign-in-value" not in str(result.use_case)
+    assert [s["name"] for s in result.use_case["secrets"]] == ["vendor_login"]
+
+
+async def test_a_read_lands_where_it_was_pointed_at():
+    """Position is correctness. Appending every reading to the end would read
+    the first page's field after the browser had moved to the third -- the
+    same mistake the codegen path had to fix, reached from the other side."""
+    result = await a_run()
+
+    assert [s["action"] for s in result.use_case["row_steps"]] == [
+        "fill", "click", "extract",
+    ]
+    assert result.use_case["outputs"] == ["balance"]
+
+
+async def test_the_steps_carry_durable_locators_not_refs():
+    """A ref is an index into one snapshot. This is the whole reason the
+    session resolves one before every call rather than after."""
+    result = await a_run()
+
+    click = result.use_case["row_steps"][1]
+    assert click["locators"], "a click with no locator cannot replay"
+    assert click["locators"][0]["role"] == "button"
+    assert click["locators"][0]["name"] == "Open"
+    assert "e3" not in str(click["locators"])
+
+
+async def test_snapshots_and_marks_do_not_become_steps():
+    """They are how it *found* the way, not the way. Replaying an exploration
+    four thousand times is four thousand wasted page loads."""
+    result = await a_run()
+
+    actions = [s["action"] for s in result.use_case["setup_steps"] + result.use_case["row_steps"]]
+    assert "snapshot" not in actions
+    assert len(result.trajectory) > len(actions), "the trajectory keeps more than the steps"
+
+
+# --- refusing to guess -----------------------------------------------------
+
+
+async def test_one_record_is_recorded_and_said_to_be_one_record():
+    """"These steps worked once" is not "these steps are the same every time",
+    and a reviewer should be told which they have."""
+    result = await a_run()
+
+    assert any("Only one record" in w for w in result.draft_warnings)
+
+
+async def test_a_second_record_taking_a_different_route_is_a_warning():
+    """The gift of asking for two. A mismatch is a warning on the review
+    screen, which beats a silent guess at which shape was meant."""
+    turns = a_recording()[:-1] + [
+        turn_calling("begin_row", key="A-1002"),
+        turn_calling("browser_type", target="e2", text="A-1002"),
+        # No click this time: a different route.
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="Two records."),
+    ]
+    result = await a_run(turns=turns)
+
+    assert any("did not take the same route" in w for w in result.draft_warnings)
+
+
+async def test_a_value_marked_on_an_element_nothing_typed_into_is_reported():
+    """Rather than a use case with a declared input no step reads -- which the
+    publish validator would reject later, with less to say about why."""
+    turns = [
+        PLAN,
+        turn_calling("browser_snapshot"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("mark_as_input", ref="e2", name="account"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="Nothing typed."),
+    ]
+    result = await a_run(turns=turns)
+
+    assert any("nothing recorded typing" in w for w in result.draft_warnings)
+    assert result.use_case["inputs"] == [], "an input nothing reads is not declared"
+
+
+async def test_a_session_with_no_row_is_still_distilled_with_the_reason():
+    """Throwing it away loses the expensive part. A person can read the steps
+    and fix the boundary by hand."""
+    turns = [
+        PLAN,
+        turn_calling("browser_snapshot"),
+        turn_calling(FINISH, summary="Never marked a row."),
+    ]
+    result = await a_run(turns=turns)
+
+    assert result.use_case is not None
+    assert any("No row was recorded" in w for w in result.draft_warnings)
+
+
+# --- verification ----------------------------------------------------------
+
+
+async def test_a_draft_that_replays_says_so_with_what_it_read():
+    result = await a_run()
+
+    assert result.verification["ran"] is True
+    assert result.verification["ok"] is True
+    assert result.verification["outputs"] == {"balance": "1,240.55"}
+
+
+async def test_a_draft_that_does_not_replay_says_so_first():
+    """This is the line a reviewer reads before anything else, so it goes at
+    the top of the warnings rather than somewhere in the report."""
+    async def broken(use_case, inputs, secrets):
+        return Verification(
+            ran=True, ok=False, failed_step="a9",
+            error="no element matched. Tried: role=button name=\"Open\".",
+        )
+
+    result = await a_run(replay=broken)
+
+    assert result.verification["ok"] is False
+    assert "Did not replay" in result.draft_warnings[0]
+    assert result.use_case is not None, "the recording is kept either way"
+
+
+async def test_verification_is_given_the_values_that_were_actually_typed():
+    """The record the agent worked through is the only row whose answer is
+    known, so it is the one the draft is checked against."""
+    seen = {}
+
+    async def capture(use_case, inputs, secrets):
+        seen.update(inputs)
+        return Verification(ran=True, ok=True)
+
+    await a_run(replay=capture)
+
+    assert seen == {"account": "A-1001"}
+
+
+async def test_a_draft_missing_a_value_is_not_verified_and_says_why():
+    """Reporting "not verified, and here is the reason" beats reporting a
+    failure that is really a gap in what was captured."""
+    from usecase import InputSpec, Locator, Step, UseCase
+
+    use_case = UseCase(
+        name="x",
+        inputs=[InputSpec(name="account")],
+        row_steps=[
+            Step(id="s1", action="fill", value="{{input.account}}",
+                 locators=[Locator(strategy="role", role="textbox", name="Account")]),
+        ],
+    )
+
+    report = await verify(use_case, {}, {})
+
+    assert not report.ran
+    assert "no value was captured" in report.skipped
+    assert "Not verified" in report.as_text()
+
+
+async def test_a_verification_that_cannot_run_is_a_result_not_a_crash():
+    """A browser that will not start must not look like a use case that does
+    not work."""
+    async def explodes(use_case, inputs, secrets):
+        raise RuntimeError("no browser on this machine")
+
+    report = await verify(
+        _one_step_use_case(), {"account": "A-1"}, {}, replay=explodes
+    )
+
+    assert not report.ran
+    assert "no browser" in report.skipped
+
+
+def _one_step_use_case():
+    from usecase import InputSpec, Locator, Step, UseCase
+
+    return UseCase(
+        name="x",
+        inputs=[InputSpec(name="account")],
+        row_steps=[
+            Step(id="s1", action="fill", value="{{input.account}}",
+                 locators=[Locator(strategy="role", role="textbox", name="Account")]),
+        ],
+    )
+
+
+async def test_a_credential_is_never_kept_as_a_sample():
+    """The slot goes into the document; the value goes into the vault.
+
+    Keeping it beside the draft "so verification can run" would be a plaintext
+    password in a table nobody thinks of as a secret store.
+    """
+    seen = {}
+
+    async def capture(use_case, inputs, secrets):
+        seen.update(inputs)
+        return Verification(ran=True, ok=True)
+
+    result = await a_run(replay=capture)
+
+    assert "vendor_login" not in seen
+    assert "secret-sign-in-value" not in str(seen)
+    assert "secret-sign-in-value" not in str(result.use_case)
+
+
+async def test_going_back_records_where_it_went():
+    """`browser_navigate_back` says nothing about its destination, and the page
+    it landed on is the only thing that does. Without this, "back to the list"
+    is a step a replay cannot perform."""
+    turns = [
+        PLAN,
+        turn_calling("browser_snapshot"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("browser_click", target="e3"),
+        turn_calling("browser_navigate_back"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="Opened and went back."),
+    ]
+    result = await a_run(turns=turns)
+
+    back = result.use_case["row_steps"][-1]
+    assert back["action"] == "navigate"
+    assert back["url"] == "https://vendor.test/users", "where it landed"

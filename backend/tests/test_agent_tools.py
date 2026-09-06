@@ -63,6 +63,11 @@ await page.getByRole('button', { name: '+ Invite User' }).click();
 
 TOOLS = [
     ToolSpec("browser_navigate", "", {"required": ["url"]}),
+    # Advertised by the real server, so the fake advertises it too. A fake
+    # narrower than the thing it stands in for silently narrows every test
+    # written against it: this one was missing, so `browser_navigate_back` was
+    # refused as an unknown tool and never reached distillation.
+    ToolSpec("browser_navigate_back", "", {}),
     ToolSpec("browser_snapshot", "", {}),
     ToolSpec("browser_click", "", {"required": ["target"]}),
     ToolSpec("browser_type", "", {"required": ["target", "text"]}),

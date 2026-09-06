@@ -26,8 +26,10 @@ from redaction import Redactor
 
 from .author import AuthorRequest, AuthorState, Wiring, initial_state
 from .budget import Spend
+from .distil import Draft, distil
 from .provider import BrowserProvider
 from .session import AgentToolSession, Recorder
+from .verify import Replayer, Verification, verify
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +55,14 @@ class AuthorResult:
     #: Set when the session cannot be distilled and why. Reported rather than
     #: discovered on the review screen with nothing to do about it.
     unfinished: str = ""
+    #: The draft use case, as a document. None when the session produced
+    #: nothing worth drafting.
+    use_case: dict[str, Any] | None = None
+    #: What the reviewer needs in order to judge it.
+    draft_warnings: list[str] = field(default_factory=list)
+    #: Whether the draft replays. The whole point: the agent does not get to
+    #: claim it recorded something.
+    verification: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +76,9 @@ class AuthorResult:
             "trajectory": self.trajectory,
             "marks": self.marks,
             "unfinished": self.unfinished,
+            "use_case": self.use_case,
+            "draft_warnings": self.draft_warnings,
+            "verification": self.verification,
         }
 
 
@@ -79,6 +92,8 @@ async def run_agent_session(
     secrets: dict[str, str] | None = None,
     checkpointer: Any = None,
     thread_id: str = "",
+    replay: Replayer | None = None,
+    name: str = "",
 ) -> AuthorResult:
     """Run one authoring session to completion, or to its budget.
 
@@ -110,6 +125,62 @@ async def run_agent_session(
             wiring, checkpointer, thread_id or request.run_id
         )
 
+    if awaiting:
+        # Nothing to distil yet: the session is paused mid-recording, not over.
+        return _result(request, state, session, wiring, awaiting=awaiting)
+
+    return await _draft_and_verify(
+        request, state, session, wiring, name=name, replay=replay, secrets=secrets or {}
+    )
+
+
+async def _draft_and_verify(
+    request: AuthorRequest,
+    state: AuthorState,
+    session: AgentToolSession,
+    wiring: Wiring,
+    *,
+    name: str,
+    replay: Replayer | None,
+    secrets: dict[str, str],
+) -> AuthorResult:
+    """Turn the session into a draft, then prove the draft replays.
+
+    Verification happens after the agent's browser is closed and opens its own,
+    which is the point rather than an accident -- see verify.py. A use case that
+    only works inside the session that recorded it is not a use case.
+    """
+    result = _result(request, state, session, wiring)
+    draft: Draft = distil(
+        session.calls,
+        session.marks,
+        name=name or (request.task[:80] or "Recorded by the agent"),
+        task=request.task,
+        start_url=request.start_url,
+        allowed_domains=request.allowed_domains,
+    )
+    result.use_case = draft.use_case.model_dump(mode="json", by_alias=True)
+    result.draft_warnings = list(draft.warnings)
+
+    report: Verification = await verify(
+        draft.use_case, draft.sample_inputs, secrets, replay=replay
+    )
+    result.verification = report.as_dict()
+    if report.ran and not report.ok:
+        # Said on the draft as well as in the report, because this is the line
+        # a reviewer reads first and it must not be somewhere else.
+        result.draft_warnings.insert(0, report.as_text())
+    return result
+
+
+def _result(
+    request: AuthorRequest,
+    state: AuthorState,
+    session: AgentToolSession,
+    wiring: Wiring,
+    *,
+    awaiting: dict[str, Any] | None = None,
+) -> AuthorResult:
     return AuthorResult(
         run_id=request.run_id,
         status="awaiting_approval" if awaiting else state.get("status", "failed"),

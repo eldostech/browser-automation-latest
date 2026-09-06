@@ -109,6 +109,21 @@ WRITES: frozenset[str] = frozenset(DISTILS_TO) - {"browser_wait_for"}
 #: Arguments naming an element. All of them must hold a ref.
 TARGET_KEYS: tuple[str, ...] = ("target", "startTarget", "endTarget")
 
+#: The categories that stop and ask a person. Deliberately narrower than
+#: "sensitive".
+#:
+#: `policy.classify` also flags credentials, file uploads and dialogs. Those
+#: are worth *recording* -- they are redacted and audited either way -- but
+#: they are not irreversible, and an approval prompt on every password typed
+#: into a sign-in form trains people to click Allow without reading. That is
+#: how an approval gate stops working, and a gate nobody reads is worse than
+#: no gate because it looks like protection.
+#:
+#: So: what cannot be undone. Submitting, paying, deleting.
+IRREVERSIBLE: frozenset[str] = frozenset(
+    {"form_submit", "payment", "destructive"}
+)
+
 
 # ---------------------------------------------------------------------------
 # Refusals
@@ -195,10 +210,11 @@ def guard(name: str, arguments: dict[str, Any], ctx: GuardContext) -> Guarded:
     # credentials rather than asking the model what it thinks of its own next
     # action, which is the only version of this check worth having.
     decision = classify(name, arguments)
+    categories = decision.category_values
     return Guarded(
         True,
-        needs_approval=decision.sensitive,
-        category=", ".join(decision.category_values),
+        needs_approval=any(c in IRREVERSIBLE for c in categories),
+        category=", ".join(categories),
     )
 
 
@@ -236,6 +252,7 @@ __all__ = [
     "Guarded",
     "PERCEPTION",
     "REFUSED",
+    "IRREVERSIBLE",
     "TARGET_KEYS",
     "WRITES",
     "guard",
