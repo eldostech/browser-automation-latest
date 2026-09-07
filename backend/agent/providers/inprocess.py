@@ -40,8 +40,8 @@ from typing import Any
 from snapshot import Snapshot, parse as parse_snapshot
 from usecase import Locator
 
-from .marks import describe_element
-from .provider import ToolResult, ToolSpec
+from ..marks import describe_element
+from .base import ToolResult, ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -140,8 +140,8 @@ def with_refs(text: str) -> str:
 class EngineBrowser:
     """An MCP-shaped session over the browser a replay is already using.
 
-    Implements the two methods :class:`agent.provider.MCPSession` needs, so it
-    can be handed to ``AgentToolSession`` in place of a real server.
+    Implements the two methods :class:`agent.providers.base.MCPSession` needs,
+    so it can be handed to ``AgentToolSession`` in place of a real server.
     """
 
     def __init__(self, executor: Any) -> None:

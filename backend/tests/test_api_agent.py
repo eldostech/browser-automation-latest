@@ -18,11 +18,13 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
+from agent.tools.finish import NAME as FINISH
 from agent.graph import available
 from agent.verify import Verification
 from credentials import generate_key
-from test_agent_author import ScriptedLLM, turn_calling
-from test_agent_distil import ACCOUNT, a_recording
+from llm import LangChainLLM
+from scripted_chat_model import ScriptedChatModel, turn_calling
+from test_agent_distil import ACCOUNT
 from test_agent_tools import FakeMCP
 from test_api_execute import FakeReplaySession
 
@@ -57,11 +59,31 @@ def arm(client: TestClient, *turns, replay=None) -> FakeMCP:
     # it -- the production signature takes one, and a stub narrower than that
     # would silently pass every test that calls it the real way.
     manager.provider = lambda headless=None: provider
-    manager.llm_factory = lambda: ScriptedLLM(list(turns or a_recording()))
+    manager.llm_factory = lambda: LangChainLLM(
+        ScriptedChatModel(responses=list(turns or _a_recording())), "scripted-model"
+    )
     # Verification would otherwise start Chromium, which is not what this file
     # is about. `test_agent_mcp_live.py` covers the real one, end to end.
     manager.replay = replay or _replays_cleanly
     return provider
+
+
+def _a_recording():
+    """Sign in, then one record: type an account, open it, read the balance."""
+    return [
+        turn_calling("browser_navigate", url="https://vendor.test/login"),
+        turn_calling("browser_snapshot"),
+        turn_calling("browser_type", target="e2", text="secret-sign-in-value"),
+        turn_calling("mark_as_secret", ref="e2", slot="vendor_login"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        turn_calling("browser_type", target="e2", text="A-1001"),
+        turn_calling("mark_as_input", ref="e2", name="account"),
+        turn_calling("browser_click", target="e3"),
+        turn_calling("mark_as_output", ref="e4", column="balance"),
+        turn_calling("end_row"),
+        turn_calling(FINISH, summary="Read the balance for A-1001."),
+    ]
 
 
 async def _replays_cleanly(use_case, inputs, secrets):
@@ -180,9 +202,9 @@ def a_session_that_asks():
 
 
 async def test_a_session_that_asks_waits_and_is_answered(client: TestClient):
-    from agent.author import FINISH  # noqa: F401 - naming the tool it calls
+    from agent.tools.finish import NAME as FINISH  # noqa: F401 - naming the tool it calls
 
-    arm(client, *([_plan()] + a_session_that_asks()), replay=_replays_cleanly)
+    arm(client, *a_session_that_asks(), replay=_replays_cleanly)
 
     created = client.post(
         "/api/agent-sessions", json={**START, "may_write": True}
@@ -200,6 +222,41 @@ async def test_a_session_that_asks_waits_and_is_answered(client: TestClient):
     assert body["status"] in {"succeeded", "partial"}
 
 
+async def test_answering_a_session_leaves_exactly_one_approval_and_one_finish(
+    client: TestClient,
+):
+    """The bug a real session hit end to end: the approval card a person
+    approved never went away, and the run ended with three disagreeing
+    `run_finished` events. Both traced to the same cause -- code with a side
+    effect running twice around one interrupt -- and this is the row of
+    events an operator would actually look at to tell whether it recurred."""
+    from agent.tools.finish import NAME as FINISH  # noqa: F401
+
+    arm(client, *a_session_that_asks(), replay=_replays_cleanly)
+
+    created = client.post(
+        "/api/agent-sessions", json={**START, "may_write": True}
+    ).json()
+    waiting = await settle(client, created["id"], {"awaiting_approval"})
+
+    client.post(
+        f"/api/agent-sessions/{created['id']}/decide", json={"decision": "approved"}
+    )
+    await settle(client, created["id"], {"succeeded", "partial", "failed"})
+
+    events = client.get(f"/api/runs/{created['run_id']}/events").json()["events"]
+    asked = [e for e in events if e["type"] == "approval_required"]
+    resolved = [e for e in events if e["type"] == "approval_resolved"]
+    finished = [e for e in events if e["type"] == "run_finished"]
+
+    assert len(asked) == 1, "a second approval was asked after the first was answered"
+    assert len(resolved) == 1
+    assert asked[0]["approval_id"] == resolved[0]["approval_id"], (
+        "the approval a person answered is not the one the backend resolved"
+    )
+    assert len(finished) == 1, "the run announced its own ending more than once"
+
+
 async def test_answering_a_session_that_is_not_waiting_is_a_conflict(client: TestClient):
     arm(client)
     created = client.post("/api/agent-sessions", json=START).json()
@@ -209,13 +266,6 @@ async def test_answering_a_session_that_is_not_waiting_is_a_conflict(client: Tes
         f"/api/agent-sessions/{created['id']}/decide", json={"decision": "approved"}
     )
     assert response.status_code == 409
-
-
-def _plan():
-    from llm import LLMTurn
-
-    return LLMTurn(text="Open the record and read it.",
-                   usage={"input_tokens": 100, "output_tokens": 20})
 
 
 # --- saving ----------------------------------------------------------------
@@ -325,7 +375,7 @@ async def test_shutting_down_waits_for_what_it_cancels(
 def test_headless_defaults_to_the_deployment_setting():
     """Nobody asked, so the installation's own default decides -- same as it
     always has."""
-    from agent_manager import AgentSessions
+    from agent.manager import AgentSessions
 
     manager = AgentSessions(None, None, object(), lambda: None)
     manager.settings = type("S", (), {"agent_headless": True, "agent_browser_provider": "local"})()
@@ -338,7 +388,7 @@ def test_a_person_starting_a_session_can_ask_to_watch_it():
     """The same choice a replay already offers under "Show the browser while
     it runs" -- watching is how trust in this gets built the first few times,
     and nobody should have to ask an administrator to see it."""
-    from agent_manager import AgentSessions
+    from agent.manager import AgentSessions
 
     manager = AgentSessions(None, None, object(), lambda: None)
     manager.settings = type("S", (), {"agent_headless": True, "agent_browser_provider": "local"})()
@@ -350,7 +400,7 @@ def test_the_override_has_no_effect_on_a_managed_browser():
     """A CDP session's browser is somebody else's to configure, and this
     session did not start it -- headless is not this deployment's call to make
     there either way."""
-    from agent_manager import AgentSessions
+    from agent.manager import AgentSessions
 
     manager = AgentSessions(None, None, object(), lambda: None)
     manager.settings = type(

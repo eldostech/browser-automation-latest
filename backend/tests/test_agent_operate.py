@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from agent.graph import available
-from agent.inprocess import EngineBrowser, with_refs
+from agent.providers.inprocess import EngineBrowser, with_refs
 from agent.operate import GIVE_UP, RESUME, run_row_with_agent
 from engine import RowResult
 from test_agent_author import ScriptedLLM, turn_calling

@@ -1,10 +1,13 @@
 """Agent sessions, held while they run.
 
-The adapter between an HTTP request and ``agent.AgentSession``. Everything
-application-shaped lives here -- the store, the event bus, settings, the
-workspace scoping -- because the agent package deliberately knows about none of
-it, and that is what keeps the eventual move to another runtime a matter of
-packaging.
+The adapter between an HTTP request and :class:`agent.run.AgentSession`.
+Everything application-shaped lives here -- the store, the event bus,
+settings, the workspace scoping -- because the rest of the agent package
+deliberately knows about none of it, and that is what keeps the eventual move
+to another runtime a matter of packaging. It lives inside the package rather
+than beside it for the same reason: nothing else in this codebase needs to
+know an agent session's lifecycle exists without also knowing what an agent
+session is.
 
 **Sessions are in memory, like recordings.** `recorder.Recorder` holds its
 sessions in a dict and the recordings router works entirely off that; an agent
@@ -28,11 +31,14 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from agent import AgentSession, AuthorRequest, AuthorResult, Budget
-from agent.provider import LocalPlaywrightMCP, local_availability
 from events import AgentEvent
 from lifecycle import RunLifecycle, Terminal
-from store import Store
+from store import Store, WorkspaceStore
+
+from .author import AuthorRequest
+from .budget import Budget
+from .providers import BrowserProvider, LocalPlaywrightMCP, StdioMCPProvider, local_availability
+from .run import AgentSession, AuthorResult
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +256,34 @@ class AgentSessions:
             return replace(budget, usd=round(remaining, 4))
         return budget
 
+    async def _registered_providers(self, data: "WorkspaceStore") -> dict[str, BrowserProvider]:
+        """This workspace's enabled MCP servers, resolved into providers.
+
+        Resolved fresh per session rather than cached: a server disabled or
+        edited between sessions must take effect on the next one without a
+        restart, the same way a credential edit does.
+        """
+        rows = await data.list_tool_servers(enabled_only=True)
+        providers: dict[str, BrowserProvider] = {}
+        for row in rows:
+            if row["transport"] != "stdio":
+                # Only stdio exists today; a row saved by a future version
+                # with a transport this one does not understand is skipped
+                # rather than crashing every session in the workspace.
+                log.warning(
+                    "skipping a tool server with an unsupported transport",
+                    extra={"server_name": row["name"], "transport": row["transport"]},
+                )
+                continue
+            connection = row["connection"] or {}
+            providers[row["name"]] = StdioMCPProvider(
+                row["name"],
+                connection.get("command", ""),
+                tuple(connection.get("args") or ()),
+                dict(connection.get("env") or {}),
+            )
+        return providers
+
     async def _drive(
         self,
         record: Session,
@@ -280,6 +314,7 @@ class AgentSessions:
                     secrets=secrets,
                     name=name,
                     replay=self.replay,
+                    extra=await self._registered_providers(data),
                 ) as session:
                     record._session = session
                     result = await session.start()
@@ -295,12 +330,27 @@ class AgentSessions:
 
                 run.finish(
                     Terminal(
-                        status="succeeded" if record.status == "succeeded" else "failed",
+                        # "partial" is a budget stop that kept everything it
+                        # did -- worth distilling, not a failure -- and
+                        # `run.py`'s `_draft_and_verify` already announced it
+                        # as "succeeded" for exactly that reason. Matching
+                        # that rule here, rather than treating anything but a
+                        # literal "succeeded" as failed, is what stops this
+                        # run's terminal *row* disagreeing with the terminal
+                        # *event* the session already emitted.
+                        status="succeeded" if record.status in {"succeeded", "partial"} else "failed",
                         steps=result.steps,
                         summary=result.summary or None,
                         error=result.stopped_by or None,
                         tokens=int(result.spend.get("tokens") or 0),
                         cost_usd=float(result.spend.get("usd") or 0.0),
+                        # The session already emitted this run's `run_finished`
+                        # through this same sink -- every completed
+                        # `session.start()`/`session.resume()` goes through
+                        # it. Announcing again here, with a status computed by
+                        # a different rule, is the second `run_finished` a
+                        # single run produced.
+                        announced=True,
                     )
                 )
         except asyncio.CancelledError:

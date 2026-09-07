@@ -25,7 +25,7 @@ from credentials import Vault
 from llm import RepairModel
 from jobs import JobQueue, Worker
 from logging_setup import configure_logging
-from agent_manager import AgentSessions
+from agent.manager import AgentSessions
 from recorder import Recorder
 from routers import ALL_ROUTERS
 from storage import build_storage
@@ -229,7 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
 
     application = FastAPI(
-        title="Understudy",
+        title="TRACE",
         version="1.0.0",
         description=(
             "Record a browser workflow by doing it once, then replay it over a "

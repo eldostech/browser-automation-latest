@@ -56,26 +56,21 @@ class Settings(BaseSettings):
     # is no provider setting: adding one back means adding a second code path
     # to keep working, and nothing here needs it.
 
-    #: The DRIVER model: the agent loop that records a use case by actually
-    #: driving the browser. Every step of a recording costs tokens here, so it
-    #: is the one worth keeping fast.
+    #: The one model setting. A use case is recorded by watching somebody do
+    #: it and distilled by parsing the recording, not by asking a model, so
+    #: neither of those costs a token -- this is asked only two things: how a
+    #: spreadsheet column maps onto a recorded field (mapping fallback), and,
+    #: rarely, which control a broken locator now means (healing/repair). Both
+    #: are one-shot judgement calls whose answer gets written back and then
+    #: repeats silently on every future row, so it is worth capability over
+    #: speed. The agent path (recording *with* an agent instead of by hand)
+    #: reads this too.
     #:
     #: On Bedrock this must be a Bedrock model ID. Current Claude models are
     #: only offered through cross-region inference profiles, so the ID carries
     #: a region prefix ("us." / "eu." / "apac." / "global."). Naming the bare
     #: foundation model fails with "on-demand throughput isn't supported".
-
-    #: The REPAIR model: self-healing mid-run, and repairing a failed use case
-    #: afterwards. Both are one-shot judgement calls on a page the model has
-    #: never seen, run rarely, where a wrong answer gets written back into a
-    #: use case and then repeats silently on every future row -- so they are
-    #: worth more capability than the driver.
     llm_repair_model: str = "us.anthropic.claude-opus-5"
-
-    #: The DISTILLER model: the single call that turns a recording into a use
-    #: case. Blank means "use the driver model". Split out because it is one
-    #: call per use case rather than per step, so it can be pointed at a
-    #: stronger model without materially changing cost.
 
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
@@ -86,13 +81,6 @@ class Settings(BaseSettings):
     #: These map to the standard AWS_REGION / AWS_PROFILE variables.
     aws_region: str | None = None
     aws_profile: str | None = None
-
-    # --- MCP ---------------------------------------------------------------
-
-    # --- Agent guardrails --------------------------------------------------
-    # Tool results are fed back to the model verbatim; cap them so one enormous
-    # accessibility snapshot cannot blow the context window.
-    # Oldest tool results are trimmed once history exceeds this many messages.
 
     # --- Credentials -------------------------------------------------------
     #: Fernet key encrypting stored credentials. Generate one with:
@@ -268,9 +256,8 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 5
     db_pool_timeout: float = 30.0
-    #: restart. Off in tests, where an in-memory saver is correct and a second
-    #: connection is waste. See checkpoints.py for why the backend differs by
-    #: platform.
+    #: Recycle a pooled connection after this many seconds, so one that a
+    #: firewall or the server silently dropped is never handed back stale.
     db_pool_recycle: int = 1800
     db_echo: bool = False
 

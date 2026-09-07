@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from agent import Budget
-from agent_manager import AgentSessions, AgentUnavailable
+from agent.manager import AgentSessions, AgentUnavailable
 from auth.rbac import Permission
 from auth.service import Principal
 from credentials import Vault

@@ -1,7 +1,12 @@
-"""The tools that turn *doing* a task into *recording* one.
+"""The state that turns *doing* a task into *recording* one.
 
 Playwright MCP can drive a browser. It cannot produce a use case, and the gap
-between those two is this file.
+between those two is this file: the bookkeeping the marking tools
+(`agent/tools/begin_row.py` and its siblings) read and write. Their schemas
+and dispatch live there, one file per tool; what they all share -- the row
+boundary, the entries recorded, the ref-to-locator resolution -- lives here,
+because splitting shared state across files it flows through would add
+indirection, not remove it.
 
 **`describe_element` is the bridge.** An MCP ref is an index into one snapshot
 and is meaningless in any other; a `UseCase` needs a locator that still works
@@ -25,8 +30,7 @@ and which value varies. Do not infer what the agent can declare.
 and `mark_as_input` / `mark_as_output` / `mark_as_secret` name the values while
 the page they came from is still on screen.
 
-These are ours, not the server's: they never reach the browser, and they are
-dispatched here rather than over MCP.
+These are ours, not the server's: they never reach the browser.
 """
 
 from __future__ import annotations
@@ -40,87 +44,6 @@ from snapshot import Node, Snapshot
 # Imported for the shape of what we produce. `usecase` is a schema module with
 # no I/O, so this does not couple the agent to the application.
 from usecase import Locator
-
-#: Marking tools, and the schema each takes. These are advertised to the model
-#: beside the server's own, and they are the only tools in the registry that
-#: never touch the browser.
-MARK_TOOLS: dict[str, dict[str, Any]] = {
-    "describe_element": {
-        "description": (
-            "Resolve an element reference from the current snapshot into the "
-            "durable locator a recorded step would use, and report how many "
-            "elements each way of finding it matches. Call this before marking "
-            "anything: an ambiguous locator is far cheaper to fix now."
-        ),
-        "properties": {
-            "ref": {"type": "string", "description": "A ref such as 'e12'."},
-        },
-        "required": ["ref"],
-    },
-    "mark_setup_complete": {
-        "description": (
-            "Everything done so far was setup -- signing in, choosing a "
-            "workspace -- and runs once per batch rather than once per row. "
-            "Call this exactly once, when the per-record work is about to start."
-        ),
-        "properties": {},
-        "required": [],
-    },
-    "begin_row": {
-        "description": (
-            "The work for one record starts here. Everything until end_row "
-            "becomes the steps that repeat, once per row of the spreadsheet."
-        ),
-        "properties": {
-            "key": {
-                "type": "string",
-                "description": "What identifies this record, e.g. 'A-1001'.",
-            }
-        },
-        "required": ["key"],
-    },
-    "end_row": {
-        "description": "The work for one record is finished.",
-        "properties": {},
-        "required": [],
-    },
-    "mark_as_input": {
-        "description": (
-            "This value changes per record and should come from a spreadsheet "
-            "column. The step that types it becomes a template. Only valid "
-            "inside a row: call begin_row first."
-        ),
-        "properties": {
-            "ref": {"type": "string"},
-            "name": {"type": "string", "description": "The column name."},
-        },
-        "required": ["ref", "name"],
-    },
-    "mark_as_output": {
-        "description": (
-            "Read this element's value into the results file. Becomes an "
-            "extract step at this point in the run, on the page it was seen "
-            "on. Only valid inside a row: call begin_row first."
-        ),
-        "properties": {
-            "ref": {"type": "string"},
-            "column": {"type": "string"},
-        },
-        "required": ["ref", "column"],
-    },
-    "mark_as_secret": {
-        "description": (
-            "This is a credential. It binds to a stored credential slot; the "
-            "value itself is never written into the use case."
-        ),
-        "properties": {
-            "ref": {"type": "string"},
-            "slot": {"type": "string", "description": "The credential slot name."},
-        },
-        "required": ["ref", "slot"],
-    },
-}
-
 
 #: What a column or slot name has to look like: an identifier, because it
 #: becomes a `{{input.x}}` template and a spreadsheet header.
@@ -428,7 +351,6 @@ class Marks:
 
 
 __all__ = [
-    "MARK_TOOLS",
     "as_name",
     "Described",
     "Mark",

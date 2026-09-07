@@ -60,8 +60,21 @@ SENSITIVE_TOOL_FRAGMENTS: dict[str, Category] = {
 SUBMITTING_TOOL_FRAGMENTS: tuple[str, ...] = ("click", "press_key", "select_option", "submit")
 
 #: Words that make a click a form submission.
+#:
+#: Deliberately **not** ``sign in`` / ``log in``: authenticating with a
+#: credential the session was already given is not a new commitment to
+#: approve, it is the use of one approved when the credential was bound to
+#: the session in the first place. Typing that credential is not gated for
+#: exactly this reason (see ``CREDENTIALS`` below, and ``tools.py``'s
+#: ``IRREVERSIBLE`` set); gating the click that submits it right afterward
+#: was the same action, split into two calls and treated inconsistently --
+#: stopping a session to ask "is it OK to sign in with the login you just
+#: told it to use" trains a person to click Allow without reading, which is
+#: how an approval gate stops working. ``sign up`` (registration) stays
+#: gated: creating a new account is a real commitment a bound credential
+#: does not already cover.
 SUBMIT_PATTERNS = re.compile(
-    r"\b(submit|send|continue|next|save|apply|sign\s?up|sign\s?in|log\s?in|"
+    r"\b(submit|send|continue|next|save|apply|sign\s?up|"
     r"register|subscribe|post|publish|book|reserve)\b",
     re.IGNORECASE,
 )

@@ -22,7 +22,7 @@ import os
 import pytest
 
 from agent import AgentToolSession, LocalPlaywrightMCP
-from agent.tools import DISTILS_TO, NOT_WORTH_THE_TOKENS, PERCEPTION, REFUSED
+from agent.guardrails import DISTILS_TO, NOT_WORTH_THE_TOKENS, PERCEPTION, REFUSED
 
 pytestmark = [
     pytest.mark.anyio,

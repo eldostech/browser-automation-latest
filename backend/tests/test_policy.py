@@ -132,6 +132,25 @@ def test_form_submit_click_is_sensitive():
     assert Category.FORM_SUBMIT in decision.categories
 
 
+def test_signing_in_with_a_credential_already_bound_is_not_gated():
+    """Typing the credential is not gated either -- see CREDENTIAL_PATTERNS'
+    absence from IRREVERSIBLE in tools.py. Gating the click that submits it
+    right afterward would be the same action treated inconsistently: a
+    session already told which login to use does not need to stop and ask
+    whether using it is OK."""
+    for element in ("Sign in", "Sign In", "SignIn", "Log in", "Login"):
+        decision = classify("browser_click", {"element": element}, allowlist=ALLOWLIST)
+        assert Category.FORM_SUBMIT not in decision.categories, element
+        assert not decision.sensitive, element
+
+
+def test_signing_up_for_a_new_account_is_still_sensitive():
+    """Unlike signing in, this creates something a bound credential does not
+    already cover."""
+    decision = classify("browser_click", {"element": "Sign up"}, allowlist=ALLOWLIST)
+    assert Category.FORM_SUBMIT in decision.categories
+
+
 def test_enter_key_counts_as_a_form_submit():
     decision = classify("browser_press_key", {"key": "Enter"}, allowlist=ALLOWLIST)
     assert Category.FORM_SUBMIT in decision.categories

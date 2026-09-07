@@ -48,7 +48,7 @@ from prompt_loader import EXPLORE, RECOVER, render
 
 from .author import for_model
 from .budget import Budget, BudgetExhausted, Spend
-from .inprocess import EngineBrowser
+from .providers.inprocess import EngineBrowser
 from .session import AgentToolSession
 
 log = logging.getLogger(__name__)

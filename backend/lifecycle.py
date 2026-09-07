@@ -53,6 +53,14 @@ class Terminal:
     #: question nobody asks twice.
     tokens: int = 0
     cost_usd: float = 0.0
+    #: True when the run already emitted its own `run_finished` through this
+    #: same sink before this block exited. The agent graph does exactly that
+    #: -- `author.py`'s `finish` node announces the session itself, since
+    #: `run_agent_session` is also used standalone with no lifecycle wrapping
+    #: it at all. Persisting here must not announce it a second time with a
+    #: status computed by a different rule; every other run type leaves this
+    #: False and gets the one announcement this class exists to guarantee.
+    announced: bool = False
 
 
 class RunLifecycle:
@@ -134,18 +142,19 @@ class RunLifecycle:
 
     async def _persist(self) -> None:
         terminal = self._terminal
-        await self.sink.emit(
-            RunFinished(
-                run_id=self.run_id,
-                seq=self.sink.reserve_seq(),
-                status=terminal.status,
-                steps=terminal.steps,
-                duration_ms=terminal.duration_ms,
-                summary=terminal.summary,
-                result=terminal.result,
-                error=terminal.error,
+        if not terminal.announced:
+            await self.sink.emit(
+                RunFinished(
+                    run_id=self.run_id,
+                    seq=self.sink.reserve_seq(),
+                    status=terminal.status,
+                    steps=terminal.steps,
+                    duration_ms=terminal.duration_ms,
+                    summary=terminal.summary,
+                    result=terminal.result,
+                    error=terminal.error,
+                )
             )
-        )
         await self.data.finish_run(
             self.run_id,
             terminal.status,

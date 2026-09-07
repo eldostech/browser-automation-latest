@@ -18,12 +18,13 @@ from __future__ import annotations
 import pytest
 
 from agent import distil, verify
-from agent.author import FINISH
+from agent.tools.finish import NAME as FINISH
 from agent.verify import Verification
-from test_agent_author import ScriptedLLM, turn_calling
-from test_agent_graph import PLAN, a_session, request
+from llm import LangChainLLM
+from scripted_chat_model import ScriptedChatModel, turn_calling
 from test_agent_marks import INVITE
 from test_agent_tools import FakeMCP
+from test_create_agent_graph import request
 
 pytestmark = pytest.mark.anyio
 
@@ -45,7 +46,6 @@ ACCOUNT = """### Page
 def a_recording():
     """Sign in, then one record: type an account, open it, read the balance."""
     return [
-        PLAN,
         turn_calling("browser_navigate", url="https://vendor.test/login"),
         turn_calling("browser_snapshot"),
         turn_calling("browser_type", target="e2", text="secret-sign-in-value"),
@@ -61,12 +61,67 @@ def a_recording():
     ]
 
 
+#: Two cards, each with a "Chat" button sharing the same role and name --
+#: the shape that produced a real failure: an agent clicked the right one by
+#: ref, and the durable locator distilled from that click matched both.
+CHAT_LIST = """### Page
+- Page URL: https://vendor.test/projects
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - text "Project A" [ref=e3]
+    - button "Chat" [ref=e4]
+    - button "Open" [ref=e5]
+  - generic [ref=e6]:
+    - text "Project B" [ref=e7]
+    - button "Chat" [ref=e8]
+```
+"""
+
+
+async def test_an_ambiguous_click_becomes_a_step_with_a_loud_warning():
+    """Found for real: an agent clicked the right "Chat" button among eleven
+    identical ones by ref -- that click always runs, since a ref is
+    position-specific, not name-based -- and the recording carried only
+    `role=button name="Chat"`, which a replay days later correctly refused
+    rather than guessing among them. The warning exists so a person sees this
+    on the review screen instead of discovering it from a failed batch."""
+    from agent import run_agent_session
+
+    provider = FakeMCP({"browser_snapshot": CHAT_LIST})
+    llm = LangChainLLM(
+        ScriptedChatModel(responses=[
+            turn_calling("browser_snapshot"),
+            turn_calling("mark_setup_complete"),
+            turn_calling("begin_row", key="project-b"),
+            turn_calling("browser_click", target="e8", element="Chat button for Project B"),
+            turn_calling("mark_as_output", ref="e5", column="open_label"),
+            turn_calling("end_row"),
+            turn_calling(FINISH, summary="Opened chat for Project B."),
+        ]),
+        "scripted-model",
+    )
+
+    result = await run_agent_session(
+        request(), llm=llm, provider=provider, emit=_ignore,
+        replay=_replays_cleanly, name="Open a project's chat",
+    )
+
+    assert result.use_case is not None
+    click_step = next(s for s in result.use_case["row_steps"] if s["action"] == "click")
+    assert click_step["locators"][0]["name"] == "Chat"
+    assert any(
+        "matched 2 elements" in w and click_step["id"] in w for w in result.draft_warnings
+    ), result.draft_warnings
+
+
 async def a_run(*, replay=None, turns=None):
     from agent import run_agent_session
 
     provider = FakeMCP({name: ACCOUNT for name in
                         ("browser_snapshot", "browser_navigate", "browser_type", "browser_click")})
-    llm = ScriptedLLM(list(turns or a_recording()))
+    llm = LangChainLLM(ScriptedChatModel(responses=list(turns or a_recording())), "scripted-model")
     return await run_agent_session(
         request(),
         llm=llm,
@@ -191,7 +246,6 @@ async def test_a_value_marked_on_an_element_nothing_typed_into_is_reported():
     """Rather than a use case with a declared input no step reads -- which the
     publish validator would reject later, with less to say about why."""
     turns = [
-        PLAN,
         turn_calling("browser_snapshot"),
         turn_calling("mark_setup_complete"),
         turn_calling("begin_row", key="A-1001"),
@@ -209,7 +263,6 @@ async def test_a_session_with_no_row_is_still_distilled_with_the_reason():
     """Throwing it away loses the expensive part. A person can read the steps
     and fix the boundary by hand."""
     turns = [
-        PLAN,
         turn_calling("browser_snapshot"),
         turn_calling(FINISH, summary="Never marked a row."),
     ]
@@ -332,7 +385,6 @@ async def test_going_back_records_where_it_went():
     it landed on is the only thing that does. Without this, "back to the list"
     is a step a replay cannot perform."""
     turns = [
-        PLAN,
         turn_calling("browser_snapshot"),
         turn_calling("mark_setup_complete"),
         turn_calling("begin_row", key="A-1001"),
@@ -372,7 +424,6 @@ async def test_the_agent_is_told_the_name_it_actually_got():
     """Answering "recorded" leaves it using its own spelling in the next call
     and in its summary, and then two names for one column are loose."""
     turns = [
-        PLAN,
         turn_calling("browser_snapshot"),
         turn_calling("mark_setup_complete"),
         turn_calling("begin_row", key="A-1001"),
@@ -429,7 +480,6 @@ async def test_typing_a_per_row_value_before_the_row_began_moves_into_it():
     agent said rather than guessing at what it meant.
     """
     turns = [
-        PLAN,
         turn_calling("browser_snapshot"),
         turn_calling("browser_type", target="e2", text="A-1001"),
         turn_calling("browser_click", target="e3"),

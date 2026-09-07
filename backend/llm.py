@@ -140,6 +140,18 @@ class LangChainLLM:
         self.model = model_name
         self.provider = PROVIDER
 
+    @property
+    def raw(self) -> Any:
+        """The underlying LangChain chat model, unwrapped.
+
+        `create_agent` wants an actual `BaseChatModel` rather than this
+        codebase's own `run_turn` protocol -- this is the seam that lets the
+        authoring graph pass one through without every other caller of
+        `LLMClient` (healing, repair, the recover/explore loop) knowing or
+        caring that it exists.
+        """
+        return self._model
+
     async def run_turn(
         self,
         *,
@@ -208,28 +220,7 @@ class LangChainLLM:
         )
 
     def _translate(self, exc: Exception) -> Exception:
-        """Turn a provider access failure into something an operator can fix.
-
-        Bedrock's own wording -- "anthropic.claude-sonnet-5 is not available
-        for this account" -- names a model ID the operator never typed (the
-        inference profile's region prefix is stripped), and says nothing about
-        which of three configured models it was or where to change it.
-        """
-        status = getattr(exc, "status_code", None) or _status_from_message(str(exc))
-        if status not in _ACCESS_STATUSES:
-            return exc
-
-        if status == 404:
-            reason = f"the provider has no model {self.model!r}"
-        elif status == 401:
-            reason = "the credentials were rejected"
-        else:
-            reason = f"this account cannot use {self.model!r}"
-
-        return LLMAccessError(
-            f"{reason} on {self.provider}. Nothing will run until the model or the "
-            f"credentials change. Provider said: {str(exc)[:300]}"
-        )
+        return translate_access_error(exc, model=self.model, provider=self.provider)
 
     def describe(self) -> dict[str, Any]:
         return {"provider": PROVIDER, "model": self.model, "auth": bedrock_auth_status()}
@@ -251,6 +242,36 @@ class LangChainLLM:
                 "error": str(translated)[:300],
             }
         return {"model": self.model, "ok": True}
+
+
+def translate_access_error(exc: Exception, *, model: str, provider: str = PROVIDER) -> Exception:
+    """Turn a provider access failure into something an operator can fix.
+
+    Bedrock's own wording -- "anthropic.claude-sonnet-5 is not available for
+    this account" -- names a model ID the operator never typed (the inference
+    profile's region prefix is stripped), and says nothing about which of
+    three configured models it was or where to change it.
+
+    A module-level function rather than only a method on `LangChainLLM`
+    because the authoring graph's model-call middleware calls the raw chat
+    model directly (`create_agent` needs a `BaseChatModel`, not this
+    codebase's `run_turn` wrapper) and still needs the same translation.
+    """
+    status = getattr(exc, "status_code", None) or _status_from_message(str(exc))
+    if status not in _ACCESS_STATUSES:
+        return exc
+
+    if status == 404:
+        reason = f"the provider has no model {model!r}"
+    elif status == 401:
+        reason = "the credentials were rejected"
+    else:
+        reason = f"this account cannot use {model!r}"
+
+    return LLMAccessError(
+        f"{reason} on {provider}. Nothing will run until the model or the "
+        f"credentials change. Provider said: {str(exc)[:300]}"
+    )
 
 
 def _status_from_message(message: str) -> int | None:

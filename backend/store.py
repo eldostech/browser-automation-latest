@@ -37,6 +37,7 @@ from db.base import iso, utcnow
 from db.engine import create_engine, create_session_factory, ensure_schema
 from db.models import (
     Target,
+    AgentToolServer,
     Artifact,
     AuditLogEntry,
     Dataset,
@@ -1090,6 +1091,74 @@ class WorkspaceStore:
             result = await session.execute(
                 delete(Credential).where(
                     Credential.id == credential_id, Credential.workspace_id == self._ws
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    # -- agent tool servers ---------------------------------------------------
+    async def save_tool_server(
+        self,
+        server_id: str,
+        name: str,
+        transport: str,
+        connection: dict[str, Any],
+        *,
+        enabled: bool = True,
+        owner_id: str | None = None,
+    ) -> str:
+        """Register or replace one MCP server. Re-saving a name replaces it,
+        the same rule ``save_credential`` uses and for the same reason: two
+        workspaces may both register a server called "crm"."""
+        async with self._sessions() as session:
+            stmt = pg_insert(AgentToolServer).values(
+                id=server_id,
+                workspace_id=self._ws,
+                owner_id=owner_id,
+                name=name,
+                transport=transport,
+                connection=connection,
+                enabled=enabled,
+                created_at=utcnow(),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[AgentToolServer.workspace_id, AgentToolServer.name],
+                set_={
+                    "transport": stmt.excluded.transport,
+                    "connection": stmt.excluded.connection,
+                    "enabled": stmt.excluded.enabled,
+                },
+            ).returning(AgentToolServer.id)
+            stored_id = await session.scalar(stmt)
+            await session.commit()
+            return stored_id or server_id
+
+    async def list_tool_servers(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        async with self._sessions() as session:
+            stmt = select(AgentToolServer).where(
+                AgentToolServer.workspace_id == self._ws
+            )
+            if enabled_only:
+                stmt = stmt.where(AgentToolServer.enabled.is_(True))
+            rows = (await session.scalars(stmt.order_by(AgentToolServer.name))).all()
+            return [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "transport": row.transport,
+                    "connection": row.connection or {},
+                    "enabled": row.enabled,
+                    "created_at": iso(row.created_at),
+                }
+                for row in rows
+            ]
+
+    async def delete_tool_server(self, server_id: str) -> bool:
+        async with self._sessions() as session:
+            result = await session.execute(
+                delete(AgentToolServer).where(
+                    AgentToolServer.id == server_id,
+                    AgentToolServer.workspace_id == self._ws,
                 )
             )
             await session.commit()

@@ -24,7 +24,7 @@ from agent import (
     guard,
     offered,
 )
-from agent.provider import REF_IN_SNAPSHOT
+from agent.providers import REF_IN_SNAPSHOT
 
 pytestmark = pytest.mark.anyio
 
@@ -147,6 +147,7 @@ def context(**kwargs) -> GuardContext:
         known_refs=frozenset(kwargs.pop("known_refs", {"e3", "e4"})),
         may_write=kwargs.pop("may_write", True),
         available=frozenset(kwargs.pop("available", {s.name for s in TOOLS})),
+        annotations=kwargs.pop("annotations", {}),
     )
 
 
@@ -248,6 +249,67 @@ def test_an_irreversible_action_is_flagged_without_being_refused():
     assert verdict.allowed
     assert verdict.needs_approval
     assert verdict.category
+
+
+# --- a tool from a registered server, classified with no name to go on -----
+
+
+def test_an_unannotated_tool_is_blocked_without_write_access():
+    """No annotation means "unknown", and unknown is the conservative answer
+    -- the same "deny-by-default" rule the allowlist already applies."""
+    verdict = guard(
+        "crm.delete_account", {},
+        context(may_write=False, available={"crm.delete_account"}),
+    )
+    assert not verdict.allowed
+
+
+def test_an_unannotated_tool_needs_approval_even_with_write_access():
+    """Write access is not the same question as "should a person see this
+    first" -- a tool nobody here has read the source of gets both gates."""
+    verdict = guard(
+        "crm.delete_account", {},
+        context(may_write=True, available={"crm.delete_account"}),
+    )
+    assert verdict.allowed
+    assert verdict.needs_approval
+
+
+def test_a_declared_read_only_tool_skips_both_gates():
+    """The one way a registered server's tool is trusted: it says so itself,
+    via the MCP protocol's own annotations -- not by a name this file has an
+    opinion about, since nobody here has read that server's source."""
+    ctx = context(
+        may_write=False,
+        available={"crm.lookup_account"},
+        annotations={"crm.lookup_account": {"readOnlyHint": True}},
+    )
+    verdict = guard("crm.lookup_account", {}, ctx)
+    assert verdict.allowed
+    assert not verdict.needs_approval
+
+
+def test_a_declared_destructive_tool_still_needs_write_access_and_approval():
+    ctx = context(
+        may_write=True,
+        available={"crm.delete_account"},
+        annotations={"crm.delete_account": {"destructiveHint": True}},
+    )
+    verdict = guard("crm.delete_account", {}, ctx)
+    assert verdict.allowed
+    assert verdict.needs_approval
+
+
+def test_a_mark_tool_is_unaffected_by_the_unannotated_classification():
+    """Mark tools are not in DISTILS_TO either, and must not fall into the
+    "unknown server tool" path -- they would suddenly need write access and
+    approval just to record a row boundary."""
+    verdict = guard(
+        "begin_row", {"key": "A-1"},
+        context(may_write=False, available={s.name for s in TOOLS} | {"begin_row"}),
+    )
+    assert verdict.allowed
+    assert not verdict.needs_approval
 
 
 # --- dispatch, recording, redaction ---------------------------------------
@@ -361,13 +423,26 @@ def test_the_agent_package_imports_no_optional_dependency_at_module_scope():
     `engine.py` does not import `llm`.
     """
     import inspect
+    import pkgutil
 
     import agent
-    import agent.provider
+    import agent.guardrails
+    import agent.providers
     import agent.session
     import agent.tools
 
-    for module in (agent, agent.provider, agent.session, agent.tools):
+    # Every submodule of every package below, not just the four top-level
+    # names -- the compatibility contract broke once already from a file one
+    # level down (`tool_adapter.py`) that nothing here was checking.
+    modules = [agent, agent.session]
+    for package in (agent.guardrails, agent.providers, agent.tools):
+        modules.append(package)
+        modules.extend(
+            __import__(f"{package.__name__}.{info.name}", fromlist=["_"])
+            for info in pkgutil.iter_modules(package.__path__)
+        )
+
+    for module in modules:
         source = inspect.getsource(module)
         top_level = [
             line
@@ -378,6 +453,7 @@ def test_the_agent_package_imports_no_optional_dependency_at_module_scope():
         assert "import mcp" not in joined, module.__name__
         assert "from mcp" not in joined, module.__name__
         assert "langgraph" not in joined, module.__name__
+        assert "langchain" not in joined, module.__name__
 
 
 def test_the_config_endpoint_tells_a_deployment_apart_from_a_broken_one():
@@ -485,3 +561,102 @@ async def test_a_session_with_no_bound_credentials_substitutes_nothing():
         await tools.call("browser_type", {"target": "e4", "text": "ordinary text"})
 
     assert tools.provider.calls[-1][1]["text"] == "ordinary text"
+
+
+# --- tools from a registered server: prefixing, dispatch, distillation ----
+#
+# Phase 1's whole point: an agent session used to have exactly one tool
+# source. These pin the three things that had to be true for a second one to
+# be safe -- its tools cannot collide with the browser's, a call to one
+# cannot be mistaken for a browser action, and it never becomes a step.
+
+
+class FakeExtraServer:
+    """A server that is not the browser: tools and answers, no refs, no page."""
+
+    def __init__(self, specs: list[ToolSpec], replies: dict[str, ToolResult] | None = None) -> None:
+        self._specs = specs
+        self.replies = replies or {}
+        self.calls: list[tuple[str, dict]] = []
+        self.closed = False
+
+    async def list_tools(self) -> list[ToolSpec]:
+        return list(self._specs)
+
+    async def call(self, name: str, arguments: dict) -> ToolResult:
+        self.calls.append((name, dict(arguments)))
+        return self.replies.get(name, ToolResult(text="ok"))
+
+    async def open(self):
+        return self
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_an_extra_servers_tools_are_shown_prefixed_by_its_name():
+    """Unprefixed, "lookup_account" could collide with a browser tool added
+    later. Prefixed, it never can."""
+    extra = FakeExtraServer([ToolSpec("lookup_account", "Look up a CRM account")])
+    async with await session(extra={"crm": extra}) as tools:
+        names = [spec.name for spec in tools.tools]
+
+    assert "crm.lookup_account" in names
+    assert "lookup_account" not in names
+
+
+async def test_calling_an_extra_tool_dispatches_to_its_own_server():
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}) as tools:
+        result = await tools.call("crm.lookup_account", {"id": "A-1"})
+
+    assert not result.is_error
+    assert extra.calls == [("lookup_account", {"id": "A-1"})]
+    assert tools.provider.calls == [], "it must not have reached the browser"
+
+
+async def test_an_extra_tool_call_never_carries_a_locator_or_distils_to_a_step():
+    """The invariant the whole design rests on: nothing from a registered
+    server can become a replay step."""
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}) as tools:
+        await tools.call("crm.lookup_account", {"id": "A-1"})
+
+    recorded = tools.calls[-1]
+    assert recorded.action == ""
+    assert recorded.locators == []
+
+
+async def test_an_extra_tool_does_not_disturb_the_browsers_known_refs():
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}) as tools:
+        await tools.call("browser_snapshot")
+        before = tools.known_refs
+        await tools.call("crm.lookup_account", {"id": "A-1"})
+
+        assert tools.known_refs == before
+
+
+async def test_an_unadvertised_extra_tool_name_is_refused_as_unknown():
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}) as tools:
+        result = await tools.call("crm.delete_account", {})
+
+    assert result.is_error
+    assert extra.calls == []
+
+
+async def test_a_secret_placeholder_is_substituted_for_an_extra_tool_too():
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}, secret_values={"key": "sk-real"}) as tools:
+        await tools.call("crm.lookup_account", {"text": "{{secret.key}}"})
+
+    assert extra.calls[-1][1]["text"] == "sk-real"
+
+
+async def test_closing_the_session_closes_every_extra_provider_too():
+    extra = FakeExtraServer([ToolSpec("lookup_account", "")])
+    async with await session(extra={"crm": extra}):
+        pass
+
+    assert extra.closed

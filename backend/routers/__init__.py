@@ -10,6 +10,7 @@ underneath can be tested without a ``TestClient``.
 from routers import (
     admin,
     agent_sessions,
+    agent_tool_servers,
     auth,
     credentials,
     datasets,
@@ -35,6 +36,7 @@ ALL_ROUTERS = (
     executions.router,
     recordings.router,
     agent_sessions.router,
+    agent_tool_servers.router,
     memory.router,
     targets.router,
 )
@@ -49,6 +51,7 @@ __all__ = [
     "health",
     "memory",
     "agent_sessions",
+    "agent_tool_servers",
     "recordings",
     "runs",
     "usecases",

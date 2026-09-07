@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 
 from agent import Marks, describe_element
-from agent.marks import MARK_TOOLS
+from agent.tools import TOOLS
 from snapshot import parse as parse_snapshot
 from test_agent_tools import FakeMCP, session
 
@@ -257,7 +257,8 @@ async def test_the_marking_tools_are_offered_beside_the_browser_ones():
     async with await session() as tools:
         names = {spec.name for spec in tools.tools}
 
-    assert set(MARK_TOOLS) <= names
+    mark_tool_names = {name for name, t in TOOLS.items() if t.handler is not None}
+    assert mark_tool_names <= names
     assert "browser_click" in names
     assert "browser_evaluate" not in names, "refusals are still removals"
 

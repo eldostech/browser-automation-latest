@@ -235,7 +235,7 @@ class StubStore:
 
 
 def manager_over(used: float, limit: float | None):
-    from agent_manager import AgentSessions
+    from agent.manager import AgentSessions
 
     return AgentSessions(StubStore(used, limit), None, object(), lambda: None)
 
@@ -267,7 +267,7 @@ async def test_a_workspace_with_no_ceiling_is_not_capped():
 async def test_a_workspace_at_its_ceiling_is_refused_before_a_browser_opens():
     """Starting with nothing to spend would open a browser, take a snapshot and
     stop -- which reads as a failure rather than as a budget."""
-    from agent_manager import AgentUnavailable
+    from agent.manager import AgentUnavailable
 
     with pytest.raises(AgentUnavailable) as caught:
         await manager_over(1.50, 1.00)._within_the_ceiling("ws", Budget())

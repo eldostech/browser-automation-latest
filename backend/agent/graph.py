@@ -1,30 +1,27 @@
-"""The authoring loop as a LangGraph graph.
+"""The authoring loop, built on `langchain.agents.create_agent`.
 
-Everything the nodes *do* is in ``author.py``. This file is the wiring, and it
-is separate for a reason worth stating: LangGraph is an optional dependency, so
-importing it at module scope would make the whole agent package unimportable in
-a deployment that installed only ``requirements.txt``. The import happens
-inside :func:`build`, and a test asserts it.
+This used to be a hand-built `StateGraph`: a `decide` node calling the model,
+an `act` node dispatching tools, and an `approve` node that suspended for a
+person. `create_agent` now provides the model-calling and tool-dispatch nodes,
+and this file's job shrinks to configuring three middleware:
 
-What the graph buys, beyond a `while` loop:
+* :class:`~agent.middleware.BudgetMiddleware` -- the budget check, the
+  prompt-cache hint, and the snapshot-pruning that used to live in `decide`
+  and `LangChainLLM.run_turn`.
+* :class:`~agent.middleware.FinishMiddleware` -- answers the `finish` call
+  and ends the graph, replacing `act`'s special case for it.
+* ``HumanInTheLoopMiddleware`` -- LangChain's own approval flow, not a
+  hand-rolled one. Its `after_model` hook recomputes the interrupt payload
+  fresh from already-checkpointed state every time, with nothing minted and
+  nothing emitted before the `interrupt()` call -- which is the safe form of
+  the pattern this file's previous `approve` node got wrong. See
+  ``run.py`` for how a person's decision actually reaches it: this file only
+  configures *which* calls stop to ask, via `guard()`, the same function that
+  already decides it for the deterministic dispatch path underneath.
 
-**A checkpoint per node.** A session that ends because a person went home, or
-because the process was restarted, resumes rather than starts again. That
-matters more here than in most agent products: an authoring session is the
-expensive part, and losing one at step thirty is losing real money.
-
-**A real interrupt.** ``approve`` is not a poll on a database flag. The graph
-stops, the state is persisted, and resuming with a decision continues from
-exactly there -- whether that is four seconds later in a browser tab or the
-next morning. That is the rendezvous ``RUN_APPROVE`` was defined for and never
-got.
-
-**One place the loop shape lives.** The conditional edges are the whole control
-flow, visible in twenty lines, rather than spread through a function with
-`break`s in it.
-
-    load_context -> plan -> decide -> ┬─ approve ─┬─ act ─┬─ decide  (not done)
-                                      └───────────┴───────┴─ finish  (done)
+LangChain is imported here, never at module scope -- it is an optional extra
+(`pip install -r backend/requirements-agent.txt`), and a deployment that only
+replays must not need it installed. A test asserts the absence.
 """
 
 from __future__ import annotations
@@ -32,127 +29,81 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .author import (
-    AuthorState,
-    Wiring,
-    _mirror,
-    act,
-    ask,
-    decide,
-    finish,
-    load_context,
-    needs_approval,
-    plan,
-    resolve,
-    stop_for_budget,
-)
-from .budget import BudgetExhausted
+from .author import Wiring, system_prompt
+from .guardrails import guard
+from .tool_adapter import as_langchain_tools
+from .tools import TOOLS
 
 log = logging.getLogger(__name__)
 
-#: The one place the node names are written down, so the graph and anything
-#: reading a checkpoint agree.
-NODES = ("load_context", "plan", "decide", "approve", "act", "finish")
-
 
 def available() -> bool:
-    """Whether this deployment has the graph library installed."""
+    """Whether this deployment has `create_agent` installed."""
     try:
-        import langgraph.graph  # noqa: F401
+        import langchain.agents  # noqa: F401
     except ImportError:
         return False
     return True
 
 
 def build(w: Wiring, checkpointer: Any = None):
-    """The compiled graph. LangGraph is imported here, never at module scope.
+    """The compiled graph.
 
-    The wiring -- the open tool session, the model client, the emit callable --
-    is closed over rather than carried in the state, because the state is the
-    thing LangGraph serialises after every node. A live browser session cannot
-    be written to Postgres, and a checkpoint that tried would be a checkpoint
-    that could not be read back.
+    The wiring -- the open tool session, the model client, the emit callable
+    -- is closed over by the middleware instances built here rather than
+    carried in the state, for the same reason it always was: the state is
+    what LangGraph checkpoints, and a live browser session cannot be written
+    to Postgres.
     """
-    from langgraph.graph import END, START, StateGraph
-    from langgraph.types import interrupt
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+    from langchain_core.tools import StructuredTool, ToolException
 
-    graph = StateGraph(AuthorState)
+    from .middleware import AuthorGraphState, BudgetMiddleware, FinishMiddleware
 
-    # Every node is wrapped so that a budget stop ends the session cleanly
-    # rather than propagating as an exception through the graph. A limit
-    # reached is an outcome, not a failure, and the trajectory is still worth
-    # keeping -- often it is a complete recording.
-    def guarded(func):
-        async def node(state: AuthorState) -> AuthorState:
-            # No early return on `done`. The conditional edges already route a
-            # finished session to `finish`, and skipping a node because the
-            # session is over would skip `finish` itself -- which is the node
-            # that says it is over.
-            try:
-                state = await func(state, w)
-            except BudgetExhausted as exc:
-                log.info(
-                    "agent session stopped by budget",
-                    extra={"run_id": w.request.run_id, "limit": exc.limit},
-                )
-                state = await stop_for_budget(state, exc, w)
-            # One place the spend is copied into the checkpoint, rather than
-            # the end of every node, where the next node added would forget.
-            return _mirror(state, w)
+    async def _unreachable_finish(**kwargs: Any) -> str:
+        # `FinishMiddleware.aafter_model` answers every `finish` call itself
+        # -- either by ending the graph or by injecting a refusal -- and
+        # strips it from the AI message either way, so the tool node never
+        # actually dispatches this. It still has to exist: the model is shown
+        # its schema, and a tool offered but never registered is a harder
+        # bug to explain than a coroutine that is never called.
+        raise ToolException("finish is answered by the graph, not dispatched.")
 
-        node.__name__ = func.__name__
-        return node
-
-    async def approve(state: AuthorState) -> AuthorState:
-        """Stop, and wait for a person.
-
-        `interrupt` suspends the graph and persists the state. Resuming with a
-        `Command(resume=...)` returns that value *from this call* -- so the
-        code below reads as though the human answered inline, which is what
-        makes the rendezvous survivable across a restart.
-        """
-        question = await ask(state, w)
-        decision = interrupt(question)
-        answer = decision if isinstance(decision, str) else str(
-            (decision or {}).get("decision", "rejected")
-        )
-        return _mirror(await resolve(state, answer, w, question["approval_id"]), w)
-
-    graph.add_node("load_context", guarded(load_context))
-    graph.add_node("plan", guarded(plan))
-    graph.add_node("decide", guarded(decide))
-    graph.add_node("approve", approve)
-    graph.add_node("act", guarded(act))
-    graph.add_node("finish", guarded(finish))
-
-    graph.add_edge(START, "load_context")
-    graph.add_edge("load_context", "plan")
-    graph.add_edge("plan", "decide")
-
-    async def after_decide(state: AuthorState) -> str:
-        if state.get("done"):
-            return "finish"
-        if state.get("pending") is None:
-            # The model produced prose and was nudged. Go round again rather
-            # than ending: said once this is harmless.
-            return "decide"
-        return "approve" if await needs_approval(state, w) else "act"
-
-    graph.add_conditional_edges(
-        "decide", after_decide,
-        {"approve": "approve", "act": "act", "decide": "decide", "finish": "finish"},
+    finish_def = TOOLS["finish"]
+    finish_tool = StructuredTool(
+        name=finish_def.name,
+        description=finish_def.description,
+        args_schema=finish_def.input_schema,
+        coroutine=_unreachable_finish,
+        handle_tool_error=True,
     )
-    graph.add_conditional_edges(
-        "approve", lambda state: "finish" if state.get("done") else "decide",
-        {"decide": "decide", "finish": "finish"},
-    )
-    graph.add_conditional_edges(
-        "act", lambda state: "finish" if state.get("done") else "decide",
-        {"decide": "decide", "finish": "finish"},
-    )
-    graph.add_edge("finish", END)
+    tools = [*as_langchain_tools(w), finish_tool]
 
-    return graph.compile(checkpointer=checkpointer)
+    def needs_approval(request: Any) -> bool:
+        """The same question `guard()` already answers for the deterministic
+        dispatch path -- decided from the call's own arguments, not asked of
+        the model."""
+        name, args = request.tool_call["name"], request.tool_call["args"]
+        return guard(name, args, w.tools.context()).needs_approval
+
+    interrupt_on = {
+        spec.name: {"allowed_decisions": ["approve", "reject"], "when": needs_approval}
+        for spec in w.tools.tools
+    }
+
+    return create_agent(
+        model=w.llm.raw,
+        tools=tools,
+        system_prompt=system_prompt(w.request),
+        middleware=[
+            BudgetMiddleware(w.spend, model_name=w.llm.model),
+            FinishMiddleware(w.tools),
+            HumanInTheLoopMiddleware(interrupt_on=interrupt_on),
+        ],
+        state_schema=AuthorGraphState,
+        checkpointer=checkpointer,
+    )
 
 
 def memory_checkpointer():
@@ -167,4 +118,4 @@ def memory_checkpointer():
     return InMemorySaver()
 
 
-__all__ = ["NODES", "available", "build", "memory_checkpointer"]
+__all__ = ["available", "build", "memory_checkpointer"]

@@ -217,6 +217,21 @@ def _steps(
             )
             continue
         steps.append(step)
+        if call.match_count != 1:
+            # The click itself ran fine -- a ref is position-specific, so it is
+            # never ambiguous -- but the *durable* locator distilled from it
+            # (role/name, no ref) already matched more than one element on the
+            # very page it was recorded from. A replay hitting the same page
+            # will refuse to guess which one was meant, correctly; the warning
+            # exists so that is found on the review screen, not days later in
+            # a failed batch.
+            warnings.append(
+                f"Step {step.id} ({step.action} {step.description!r}) matched "
+                f"{call.match_count} elements when it was recorded, not one. "
+                "A replay will refuse to guess which one was meant. Point at "
+                "something more specific -- inside the right row or card -- "
+                "and re-record this step."
+            )
     return steps
 
 

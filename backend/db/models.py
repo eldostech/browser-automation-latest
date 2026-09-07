@@ -515,6 +515,39 @@ class Credential(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class AgentToolServer(Base):
+    """One MCP server a recording agent may reach for, beside its browser.
+
+    Registered per workspace, the same tenancy shape as ``Credential``: two
+    workspaces may both register a server named "crm". ``connection`` holds
+    whatever ``transport`` needs to open it -- today only stdio's
+    ``{"command", "args", "env"}`` -- kept as JSONB rather than columns so an
+    ``"sse"``/``"http"`` transport can be added later without a migration.
+    Its tools never become a replay step; see ``agent/tools.py``'s
+    ``DISTILS_TO``, which only ever names Playwright's own tool names.
+    """
+
+    __tablename__ = "agent_tool_servers"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "name", name="uq_agent_tool_servers_workspace_id_name"
+        ),
+    )
+
+    id: Mapped[str] = id_column()
+    workspace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    owner_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    transport: Mapped[str] = mapped_column(String(20), nullable=False, default="stdio")
+    connection: Mapped[dict] = _json_column(default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = created_at_column()
+
+
 # ---------------------------------------------------------------------------
 # Batches and executions
 # ---------------------------------------------------------------------------

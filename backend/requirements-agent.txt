@@ -24,7 +24,7 @@
 # You also need Node 18 or newer on PATH. The browser tools are
 # `npx @playwright/mcp`, pinned by AGENT_MCP_VERSION -- pinned for the same
 # reason `playwright` is pinned in requirements.txt: that server's tool names
-# and argument shapes are the contract backend/agent/tools.py is written
+# and argument shapes are the contract backend/agent/tools/ is written
 # against, and `@latest` would let a release change them inside somebody's
 # session rather than in CI.
 # ---------------------------------------------------------------------------
@@ -46,4 +46,19 @@ mcp>=1.2,<2
 # agent finds the way and the engine repeats it, rather than the agent being
 # the only way to run anything.
 langgraph>=0.2,<2
-langgraph-checkpoint-postgres>=2.0,<3
+
+# `create_agent` and its middleware system -- what the authoring loop is built
+# on now instead of a hand-rolled StateGraph. Requires langgraph>=1.2.11,
+# still inside the pin above; verified in isolation before anything using it
+# was written, because a version bump changing checkpointer or interrupt
+# behaviour out from under the already-hardened graph code is a different
+# problem than the migration itself.
+langchain>=1.4,<2
+
+# langgraph 1.2.11 (what the line above pulls in) needs langgraph-checkpoint
+# >=4.1.0, which no 2.x release of this package supports -- only 3.x does.
+# Found by installing into a scratch venv first rather than guessed: the old
+# <3 pin here, not langchain itself, was what made this unresolvable.
+# Unused today (nothing in this codebase passes a checkpointer other than the
+# in-memory one), so the bump has no runtime effect yet.
+langgraph-checkpoint-postgres>=3.1,<4

@@ -232,5 +232,88 @@ async def _ignore(event):
     return None
 
 
+#: Signing out returns to the *same* login form -- deliberately, because that
+#: is the exact shape of the real session that motivated this test: the model
+#: reached "task is complete" in its own words, took one more look, saw a
+#: sign-in page, and re-ran the entire task a second time believing it had
+#: not started. Nothing distinguishes this from a real login page except that
+#: the task itself just walked through it.
+SIGN_OUT_LOOP_PAGE = (
+    "data:text/html,"
+    "<div id='login'><h1>Sign in</h1><label>Code "
+    "<input id='code'></label>"
+    "<button onclick=\"if(document.getElementById('code').value==='"
+    "Live-Bedrock-Check-9f3'){"
+    "document.getElementById('login').style.display='none';"
+    "document.getElementById('home').style.display='block';}\">Sign in</button></div>"
+    "<div id='home' style='display:none'><h1>Home</h1><p>Signed in.</p>"
+    "<button onclick=\""
+    "document.getElementById('home').style.display='none';"
+    "document.getElementById('login').style.display='block';"
+    "document.getElementById('code').value='';\">Sign out</button></div>"
+)
+
+
+async def test_a_real_model_stops_after_signing_out_instead_of_signing_in_again():
+    """The second bug a real session hit: told to sign in, do one thing, and
+    sign out, the model narrated "the task is complete" but never called
+    `finish` -- then, seeing the login page its own sign-out click produced,
+    signed in again and repeated the whole task from scratch.
+
+    This proves the strengthened "When to stop" prompt actually changes that:
+    a real model, given the same trap, calls `finish` at most once and does
+    not type the credential a second time.
+    """
+    from config import Settings
+    from llm import build_llm
+
+    result = await run_agent_session(
+        AuthorRequest(
+            task=(
+                "Sign in using the credential provided. Once the Home page "
+                "appears, mark_setup_complete, then begin_row for 'A-1', "
+                "end_row, sign out, and finish. Do not sign in again after "
+                "you sign out -- signing out is the last step, not a "
+                "problem to fix."
+            ),
+            start_url=SIGN_OUT_LOOP_PAGE,
+            allowed_domains=("data",),
+            secrets=("login",),
+            may_write=True,
+            budget=Budget(steps=20, tokens=200_000, seconds=180, usd=0.70),
+        ),
+        llm=build_llm(Settings()),
+        provider=LocalPlaywrightMCP(headless=True),
+        emit=_ignore,
+        secrets={"login": REAL_SECRET},
+        replay=_ok,
+        name="Sign in and out",
+    )
+
+    print(f"\nspent: {result.spend}")
+    print(f"status: {result.status} — {result.summary or result.stopped_by}")
+    for call in result.trajectory:
+        print(f"  {call['tool']:24} {call.get('detail','')[:80]!r}")
+
+    typed_credential = [
+        call for call in result.trajectory
+        if call["tool"] == "browser_type" and "code" in str(call.get("detail", "")).lower()
+    ]
+
+    # `finish` itself never appears in the trajectory -- it is answered by the
+    # graph, not dispatched through the browser -- so the way to tell the
+    # model actually called it, rather than being cut off by the budget, is
+    # that nothing here blames a limit for the ending.
+    assert result.status in {"succeeded", "partial"}, result.stopped_by
+    assert result.stopped_by == "", (
+        "the session ran out of budget instead of the model calling finish "
+        "on its own -- likely because it was still redoing the task"
+    )
+    assert len(typed_credential) <= 1, (
+        "the model signed in a second time after signing out -- the exact "
+        "loop this prompt change exists to stop"
+    )
+
+
 async def _ok(use_case, inputs, secrets):
     return Verification(ran=True, ok=True)

@@ -209,6 +209,42 @@ class CredentialRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Agent tool servers
+# ---------------------------------------------------------------------------
+
+
+class StdioConnection(BaseModel):
+    """What it takes to open one stdio MCP server.
+
+    Its own model rather than a bare dict, so a malformed registration is
+    refused at the boundary rather than surfacing as a subprocess that will
+    not start, three steps into an agent session nobody can debug from there.
+    """
+
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class ToolServerRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    #: Only stdio exists today; the field exists so an sse/http server later
+    #: is a new value here rather than a new endpoint.
+    transport: Literal["stdio"] = "stdio"
+    connection: StdioConnection
+    enabled: bool = True
+
+
+class ToolServerPreviewRequest(BaseModel):
+    """Same shape as registering one, but nothing is saved -- see the
+    ``/preview`` route: this is what a person answers *before* deciding
+    whether a server is worth registering at all."""
+
+    transport: Literal["stdio"] = "stdio"
+    connection: StdioConnection
+
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 

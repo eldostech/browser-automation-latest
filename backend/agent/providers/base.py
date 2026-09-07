@@ -1,4 +1,5 @@
-"""Where the agent's browser comes from.
+"""The protocol every browser/MCP connection speaks, and the bootstrapping
+every stdio-based one shares.
 
 The agent drives a browser over Playwright MCP; the replay engine drives
 Playwright directly. That looks like a contradiction and is not: they are
@@ -44,9 +45,9 @@ log = logging.getLogger(__name__)
 #: a ref that has just appeared is exactly the one the next call needs.
 REF_IN_SNAPSHOT = re.compile(r"\[ref=(e\d+)\]")
 
-#: What a valid ``target`` looks like. See ``tools.py`` -- the fact that the
-#: server also accepts a raw CSS selector here is the thing the guard exists to
-#: take back.
+#: What a valid ``target`` looks like. See ``guardrails/guard.py`` -- the fact
+#: that the server also accepts a raw CSS selector here is the thing the guard
+#: exists to take back.
 REF_FORMAT = re.compile(r"^e\d+$")
 
 
@@ -57,6 +58,14 @@ class ToolSpec:
     name: str
     description: str
     input_schema: dict[str, Any] = field(default_factory=dict)
+    #: The MCP protocol's own tool annotations (``readOnlyHint``,
+    #: ``destructiveHint``, ...), where the server bothers to declare them.
+    #: Playwright MCP does not, and that is fine -- browser tools are
+    #: classified by name in ``guardrails/catalog.py`` regardless. This is
+    #: what a tool from some *other* server is classified from instead, since
+    #: this codebase has no hand-written knowledge of what that server's
+    #: tools do.
+    annotations: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -150,89 +159,60 @@ def _npx_path() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# The local provider
+# Shared stdio bootstrapping -- every concrete provider is a command to run
 # ---------------------------------------------------------------------------
 
 
-class LocalPlaywrightMCP:
-    """`npx @playwright/mcp` over stdio, owning its own Chromium.
-
-    ``--isolated`` keeps the profile in memory. A batch that signed in as one
-    tenant must not leave a cookie behind for the next one, and a profile on
-    disk is exactly how that happens.
-
-    The version is pinned for the same reason ``playwright`` is pinned in
-    ``requirements.txt``: this server's tool names and argument shapes are the
-    contract the tool registry is written against, and ``@latest`` would let a
-    release change them inside somebody's batch rather than in CI.
+async def _open_stdio(
+    command: str, args: list[str], env: dict[str, str] | None
+) -> tuple[Any, "_RealMCPSession"]:
+    """Bring up one stdio MCP server. Shared because the only thing that
+    differs between the browser and any other server is what gets spawned --
+    the three calls that bring a client session up are the same either way.
     """
+    from contextlib import AsyncExitStack
 
-    #: Bumping this is a deliberate act. `tools.py` is written against it.
-    VERSION = "0.0.80"
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
 
-    def __init__(
-        self,
-        *,
-        headless: bool = True,
-        version: str | None = None,
-        cdp_endpoint: str = "",
-        extra_args: tuple[str, ...] = (),
-    ) -> None:
-        self.headless = headless
-        self.version = version or self.VERSION
-        #: When set, attach to a browser somebody else runs rather than launch
-        #: one. This is the AgentCore path, and it is a flag rather than a
-        #: subclass because it is genuinely the only difference.
-        self.cdp_endpoint = cdp_endpoint
-        self.extra_args = extra_args
-        self._stack: Any = None
-        self._session: Any = None
+    stack = AsyncExitStack()
+    read, write = await stack.enter_async_context(
+        stdio_client(StdioServerParameters(command=command, args=args, env=env))
+    )
+    session = await stack.enter_async_context(ClientSession(read, write))
+    await session.initialize()
+    return stack, _RealMCPSession(session)
 
-    def argv(self) -> list[str]:
-        args = [f"@playwright/mcp@{self.version}", "--isolated"]
-        if self.cdp_endpoint:
-            args += ["--cdp-endpoint", self.cdp_endpoint]
-        elif self.headless:
-            args.append("--headless")
-        args.extend(self.extra_args)
-        return args
 
-    async def open(self) -> MCPSession:
-        availability = local_availability()
-        if not availability.available:
-            raise RuntimeError(availability.reason)
+async def _close_stack(stack: Any, *, what: str) -> None:
+    if stack is None:
+        return
+    # A server that has already died makes teardown raise, and a failure to
+    # close a subprocess must not be what a caller sees instead of whatever
+    # actually went wrong.
+    try:
+        await stack.aclose()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mcp server did not close cleanly", extra={"server_name": what, "error": str(exc)})
 
-        from contextlib import AsyncExitStack
 
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+def _annotations_of(tool: Any) -> dict[str, bool]:
+    """The MCP protocol's optional tool annotations, off the SDK's object.
 
-        npx = _npx_path()
-        assert npx is not None  # local_availability() just checked
-
-        self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(
-            stdio_client(StdioServerParameters(command=npx, args=["-y", *self.argv()]))
-        )
-        session = await self._stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        self._session = _RealMCPSession(session)
-        log.info(
-            "playwright mcp started",
-            extra={"version": self.version, "cdp": bool(self.cdp_endpoint)},
-        )
-        return self._session
-
-    async def close(self) -> None:
-        stack, self._stack, self._session = self._stack, None, None
-        if stack is not None:
-            # A server that has already died makes teardown raise, and a
-            # failure to close a subprocess must not be what a caller sees
-            # instead of whatever actually went wrong.
-            try:
-                await stack.aclose()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("mcp server did not close cleanly", extra={"error": str(exc)})
+    Most servers do not declare these -- the spec calls them hints, not a
+    guarantee -- so a missing key means "unknown", never "safe". See
+    ``guardrails/catalog.py``'s classification for a tool that did not come
+    from the browser, which is the thing that reads these.
+    """
+    raw = getattr(tool, "annotations", None)
+    if raw is None:
+        return {}
+    out: dict[str, bool] = {}
+    for key in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+        value = getattr(raw, key, None)
+        if isinstance(value, bool):
+            out[key] = value
+    return out
 
 
 class _RealMCPSession:
@@ -248,6 +228,7 @@ class _RealMCPSession:
                 name=tool.name,
                 description=tool.description or "",
                 input_schema=dict(tool.inputSchema or {}),
+                annotations=_annotations_of(tool),
             )
             for tool in listing.tools
         ]
@@ -267,7 +248,6 @@ class _RealMCPSession:
 __all__ = [
     "Availability",
     "BrowserProvider",
-    "LocalPlaywrightMCP",
     "MCPSession",
     "REF_FORMAT",
     "REF_IN_SNAPSHOT",

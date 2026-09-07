@@ -157,6 +157,49 @@ async def test_every_row_belongs_to_a_workspace(root_store):
     )
 
 
+# --- agent tool servers -----------------------------------------------------
+
+
+async def test_a_tool_server_is_only_visible_to_its_own_workspace(root_store):
+    """Two workspaces may both register a server called "crm" -- the same
+    property `save_credential` already guarantees, and for the same reason."""
+    a = root_store.workspace(await root_store.ensure_workspace("A", "tenant-a"))
+    b = root_store.workspace(await root_store.ensure_workspace("B", "tenant-b"))
+
+    await a.save_tool_server("s1", "crm", "stdio", {"command": "crm-mcp"})
+    await b.save_tool_server("s2", "crm", "stdio", {"command": "other-mcp"})
+
+    a_rows = await a.list_tool_servers()
+    b_rows = await b.list_tool_servers()
+
+    assert [r["name"] for r in a_rows] == ["crm"]
+    assert a_rows[0]["connection"]["command"] == "crm-mcp"
+    assert [r["name"] for r in b_rows] == ["crm"]
+    assert b_rows[0]["connection"]["command"] == "other-mcp"
+
+    # Cross-tenant delete must fail rather than succeed on the wrong row.
+    assert await a.delete_tool_server("s2") is False
+    assert [r["name"] for r in (await b.list_tool_servers())] == ["crm"]
+
+
+async def test_saving_the_same_name_twice_replaces_it(store):
+    await store.save_tool_server("s1", "crm", "stdio", {"command": "old"})
+    await store.save_tool_server("s1", "crm", "stdio", {"command": "new"}, enabled=False)
+
+    rows = await store.list_tool_servers()
+    assert len(rows) == 1
+    assert rows[0]["connection"]["command"] == "new"
+    assert rows[0]["enabled"] is False
+
+
+async def test_disabled_servers_are_excluded_when_asked(store):
+    await store.save_tool_server("s1", "on", "stdio", {"command": "a"}, enabled=True)
+    await store.save_tool_server("s2", "off", "stdio", {"command": "b"}, enabled=False)
+
+    assert {r["name"] for r in await store.list_tool_servers()} == {"on", "off"}
+    assert {r["name"] for r in await store.list_tool_servers(enabled_only=True)} == {"on"}
+
+
 async def test_the_migrations_reproduce_the_models(db_settings):
     """Applying every migration to an empty schema yields exactly the models.
 
