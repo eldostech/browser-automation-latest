@@ -122,6 +122,11 @@ class OperateState(TypedDict, total=False):
     messages: list[dict[str, Any]]
     #: What the recovery said it did, for the run trail.
     notes: list[str]
+    #: The previous attempt's reasoning and last action, however it ended --
+    #: not just the ones that counted as a `notes`-worthy result. A second
+    #: rescue opens with this rather than a blank page, so it does not spend a
+    #: full turn re-deriving what the first attempt already worked out.
+    last_summary: str
 
 
 def initial_state(inputs: dict[str, Any] | None = None) -> OperateState:
@@ -135,6 +140,7 @@ def initial_state(inputs: dict[str, Any] | None = None) -> OperateState:
         attempts=0,
         messages=[],
         notes=[],
+        last_summary="",
     )
 
 
@@ -211,7 +217,8 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
     rescuing is a use case that needs re-recording, and the alternative is
     paying for that discovery once per row across a whole batch.
     """
-    state["attempts"] = state.get("attempts", 0) + 1
+    attempt = state.get("attempts", 0) + 1
+    state["attempts"] = attempt
     await w.emit(
         Thinking(
             run_id=w.run_id,
@@ -225,6 +232,25 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
         )
     )
 
+    prior = state.get("last_summary") or ""
+    opening = "Take a snapshot and decide what is in the way."
+    if attempt > 1 and prior:
+        # A fresh `agent_loop` starts every attempt with an empty transcript
+        # -- see its own docstring for why one implementation serves both
+        # recovery and explore. Without this, that emptiness meant a second
+        # rescue re-ran the *entire* first turn (a snapshot, the same
+        # diagnosis, the same action) for no new information, because it had
+        # no way to know any of that had already happened.
+        opening = (
+            f"This is rescue attempt {attempt} of {w.max_attempts} on this row. "
+            f"Attempt {attempt - 1} did not clear the way. {prior} Do not repeat "
+            "whatever it just tried -- if the last action failed for a reason "
+            "that will not change (an element that still will not resolve to "
+            "exactly one match, say), try a genuinely different approach, or "
+            "call give_up with that reason rather than spending another turn "
+            "confirming it again."
+        )
+
     ending = await agent_loop(
         w,
         system=render(
@@ -233,10 +259,11 @@ async def recover(state: OperateState, w: OperateWiring) -> OperateState:
             error=state.get("error") or "(no reason recorded)",
             allowed_domains=", ".join(w.allowed_domains) or "(nothing configured)",
         ),
-        opening="Take a snapshot and decide what is in the way.",
+        opening=opening,
         terminals=RECOVERY_TOOLS,
         step=state.get("start_at", 0),
     )
+    state["last_summary"] = ending.summary
 
     if ending.tool == RESUME:
         note = str(ending.arguments.get("note") or "cleared the way")
@@ -272,6 +299,21 @@ class Ending:
     #: way. Not a success and not a refusal -- a third thing, and one that must
     #: not be mistaken for the page being ready.
     exhausted: bool = False
+    #: What this attempt actually did, in a couple of lines -- its last
+    #: reasoning and its last tool call, whichever way it ended. Carried
+    #: forward into the next attempt's opening message (see `recover`), so a
+    #: second rescue does not re-derive a diagnosis the first one already
+    #: reached, and does not retry the exact action that just failed.
+    summary: str = ""
+
+
+def _summary_of(last_thought: str, last_action: str) -> str:
+    parts = []
+    if last_thought:
+        parts.append(f"Its reasoning: {last_thought[:400]}")
+    if last_action:
+        parts.append(last_action)
+    return " ".join(parts)
 
 
 async def agent_loop(
@@ -293,18 +335,25 @@ async def agent_loop(
     """
     messages: list[dict[str, Any]] = [{"role": "user", "content": opening}]
     schemas = _schemas(w, terminals)
+    last_thought = ""
+    last_action = ""
 
     for _ in range(max_actions if max_actions is not None else w.max_actions):
         try:
             w.spend.check()
         except BudgetExhausted as exc:
-            return Ending(tool=GIVE_UP, arguments={"reason": str(exc)})
+            return Ending(
+                tool=GIVE_UP,
+                arguments={"reason": str(exc)},
+                summary=_summary_of(last_thought, last_action),
+            )
 
         turn = await w.llm.run_turn(
             system=system, messages=for_model(messages), tools=schemas
         )
         w.spend.turn(turn.usage, w.llm.model)
         if turn.text.strip():
+            last_thought = turn.text.strip()
             await w.emit(
                 Thinking(
                     run_id=w.run_id, seq=0, step=step, text=turn.text.strip(), done=True
@@ -330,7 +379,11 @@ async def agent_loop(
 
         call = turn.tool_calls[0]
         if call.name in terminals:
-            return Ending(tool=call.name, arguments=dict(call.input))
+            return Ending(
+                tool=call.name,
+                arguments=dict(call.input),
+                summary=_summary_of(last_thought, last_action),
+            )
 
         if call.name == RECORD and w.on_record is not None:
             # Ours, and it never reaches the browser. Answered inline so a
@@ -371,6 +424,10 @@ async def agent_loop(
                 ok=not result.is_error, duration_ms=0, text=result.text[:2000],
             )
         )
+        last_action = (
+            f"{call.name} {'failed' if result.is_error else 'succeeded'}: "
+            f"{result.text[:300]}"
+        )
         messages.append(
             {
                 "role": "user",
@@ -385,7 +442,7 @@ async def agent_loop(
             }
         )
 
-    return Ending(exhausted=True)
+    return Ending(exhausted=True, summary=_summary_of(last_thought, last_action))
 
 
 async def explore(state: OperateState, w: OperateWiring) -> OperateState:
@@ -500,7 +557,67 @@ async def learn(state: OperateState, w: OperateWiring) -> OperateState:
                 recoverable=True,
             )
         )
+
+    # Recover only, not explore: a repair proposal is a `step_id` and a
+    # locator fix, and an Explore-mode use case has no recorded steps for
+    # either to name -- `apply_fixes` would just skip every fix it got back
+    # as unknown, after paying for the call that produced them.
+    if w.result is not None and not w.result.ok and state.get("attempts", 0) > 0:
+        w.result.repair_proposal = await _propose_repair(state, w)
+
     return state
+
+
+async def _propose_repair(state: OperateState, w: OperateWiring) -> Any:
+    """One more, budgeted attempt: the same diagnosis "Fix it with AI"
+    produces by hand, run automatically the moment a row could not be
+    rescued, while the page that broke it is still the one in front of us.
+
+    Deliberately does not apply anything -- `agent/operate.py` has no store,
+    the same reason `engine.py` cannot import `llm`, and even if it did,
+    `repair.py`'s own rule holds here too: nothing this proposes should reach
+    a use case unreviewed. This only hands the caller (`runner.py`, which has
+    the store) enough to turn into a ready-to-review draft, or discard.
+
+    Every failure mode here -- no page captured, the model declined, the
+    budget is spent, anything unexpected -- returns ``None`` rather than
+    raising: a row that could not be rescued is already failing with a clear
+    reason, and a bug in this bonus attempt must never make that worse.
+    """
+    if w.usecase is None:
+        return None
+    snapshot = getattr(w.tools.provider, "snapshot", None)
+    if snapshot is None:
+        return None
+    try:
+        w.spend.check()
+    except BudgetExhausted:
+        return None
+
+    from repair import FailureContext, PendingRepair, RepairError, UseCaseDoctor
+
+    context = FailureContext(
+        usecase=w.usecase,
+        failed_step_id=state.get("failed_step_id") or None,
+        error=state.get("error") or "",
+        snapshot=snapshot,
+        page_url=getattr(snapshot, "page_url", None),
+        inputs=w.inputs,
+        reached_a_step=bool(state.get("failed_step_id")),
+    )
+    try:
+        proposal = await UseCaseDoctor(w.llm).diagnose(context)
+    except RepairError:
+        return None
+    except Exception:  # noqa: BLE001 - a bonus attempt must not break the row
+        log.exception("automatic repair proposal failed", extra={"run_id": w.run_id})
+        return None
+
+    if proposal.usage:
+        w.spend.turn(proposal.usage, w.llm.model)
+    if not proposal.actionable:
+        return None
+    return PendingRepair(proposal=proposal, snapshot=snapshot)
 
 
 def _schemas(
@@ -671,6 +788,16 @@ async def run_row_with_agent(
     result = wiring.result
     if result is not None and not result.ok and final.get("error"):
         result.error = final["error"]
+    if result is not None:
+        # `replay()` sets `wiring.result` from the engine's own RowResult on
+        # every pass, including the one right after `recover()` spent real
+        # tokens -- so without this, a rescued row reports the recovery as
+        # free. `explore()` already threads its own spend through in
+        # `_as_row_result`; this is the same fix for the replay/recover path,
+        # done once here instead of in both nodes.
+        result.llm_calls = wiring.spend.llm_calls
+        result.llm_tokens = wiring.spend.tokens
+        result.llm_usd = wiring.spend.usd
     return result
 
 

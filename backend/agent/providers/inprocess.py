@@ -150,6 +150,17 @@ class EngineBrowser:
         self.executor = executor
         self._snapshot: Snapshot | None = None
 
+    @property
+    def snapshot(self) -> "Snapshot | None":
+        """The last page this session actually looked at, if any.
+
+        Read-only on purpose: this exists so a caller that gave up (a
+        recovery that could not clear the way, say) can hand the page it was
+        looking at to something else -- a repair proposal -- without that
+        caller reaching into a private attribute across a module boundary.
+        """
+        return self._snapshot
+
     # -- as a provider ------------------------------------------------------
     async def open(self) -> "EngineBrowser":
         return self

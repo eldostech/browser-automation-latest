@@ -103,6 +103,40 @@ def test_three_identical_rows_are_reported_as_ambiguous_now():
     assert "matches 3 elements" in described.as_text()
 
 
+def test_the_first_of_several_identical_matches_stays_honestly_unresolved():
+    """`nth=0` is how the schema spells "no position given" -- deliberately,
+    so an ambiguous rung with no explicit nth keeps refusing rather than
+    silently acting on whichever element happens to load first. That means
+    the ref that IS the first match cannot record its own position; this
+    checks the message says so rather than claiming a fix it cannot make.
+    """
+    described = describe_element(snap(LIST), "e2")
+
+    assert described.ladder[0].nth == 0, "e2 is the first of the three"
+    text = described.as_text()
+    assert "cannot tell apart" in text
+    assert "first" in text
+
+
+def test_the_second_and_third_of_identical_rows_get_a_usable_position():
+    """These *do* get fixed: `nth` can address the 2nd match onward, so a ref
+    that is not the first of its group now resolves instead of refusing."""
+    second = describe_element(snap(LIST), "e3")
+    assert second.ladder[0].nth == 1
+    text = second.as_text()
+    assert "2nd of them" in text
+    assert "Acting on it is fine now" in text
+
+    third = describe_element(snap(LIST), "e4")
+    assert third.ladder[0].nth == 2
+    assert "3rd of them" in third.as_text()
+
+
+def test_the_second_and_third_of_identical_rows_get_their_own_position():
+    assert describe_element(snap(LIST), "e3").ladder[0].nth == 1
+    assert describe_element(snap(LIST), "e4").ladder[0].nth == 2
+
+
 def test_a_ref_the_page_is_not_showing_describes_nothing():
     described = describe_element(snap(INVITE), "e99")
 

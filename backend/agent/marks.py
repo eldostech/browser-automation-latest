@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from snapshot import Node, Snapshot
+from snapshot import Node, Snapshot, count_matches, index_among, ordinal_suffix
 
 # Imported for the shape of what we produce. `usecase` is a schema module with
 # no I/O, so this does not couple the agent to the application.
@@ -116,11 +116,32 @@ class Described:
         if not self.ladder:
             return f"{self.ref} is not on the page as it now stands."
         lines = [f"{self.ref} is {self.describe_first()}"]
-        if self.ambiguous:
+        if self.ambiguous and self.ladder[0].nth > 0:
+            position = self.ladder[0].nth + 1
             lines.append(
-                f"WARNING: that matches {self.matches} elements, so a recorded "
-                "step could act on the wrong one. Point at something more "
-                "specific, or accept that this step will need a person."
+                f"NOTE: role and name alone match {self.matches} elements; this "
+                f"is specifically the {position}{ordinal_suffix(position)} of "
+                "them, by page position, which is why the locator carries "
+                "[nth]. Acting on it is fine now. Recording it that way is not: "
+                "position can change between runs, so a step that leans on this "
+                "repeatedly should be re-recorded with something that names the "
+                "element itself, not where it happens to sit."
+            )
+        elif self.ambiguous:
+            # This ref IS the first of the matches, and `nth=0` is exactly
+            # what an *unresolved* ambiguity also looks like -- the ladder
+            # format has no way to say "the first one, specifically" apart
+            # from "no position given at all", so recording this rung would
+            # still be refused at replay for the same reason it always was.
+            # A live click on this exact ref, right now, is unaffected.
+            lines.append(
+                f"WARNING: that matches {self.matches} elements, and this "
+                "happens to be the first -- which this locator format cannot "
+                "tell apart from 'no position specified'. Acting on this ref "
+                "directly is fine; recording this rung is not, it would "
+                "still be refused. Point at a later one of the matches if "
+                "the recording needs to name a position, or name the "
+                "element some other way."
             )
         elif self.shadowed_by:
             others = ", ".join(repr(name) for name in self.shadowed_by)
@@ -137,16 +158,47 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
     The ladder is built the way the codegen parser builds one: a semantic rung
     first, and a text rung behind it that costs nothing and survives a redesign
     keeping a control's wording while changing its role.
+
+    When the semantic rung is ambiguous -- several elements share the same
+    role and name, a repeated card or table row being the usual cause -- a ref
+    still names exactly one of them. ``nth`` carries that: the position of
+    *this* ref among the matches, so a specific choice (a person's click, a
+    model's reasoned pick) survives into the ladder instead of being thrown
+    away in favour of a rung the engine will refuse to act on. This is not a
+    guess bolted on here -- ``Locator.nth`` and its use in the executor's
+    resolver already exist for exactly this ("the recorded nth is how a
+    recording says which one it meant"); nothing upstream of this function
+    ever populated it. Positional, so it stays only as durable as the page's
+    own ordering -- honest about that in ``Described.as_text()`` below, and a
+    step that leans on it repeatedly is one to re-record rather than rescue
+    forever.
+
+    One gap this does not close: ``Locator.nth`` is a plain ``int`` defaulting
+    to 0, and ``engine.py``'s resolver reads 0 as "no position given" (deliberately --
+    an ambiguous rung with no nth must keep refusing, or every existing use
+    case with no nth chosen would start silently acting on whichever element
+    came first). So when the ref happens to be the *first* of the matches,
+    this cannot record that fact; the ladder comes back exactly as ambiguous
+    as it would have before this function existed. Real for the 2nd match
+    onward, not for the 1st -- see the corresponding branch in
+    ``Described.as_text()``.
     """
     node = snapshot.get(ref)
     if node is None:
         return Described(ref=ref, role="", name="", matches=0)
 
     exact = _needs_exact(snapshot, node)
+    matches = count_matches(snapshot, node, exact)
     ladder: list[Locator] = []
     if node.role:
         ladder.append(
-            Locator(strategy="role", role=node.role, name=node.name or None, exact=exact)
+            Locator(
+                strategy="role",
+                role=node.role,
+                name=node.name or None,
+                exact=exact,
+                nth=index_among(snapshot, node, exact) if matches > 1 else 0,
+            )
         )
     if node.name:
         ladder.append(Locator(strategy="text", text=node.name, exact=exact))
@@ -160,7 +212,7 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
         role=node.role,
         name=node.name,
         ladder=ladder,
-        matches=_count(snapshot, node, exact),
+        matches=matches,
         shadowed_by=_shadowing(snapshot, node),
     )
 
@@ -194,22 +246,9 @@ def _shadowing(snapshot: Snapshot, node: Node) -> tuple[str, ...]:
     )
 
 
-def _count(snapshot: Snapshot, node: Node, exact: bool) -> int:
-    """How many elements the leading rung would match on this page."""
-    if not node.name:
-        return sum(1 for other in snapshot if other.role == node.role)
-    wanted = node.name.casefold()
-    if exact:
-        return sum(
-            1
-            for other in snapshot
-            if other.role == node.role and (other.name or "").casefold() == wanted
-        )
-    return sum(
-        1
-        for other in snapshot
-        if other.role == node.role and wanted in (other.name or "").casefold()
-    )
+# `count_matches` / `index_among` live in `snapshot.py` now -- they operate
+# purely on `Node`/`Snapshot` and `repair.py` needs them too, without taking a
+# dependency on this (optional-extra) package. See snapshot.py.
 
 
 # ---------------------------------------------------------------------------

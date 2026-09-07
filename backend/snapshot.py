@@ -102,6 +102,54 @@ class Node:
         return f'{self.role} "{self.name}"' if self.name else self.role
 
 
+def ordinal_suffix(n: int) -> str:
+    """'st'/'nd'/'rd'/'th', for a message a person actually reads."""
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def same_rung(node: Node, other: Node, exact: bool) -> bool:
+    """Whether ``other`` is one of the elements a role[+name] rung for
+    ``node`` would match -- the same test the executor's own ladder resolver
+    applies at replay time (role equal; name equal if ``exact``, a substring
+    otherwise; unnamed matches by role alone).
+
+    The one predicate both :func:`count_matches` and :func:`index_among`
+    filter by, so "how many match" and "which position a specific one holds
+    among them" cannot drift apart from being written twice -- and the one
+    place both `agent/marks.py`'s recording/recovery path and `repair.py`'s
+    post-mortem path share, so they cannot drift from *each other* either.
+    """
+    if other.role != node.role:
+        return False
+    if not node.name:
+        return True
+    wanted = node.name.casefold()
+    other_name = (other.name or "").casefold()
+    return other_name == wanted if exact else wanted in other_name
+
+
+def count_matches(snapshot: "Snapshot", node: Node, exact: bool) -> int:
+    """How many elements a role[+name] rung for ``node`` would match."""
+    return sum(1 for other in snapshot if same_rung(node, other, exact))
+
+
+def index_among(snapshot: "Snapshot", node: Node, exact: bool) -> int:
+    """Where ``node`` sits among the elements a role[+name] rung would match.
+
+    Document order -- the order refs are numbered in, and the order
+    Playwright's own ``.nth()`` walks. 0 if something has gone wrong (the
+    node's own rung does not match itself), which ``Locator``'s ``nth=0``
+    reads as "no index needed" rather than raising past a caller that just
+    wanted a ladder.
+    """
+    for index, other in enumerate(o for o in snapshot if same_rung(node, o, exact)):
+        if other.ref == node.ref:
+            return index
+    return 0
+
+
 def _unescape(value: str) -> str:
     return value.replace('\\"', '"').replace("\\\\", "\\")
 

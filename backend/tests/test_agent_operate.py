@@ -50,15 +50,16 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self) -> None:
+    def __init__(self, aria: str = ARIA) -> None:
         self.url = "https://vendor.test/users"
         self.did: list[str] = []
+        self._aria = aria
 
     def locator(self, _selector):
         return self
 
     async def aria_snapshot(self):
-        return ARIA
+        return self._aria
 
     async def goto(self, url):
         self.did.append(f"goto:{url}")
@@ -185,6 +186,121 @@ async def test_a_rescue_carries_forward_what_was_already_read():
     assert result.outputs["balance"] == "1,240.55"
 
 
+async def test_a_rescue_that_succeeds_reports_what_it_spent():
+    """`replay()` used to set the row result from the engine's own (LLM-blind)
+    RowResult every time it ran, including right after a rescue spent real
+    tokens -- so a rescued row that succeeded reported itself as free. This is
+    the actual bug behind an incident where the dashboard showed `llm_calls: 0`
+    on a row the event log proved had spent a dozen turns."""
+    executor = FakeExecutor(failures=1)
+    llm = a_model(turn_calling(RESUME, note="dismissed a dialog"))
+
+    result = await run_row_with_agent(
+        executor, {}, llm=llm, emit=_ignore, allowed_domains=("vendor.test",)
+    )
+
+    assert result.ok
+    assert result.llm_calls == 1
+    assert result.llm_tokens > 0
+    assert result.llm_usd > 0
+
+
+async def test_a_second_rescue_is_told_what_the_first_one_found():
+    """Each `recover()` call used to start a brand-new conversation with no
+    memory of the previous attempt. A second rescue only happens at all when
+    the first one said `resume` and the page still was not where the next
+    step expected it -- which is exactly the shape that used to burn a whole
+    second attempt re-deriving the same diagnosis and re-trying the same
+    action for zero new information. The second attempt's opening message
+    must now carry the first one's reasoning and last action forward."""
+    executor = FakeExecutor(failures=2, fail_at=3)
+    llm = a_model(
+        turn_calling("browser_snapshot"),
+        turn_calling(RESUME, note="dismissed a dialog"),  # attempt 1 ends here
+        turn_calling(RESUME, note="cleared it"),  # attempt 2
+    )
+
+    result = await run_row_with_agent(
+        executor, {}, llm=llm, emit=_ignore,
+        allowed_domains=("vendor.test",), max_attempts=2,
+    )
+
+    assert result.ok
+    assert len(llm.asked) == 3
+    second_opening = llm.asked[2]["messages"][0]["content"]
+    assert "attempt 2 of 2" in second_opening
+    assert "dismissed a dialog" not in second_opening, (
+        "notes are for the run trail; the opening carries the model's own "
+        "reasoning and last action, not the note it wrote for a human"
+    )
+    assert "browser_snapshot" in second_opening, (
+        "it should be told what the first attempt actually did, not just that "
+        "there was one"
+    )
+
+
+#: Three identical role+name buttons, one per project card -- the exact shape
+#: of the real incident this reproduces (11 identical "Chat" buttons, one per
+#: project, on a dashboard).
+CARD_LIST_ARIA = '''- generic [active]:
+  - generic "Alpha Project":
+    - button "Chat"
+  - generic "Beta Project":
+    - button "Chat"
+  - generic "Gamma Project":
+    - button "Chat"'''
+
+
+class AmbiguousChatExecutor(FakeExecutor):
+    """`locate` mirrors `engine.py::UseCaseExecutor._build`'s real rule for
+    `nth` exactly (0 is indistinguishable from "not given", so an ambiguous
+    rung with no nth is refused; nth=1.. narrows to that match) rather than
+    re-implementing the engine's whole resolver -- this is about the *agent*
+    reaching a resolvable ladder, which `test_agent_marks.py` and the
+    engine's own suite do not exercise end to end through this graph.
+    """
+
+    def __init__(self, failures: int = 1, fail_at: int = 3) -> None:
+        super().__init__(failures=failures, fail_at=fail_at)
+        self.browser.page._aria = CARD_LIST_ARIA
+
+    async def locate(self, locators, step_id="ad-hoc"):
+        spec = locators[0]
+        if spec.role == "button" and spec.name == "Chat":
+            if not spec.nth or not (0 <= spec.nth < 3):
+                return None
+            return FakeLocator(self.browser.page), 0, spec.describe()
+        return await super().locate(locators, step_id=step_id)
+
+
+async def test_an_ambiguous_click_correctly_diagnosed_now_succeeds_first_try():
+    """The actual incident: the recovery agent correctly identified which of
+    several identical buttons was meant on its very first turn, but had no
+    way to act on that -- `describe_element` only ever built a bare role+name
+    rung, so the click was refused as a guess even though it was not one.
+    Picking the second or third of the group is exactly what `agent/marks.py`
+    can now express; this proves the fix through the real dispatch path
+    (`EngineBrowser._act_on` -> `describe_element` -> `executor.locate`), not
+    just at the unit level.
+    """
+    executor = AmbiguousChatExecutor(failures=1)
+    llm = a_model(
+        turn_calling("browser_snapshot"),
+        # e5 is the second "Chat" button (Beta Project) -- ambiguous by role
+        # and name alone, resolvable once `describe_element` attaches nth.
+        turn_calling("browser_click", target="e5", element="Chat, Beta Project"),
+        turn_calling(RESUME, note="clicked the right project's Chat button"),
+    )
+
+    result = await run_row_with_agent(
+        executor, {}, llm=llm, emit=_ignore, allowed_domains=("vendor.test",),
+    )
+
+    assert result.ok
+    assert len(llm.asked) == 3, "diagnosed and acted in one attempt -- no rescue wasted"
+    assert result.llm_calls == 3
+
+
 async def test_giving_up_fails_the_row_with_the_reason_attached():
     """A row that fails with a clear reason is worth more than one that
     succeeded by doing something nobody asked for."""
@@ -194,6 +310,62 @@ async def test_giving_up_fails_the_row_with_the_reason_attached():
     result = await run_row_with_agent(
         executor, {}, llm=llm, emit=_ignore, allowed_domains=("vendor.test",)
     )
+
+
+async def test_a_give_up_tries_one_more_thing_a_ready_to_review_diagnosis():
+    """The row still fails -- nothing here changes that -- but it no longer
+    has to end at a bare error string. Once the agent has genuinely given up,
+    one more budgeted call runs the same diagnosis "Fix it with AI" runs by
+    hand, and attaches it for the caller (which has the store this package
+    does not) to turn into a draft version."""
+    from usecase import Locator, Step, UseCase
+
+    usecase = UseCase(
+        id="uc-1",
+        name="Continue",
+        row_steps=[Step(id="s7", action="click",
+                         locators=[Locator(strategy="role", role="button", name="Continue")])],
+    )
+    executor = FakeExecutor(failures=1)
+    llm = a_model(
+        turn_calling("browser_snapshot"),  # so a page exists to diagnose from
+        turn_calling(GIVE_UP, reason="the account is locked"),
+        turn_calling(
+            "propose_repair",
+            diagnosis="the Continue button is disabled until email is confirmed",
+            confidence="medium",
+            fixes=[{"kind": "make_optional", "step_id": "s7", "reason": "not always shown"}],
+        ),
+    )
+
+    result = await run_row_with_agent(
+        executor, {}, llm=llm, emit=_ignore, allowed_domains=("vendor.test",), usecase=usecase,
+    )
+
+    assert not result.ok
+    assert "the account is locked" in result.error, "the row's own reason is unchanged"
+    assert result.repair_proposal is not None
+    assert result.repair_proposal.proposal.diagnosis.startswith("the Continue button")
+    assert result.repair_proposal.proposal.fixes[0]["kind"] == "make_optional"
+    assert result.llm_calls == 3, "the diagnosis call is counted in what this row spent"
+
+
+async def test_giving_up_without_a_usecase_skips_the_diagnosis_quietly():
+    """`run_row_with_agent` can be called with no `usecase` (every existing
+    test before this one does) -- there is nothing to diagnose against, and
+    that must not be an error."""
+    executor = FakeExecutor(failures=1)
+    llm = a_model(
+        turn_calling("browser_snapshot"),
+        turn_calling(GIVE_UP, reason="the account is locked"),
+    )
+
+    result = await run_row_with_agent(
+        executor, {}, llm=llm, emit=_ignore, allowed_domains=("vendor.test",),
+    )
+
+    assert result.repair_proposal is None
+    assert len(llm.asked) == 2, "no third call attempted with nothing to diagnose against"
 
     assert not result.ok
     assert "the account is locked" in result.error

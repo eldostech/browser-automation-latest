@@ -496,7 +496,9 @@ async def repair_usecase(
             "llm_tokens": proposal.tokens,
         }
 
-    patched, applied = apply_fixes(definition, proposal, candidates(context.snapshot))
+    patched, applied = apply_fixes(
+        definition, proposal, candidates(context.snapshot), context.snapshot
+    )
 
     # A repair that changes nothing must not be reported as one, and must not
     # leave a version behind. Otherwise pressing the button appears to work

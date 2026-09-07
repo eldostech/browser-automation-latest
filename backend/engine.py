@@ -195,6 +195,17 @@ class RowResult:
     #: look identical on a dashboard, and until this existed every replay
     #: claimed to be free whether or not it had healed.
     llm_usd: float = 0.0
+    #: Set by `agent/operate.py` when an agent recovery gave up on this row
+    #: and could still produce a diagnosis -- an untyped `repair.PendingRepair`
+    #: rather than importing that type here, so that this module (used by
+    #: every replay, agent installed or not) never has to import anything
+    #: from the agent's own optional dependency tree just to *hold* a value it
+    #: never inspects. Never applied by anything that only sees a `RowResult`:
+    #: turning it into a draft version is the caller's job, once, and only the
+    #: caller (`runner.py`) has the store this needs. Not included in
+    #: `to_dict()` deliberately -- nothing serializes a `RowResult` wholesale
+    #: for storage; a caller that wants this reads the attribute directly.
+    repair_proposal: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

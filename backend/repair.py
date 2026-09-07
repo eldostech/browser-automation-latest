@@ -31,7 +31,13 @@ from typing import Any
 
 from memory import as_prompt
 from prompt_loader import REPAIR, REPAIR_REQUEST, load, render
-from snapshot import Node, Snapshot, parse as parse_snapshot
+from snapshot import (
+    Node,
+    Snapshot,
+    count_matches,
+    index_among,
+    parse as parse_snapshot,
+)
 from usecase import Assertion, Locator, UseCase
 
 log = logging.getLogger(__name__)
@@ -151,9 +157,20 @@ class FailureContext:
         return next((s for s in self.usecase.all_steps if s.id == self.failed_step_id), None)
 
 
+#: Within one identical (role, label) group, how many distinct instances to
+#: offer as separate candidates. This used to be 1 -- every instance past the
+#: first was silently dropped, which meant a page with 11 identical per-row
+#: "Chat" buttons offered exactly one candidate no matter which row actually
+#: failed, and a repair could never point at a specific one. Capped rather
+#: than unlimited: this exists to let a dozen near-identical rows be told
+#: apart, not to let a doctor pick "the 340th delete icon" out of a wall of
+#: them -- past this many, the rest collapse the way they always did.
+MAX_PER_GROUP = 20
+
+
 def candidates(snapshot: Snapshot) -> list[Node]:
     """Named, interactive controls that were on the page when it failed."""
-    seen: set[tuple[str, str]] = set()
+    counts: dict[tuple[str, str], int] = {}
     chosen: list[Node] = []
     for node in snapshot:
         if node.role not in _INTERESTING:
@@ -162,13 +179,70 @@ def candidates(snapshot: Snapshot) -> list[Node]:
         if not label:
             continue
         key = (node.role, label)
-        if key in seen:
+        seen = counts.get(key, 0)
+        if seen >= MAX_PER_GROUP:
             continue
-        seen.add(key)
+        counts[key] = seen + 1
         chosen.append(node)
         if len(chosen) >= MAX_CANDIDATES:
             break
     return chosen
+
+
+def _nearby_context(nodes: list[Node], index: int) -> str:
+    """The nearest ancestor's own name or text, for telling apart two
+    otherwise-identical candidates -- the title of the card a button sits in,
+    the row of a table a cell belongs to.
+
+    Cheap on purpose: the snapshot is already a top-down walk with a depth per
+    node, so an element's nearest labelled ancestor is found by walking
+    backward and stepping the depth ceiling up one level at a time, stopping
+    at the first ancestor that has something to say for itself (skipping bare
+    wrapper `generic`/`group` nodes, which are common and say nothing).
+    """
+    node = nodes[index]
+    ceiling = node.depth
+    for i in range(index - 1, -1, -1):
+        other = nodes[i]
+        if other.depth >= ceiling:
+            continue
+        ceiling = other.depth
+        if other.name or other.text:
+            return other.name or other.text
+        if ceiling == 0:
+            break
+    return ""
+
+
+def _listing(options: list[Node], snapshot: Snapshot) -> str:
+    """The candidates, numbered for ``element_index`` -- with enough context
+    to tell two identically-named ones apart.
+
+    Plain role+name is shown for anything that is not part of an ambiguous
+    group. Where it is -- the ordinary shape of a list, a card, a table row --
+    the nearest ancestor's own text is appended, because that is usually
+    exactly what a person or a diagnosis already uses to tell them apart
+    ("the row for account A-1001"), and it is what lets a fix's `nth` land on
+    the *right* one instead of always the first.
+    """
+    if not options:
+        return "(the page was not captured, so no elements can be offered)"
+    by_ref = {node.ref: i for i, node in enumerate(snapshot.nodes)}
+    lines: list[str] = []
+    for index, node in enumerate(options):
+        line = f'{index}. {node.role} "{node.name or node.text}"'
+        exact = False  # repair has never distinguished exact/loose matching
+        if count_matches(snapshot, node, exact) > 1:
+            page_index = by_ref.get(node.ref)
+            context = (
+                _nearby_context(snapshot.nodes, page_index)
+                if page_index is not None
+                else ""
+            )
+            note = f'inside "{context}"' if context else "position on the page only"
+            line += f" -- one of several identical; {note}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def gather_context(
@@ -232,10 +306,35 @@ class RepairProposal:
     confidence: str = "medium"
     unfixable_reason: str = ""
     tokens: int = 0
+    #: The input/output split behind `tokens`, kept separately because a
+    #: caller pricing this call (an agent recovery folding it into its own
+    #: budget, say) needs the split -- input and output are priced
+    #: differently, and collapsing them first would make that caller's own
+    #: cost estimate wrong rather than merely approximate.
+    usage: dict[str, int] = field(default_factory=dict)
 
     @property
     def actionable(self) -> bool:
         return bool(self.fixes) and not self.unfixable_reason
+
+
+@dataclass(slots=True)
+class PendingRepair:
+    """A diagnosis produced automatically, when an agent recovery gave up on
+    a row rather than by a person pressing "Fix it with AI" -- carrying the
+    one extra thing `apply_fixes` needs that a stored execution does not
+    keep: the actual snapshot the diagnosis was read from.
+
+    Produced by `agent/operate.py`, which has no store access by design (the
+    same reason `engine.py` cannot import `llm`); a caller that does have one
+    turns this into a draft version the way `repair.py`'s own router does,
+    or discards it if it turns out to change nothing. Never applied without
+    that step -- the rule that a repair is only ever a reviewable draft holds
+    here exactly as it does for the button a person presses.
+    """
+
+    proposal: RepairProposal
+    snapshot: Snapshot
 
 
 class UseCaseDoctor:
@@ -286,13 +385,7 @@ class UseCaseDoctor:
                 "the page was captured at failure time -- run it once more and the repair "
                 "will have the page to work from."
             )
-        listing = (
-            "\n".join(
-                f'{index}. {node.role} "{node.name or node.text}"'
-                for index, node in enumerate(options)
-            )
-            or "(the page was not captured, so no elements can be offered)"
-        )
+        listing = _listing(options, context.snapshot)
         step = context.failed_step
 
         # Evidence for the model, never an instruction: whatever it picks still
@@ -337,7 +430,11 @@ class UseCaseDoctor:
             timeout=90.0,
         )
 
-        tokens = int(turn.usage.get("input_tokens", 0)) + int(turn.usage.get("output_tokens", 0))
+        usage = {
+            "input_tokens": int(turn.usage.get("input_tokens", 0)),
+            "output_tokens": int(turn.usage.get("output_tokens", 0)),
+        }
+        tokens = usage["input_tokens"] + usage["output_tokens"]
         call = next((c for c in turn.tool_calls if c.name == PROPOSE_TOOL["name"]), None)
         if call is None:
             # Answering in prose rather than calling the tool is usually the
@@ -350,6 +447,7 @@ class UseCaseDoctor:
                 confidence="low",
                 unfixable_reason="the model did not propose a concrete edit",
                 tokens=tokens,
+                usage=usage,
             )
 
         payload = call.input
@@ -359,6 +457,7 @@ class UseCaseDoctor:
             confidence=str(payload.get("confidence") or "medium"),
             unfixable_reason=str(payload.get("unfixable_reason") or ""),
             tokens=tokens,
+            usage=usage,
         )
 
 
@@ -416,13 +515,24 @@ def locator_changes(before: dict[str, Any], after: dict[str, Any]) -> list[Locat
 
 
 def apply_fixes(
-    definition: dict[str, Any], proposal: RepairProposal, options: list[Node]
+    definition: dict[str, Any],
+    proposal: RepairProposal,
+    options: list[Node],
+    snapshot: Snapshot | list[Node] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Apply a proposal to a stored definition. Returns ``(patched, applied)``.
 
     A fix the model got wrong -- an unknown step, an out-of-range element -- is
     skipped and reported rather than guessed at.
+
+    ``snapshot`` is the *whole* page a picked element is counted against, not
+    just the candidate list -- an element can be part of a duplicate group even
+    when ``MAX_PER_GROUP`` trimmed some of its siblings out of ``options``.
+    Optional and falls back to ``options`` itself (fine for a page with no
+    trimming, which is every test fixture and most real pages) so existing
+    callers are not forced to thread a snapshot through for no benefit.
     """
+    counted_against: Snapshot | list[Node] = snapshot if snapshot is not None else options
     patched = json.loads(json.dumps(definition))
     applied: list[str] = []
 
@@ -461,7 +571,39 @@ def apply_fixes(
                 applied.append(f"SKIPPED {step_id}: element index {index!r} is not on the page")
                 continue
             node = options[index]
-            healed = Locator(strategy="role", role=node.role, name=node.name or None)
+            group_size = count_matches(counted_against, node, False)
+            position = index_among(counted_against, node, False) if group_size > 1 else 0
+            if group_size > 1 and position == 0:
+                # `nth=0` is how the schema spells "no position given" --
+                # deliberately, so the executor's resolver keeps refusing an
+                # ambiguous rung with no explicit nth rather than silently
+                # acting on whichever element loads first. That means the
+                # element that IS the first of the group cannot record its
+                # own position, so applying this fix as written would look
+                # like progress in the diff and still fail at replay for the
+                # identical reason. Refuse it rather than propose something
+                # that cannot work.
+                applied.append(
+                    f"SKIPPED {step_id}: {node.role} {node.name!r} matches {group_size} "
+                    "elements and this is the first of them, which a locator cannot name "
+                    "specifically (only the 2nd match onward can be pinned by position). "
+                    "Point at a different one of the matches, or re-record this step "
+                    "against something that names the element itself."
+                )
+                continue
+            healed = Locator(
+                strategy="role",
+                role=node.role,
+                name=node.name or None,
+                nth=position,
+            )
+            if group_size > 1:
+                applied.append(
+                    f"{step_id}: {node.role} {node.name!r} matches {group_size} elements on "
+                    f"the page the doctor saw; pinned to position {healed.nth} of them. "
+                    "Positional, not a name -- if this list can reorder between runs, treat "
+                    "this as a stopgap and re-record the step properly."
+                )
 
             def ladder_for(holder: dict[str, Any]) -> list[dict[str, Any]]:
                 existing = [

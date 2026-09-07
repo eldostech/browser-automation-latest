@@ -364,6 +364,105 @@ def test_a_repair_that_breaks_the_schema_is_rejected():
     validate_patched(patched)
 
 
+# --- a repeated card, the ordinary shape of a list page ---------------------
+
+#: 11 identical "Chat" buttons, one per project card -- the page that broke a
+#: real run: a step recorded against one specific card's button could not be
+#: told apart from the other 10 by role and name alone.
+CARDS = """### Page
+- Page URL: https://example.com/dashboard
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic "Alpha Project" [ref=e2]:
+    - heading "Alpha Project" [ref=e3]
+    - button "Chat" [ref=e4]
+  - generic "Beta Project" [ref=e5]:
+    - heading "Beta Project" [ref=e6]
+    - button "Chat" [ref=e7]
+  - generic "Gamma Project" [ref=e8]:
+    - heading "Gamma Project" [ref=e9]
+    - button "Chat" [ref=e10]
+```"""
+
+
+def test_a_duplicate_group_offers_every_instance_not_just_the_first():
+    """This used to collapse to one candidate no matter which card failed."""
+    options = candidates(gather_context(use_case(), execution(), failure_events(CARDS)).snapshot)
+    chat_buttons = [n for n in options if n.role == "button" and n.name == "Chat"]
+    assert len(chat_buttons) == 3
+    assert [n.ref for n in chat_buttons] == ["e4", "e7", "e10"]
+
+
+def test_the_listing_says_which_card_each_duplicate_belongs_to():
+    from repair import _listing
+
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    listing = _listing(candidates(snapshot), snapshot)
+
+    assert 'inside "Beta Project"' in listing
+    assert 'inside "Gamma Project"' in listing
+
+
+def test_picking_one_of_a_duplicate_group_pins_its_position():
+    """The fix that would have unblocked the real incident: a repair can now
+    point at *the second* identical button, not just the first."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    beta_index = next(i for i, n in enumerate(options) if n.ref == "e7")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": beta_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    locator = patched["row_steps"][0]["locators"][0]
+    assert locator["name"] == "Chat"
+    assert locator["nth"] == 1, "e7 is the second of the three Chat buttons"
+    assert "pinned to position 1" in applied[0]
+    validate_patched(patched)
+
+
+def test_without_the_full_snapshot_ambiguity_still_degrades_safely():
+    """A caller that does not thread the snapshot through (every existing one
+    before this change) still gets a correct answer for anything the trimmed
+    candidate list itself already contains -- it just cannot see duplicates
+    MAX_PER_GROUP trimmed away."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    beta_index = next(i for i, n in enumerate(options) if n.ref == "e7")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": beta_index}],
+    )
+    patched, _ = apply_fixes(definition(), proposal, options)  # no snapshot passed
+
+    assert patched["row_steps"][0]["locators"][0]["nth"] == 1
+
+
+def test_picking_the_first_of_a_duplicate_group_is_refused_not_faked():
+    """`nth=0` means "no position given" as far as the executor's resolver is
+    concerned -- so a "fix" that pins the first of several identical elements
+    to position 0 would look applied in the diff and still be refused, for
+    the identical reason, the next time it runs. Skipping it and saying so is
+    more honest than a repair that appears to work and does not."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    alpha_index = next(i for i, n in enumerate(options) if n.ref == "e4")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": alpha_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    assert patched["row_steps"][0]["locators"][0]["name"] == "Full name", "unchanged"
+    assert "SKIPPED" in applied[0]
+    assert "first of them" in applied[0]
+
+
 # --- when there is no page to look at --------------------------------------
 
 
