@@ -825,6 +825,22 @@ table.runs .task-cell button:hover {
   font-size: 12px;
 }
 
+.step-detail-edit {
+  align-items: center;
+}
+.step-detail-edit input {
+  flex: 1 1 260px;
+  width: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 8px;
+}
+.step-detail-edit button {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
 /* Ladder rungs. The first is tried first; a brittle one is flagged because
    falling through to it is the early warning that a site has drifted. */
 code.locator {

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { Locator, UseCaseStep } from '../lib/events';
 
 /** How a locator reads in the review UI. */
@@ -30,11 +31,21 @@ function summarise(step: UseCaseStep): string {
   return step.action;
 }
 
+/** Which field a step's single "value" line actually edits, by action. */
+function editableField(step: UseCaseStep): 'url' | 'value' | null {
+  if (step.action === 'navigate') return 'url';
+  if (step.value != null) return 'value';
+  return null;
+}
+
 interface Props {
   title: string;
   hint?: string;
   steps: UseCaseStep[];
   onRemove?: (stepId: string) => void;
+  /** Saves a single step field (a wrong recorded URL, a typo'd typed value)
+   * as a new draft version. Absent means read-only, same as today. */
+  onEditField?: (stepId: string, field: 'url' | 'value', value: string) => void;
 }
 
 /**
@@ -42,7 +53,26 @@ interface Props {
  * which rung a step relies on is the single best predictor of whether it will
  * still work next month.
  */
-export function UseCaseSteps({ title, hint, steps, onRemove }: Props) {
+export function UseCaseSteps({ title, hint, steps, onRemove, onEditField }: Props) {
+  // Which step is mid-edit, and the draft text for it. One at a time: a step
+  // list is reviewed top to bottom, and editing two at once just makes it
+  // easy to lose track of which unsaved change belongs to which step.
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+
+  const startEdit = (step: UseCaseStep) => {
+    const field = editableField(step);
+    if (!field) return;
+    setEditing(step.id);
+    setDraft((field === 'url' ? step.url : step.value) ?? '');
+  };
+
+  const save = (step: UseCaseStep) => {
+    const field = editableField(step);
+    if (field && onEditField) onEditField(step.id, field, draft);
+    setEditing(null);
+  };
+
   if (steps.length === 0) {
     return (
       <div className="panel" style={{ marginBottom: 16 }}>
@@ -75,6 +105,20 @@ export function UseCaseSteps({ title, hint, steps, onRemove }: Props) {
                 <code className="action">{step.action}</code>
                 <span className="summary">{summarise(step)}</span>
                 {step.optional && <span className="tag">optional</span>}
+                {onEditField && editableField(step) && editing !== step.id && (
+                  <button
+                    type="button"
+                    className="link"
+                    onClick={() => startEdit(step)}
+                    title={
+                      step.action === 'navigate'
+                        ? 'Fix the recorded URL'
+                        : 'Fix the recorded value'
+                    }
+                  >
+                    Edit
+                  </button>
+                )}
                 {onRemove && (
                   <button
                     type="button"
@@ -87,11 +131,32 @@ export function UseCaseSteps({ title, hint, steps, onRemove }: Props) {
                 )}
               </div>
 
-              {(step.value || step.url) && (
-                <div className="step-detail">
-                  <span className="label">value</span>
-                  <code>{step.value ?? step.url}</code>
+              {editing === step.id ? (
+                <div className="step-detail step-detail-edit">
+                  <span className="label">{step.action === 'navigate' ? 'url' : 'value'}</span>
+                  <input
+                    autoFocus
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') save(step);
+                      if (e.key === 'Escape') setEditing(null);
+                    }}
+                  />
+                  <button type="button" className="linkish" onClick={() => save(step)}>
+                    Save
+                  </button>
+                  <button type="button" className="link" onClick={() => setEditing(null)}>
+                    Cancel
+                  </button>
                 </div>
+              ) : (
+                (step.value || step.url) && (
+                  <div className="step-detail">
+                    <span className="label">value</span>
+                    <code>{step.value ?? step.url}</code>
+                  </div>
+                )
               )}
 
               {step.fields.length > 0 && (

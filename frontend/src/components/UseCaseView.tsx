@@ -9,6 +9,7 @@ import type {
   Target,
   UseCase,
   UseCaseMode,
+  UseCaseStep,
 } from '../lib/events';
 import { DatasetMapper } from './DatasetMapper';
 import {
@@ -251,6 +252,26 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       setNotice(`Removed ${stepId}. Saved as a new version.`);
       await load();
     });
+
+  // A recorded URL or typed value is sometimes just wrong -- the browser was
+  // on the wrong tab, an env-specific address got baked in -- and until now
+  // the only fix was re-recording the whole step. Same shape as every other
+  // edit here: patch the definition, save as a new version, reload.
+  const editStep =
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') =>
+    (stepId: string, field: 'url' | 'value', value: string) =>
+      act(async () => {
+        if (!useCase) return;
+        const patch = (step: UseCaseStep) =>
+          step.id === stepId ? { ...step, [field]: value } : step;
+        const next =
+          phase === 'row_reset'
+            ? { ...useCase, row_reset: useCase.row_reset ? patch(useCase.row_reset) : null }
+            : { ...useCase, [phase]: useCase[phase].map(patch) };
+        await api.updateUseCase(usecaseId, next as UseCase);
+        setNotice(`Updated ${stepId}. Saved as a new version.`);
+        await load();
+      });
 
   // Saved on blur rather than behind a button: it is one number, and a
   // "Save" next to a single field is ceremony. A new version is written, as
@@ -650,18 +671,21 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             hint="The sign-in lives here. It runs once for a whole batch, not once per row."
             steps={useCase.setup_steps}
             onRemove={removeStep('setup_steps')}
+            onEditField={editStep('setup_steps')}
           />
           {useCase.row_reset && (
             <UseCaseSteps
               title="Reset — before every row"
               hint="Puts the browser back to a known state so one row cannot inherit the last one's state."
               steps={[useCase.row_reset]}
+              onEditField={editStep('row_reset')}
             />
           )}
           <UseCaseSteps
             title="Per row — runs once for each input"
             steps={useCase.row_steps}
             onRemove={removeStep('row_steps')}
+            onEditField={editStep('row_steps')}
           />
 
           {(useCase.dropped ?? []).length > 0 && (
