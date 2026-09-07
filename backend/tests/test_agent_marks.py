@@ -55,6 +55,23 @@ LIST = """### Page
 ```
 """
 
+#: The shape of the real failure: a project card is a `generic` div with no
+#: accessible name at all, one per project, and nothing else distinguishes
+#: them in the tree. Unlike LIST's named "Open" links, there is no name for
+#: position to even be a fallback from -- and a real replay found this exact
+#: page rendering *zero* generic elements minutes later, proving the count
+#: itself was never a stable property of the page.
+GENERIC_WRAPPERS = """### Page
+- Page URL: https://vendor.test/projects
+### Snapshot
+```yaml
+- list [ref=e1]:
+  - generic [ref=e2]
+  - generic [ref=e3]
+  - generic [ref=e4]
+```
+"""
+
 
 def snap(text: str):
     return parse_snapshot(text)
@@ -130,6 +147,37 @@ def test_the_second_and_third_of_identical_rows_get_a_usable_position():
     third = describe_element(snap(LIST), "e4")
     assert third.ladder[0].nth == 2
     assert "3rd of them" in third.as_text()
+
+
+def test_an_unnamed_generic_wrapper_among_identical_siblings_is_unreliable():
+    """The bug `nth` cannot fix: position among named duplicates ("Open" links,
+    "Chat" buttons) is at least a real, if fragile, proxy for which one was
+    meant. Position among anonymous `generic`/`group`/`none`/`presentation`
+    wrappers is not -- there is no name for it to even be a fallback from, and
+    a real replay found the exact same page exposing a different count of
+    these elements minutes later. This must be flagged as categorically worse
+    than an ordinary ambiguous match, not smoothed over by `nth` resolving.
+    """
+    described = describe_element(snap(GENERIC_WRAPPERS), "e3")
+
+    assert described.matches == 3
+    assert described.ambiguous
+    assert described.unreliable
+    assert described.ladder[0].nth == 1, "nth is still computed -- only the messaging changes"
+
+    text = described.as_text()
+    assert "not a real control" in text
+    assert "is not something to rely on" in text
+    assert "2nd of them" not in text, "the milder by-position note must not also fire"
+
+
+def test_a_named_control_among_identical_siblings_is_not_flagged_unreliable():
+    """The control case: `unreliable` must not fire just because a role happens
+    to repeat -- only for the structural-role-and-no-name combination."""
+    described = describe_element(snap(LIST), "e3")
+
+    assert described.ambiguous
+    assert not described.unreliable
 
 
 def test_the_second_and_third_of_identical_rows_get_their_own_position():

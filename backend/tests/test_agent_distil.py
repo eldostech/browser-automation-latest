@@ -80,13 +80,17 @@ CHAT_LIST = """### Page
 """
 
 
-async def test_an_ambiguous_click_becomes_a_step_with_a_loud_warning():
-    """Found for real: an agent clicked the right "Chat" button among eleven
-    identical ones by ref -- that click always runs, since a ref is
-    position-specific, not name-based -- and the recording carried only
-    `role=button name="Chat"`, which a replay days later correctly refused
-    rather than guessing among them. The warning exists so a person sees this
-    on the review screen instead of discovering it from a failed batch."""
+async def test_an_ambiguous_click_resolved_by_position_gets_a_mild_note():
+    """Found for real, in two parts. First: an agent clicked the right "Chat"
+    button among several identical ones by ref -- that click always runs,
+    since a ref is position-specific, not name-based. Second, found only
+    after the first fix shipped: `describe_element` (agent/marks.py) had
+    already learned to attach the click's position among the matches
+    (`nth`), which is what actually lets a replay resolve this instead of
+    refusing -- but this file's own warning still fired the *old*, scarier
+    message ("will refuse to guess... re-record this step") regardless,
+    telling a reviewer to redo a step that already worked. e8 is the *second*
+    of the two "Chat" buttons, so this checks the corrected, milder note."""
     from agent import run_agent_session
 
     provider = FakeMCP({"browser_snapshot": CHAT_LIST})
@@ -111,9 +115,103 @@ async def test_an_ambiguous_click_becomes_a_step_with_a_loud_warning():
     assert result.use_case is not None
     click_step = next(s for s in result.use_case["row_steps"] if s["action"] == "click")
     assert click_step["locators"][0]["name"] == "Chat"
-    assert any(
-        "matched 2 elements" in w and click_step["id"] in w for w in result.draft_warnings
-    ), result.draft_warnings
+    assert click_step["locators"][0]["nth"] == 1, "e8 is the second of the two matches"
+    warning = next(w for w in result.draft_warnings if click_step["id"] in w)
+    assert "2nd one" in warning
+    assert "by position on the page" in warning
+    assert "will refuse to guess" not in warning, "this step will replay correctly"
+
+
+async def test_the_first_of_an_ambiguous_pair_still_gets_the_loud_warning():
+    """The other half of the same fix: `nth` cannot express "specifically the
+    first" (it is indistinguishable from "no position given" -- see
+    describe_element's own docstring), so a click on the *first* of the
+    duplicates is genuinely still unresolved, and must keep the strong
+    warning telling a reviewer to re-record it."""
+    from agent import run_agent_session
+
+    provider = FakeMCP({"browser_snapshot": CHAT_LIST})
+    llm = LangChainLLM(
+        ScriptedChatModel(responses=[
+            turn_calling("browser_snapshot"),
+            turn_calling("mark_setup_complete"),
+            turn_calling("begin_row", key="project-a"),
+            turn_calling("browser_click", target="e4", element="Chat button for Project A"),
+            turn_calling("mark_as_output", ref="e5", column="open_label"),
+            turn_calling("end_row"),
+            turn_calling(FINISH, summary="Opened chat for Project A."),
+        ]),
+        "scripted-model",
+    )
+
+    result = await run_agent_session(
+        request(), llm=llm, provider=provider, emit=_ignore,
+        replay=_replays_cleanly, name="Open a project's chat",
+    )
+
+    assert result.use_case is not None
+    click_step = next(s for s in result.use_case["row_steps"] if s["action"] == "click")
+    assert click_step["locators"][0]["nth"] == 0, "e4 is the first of the two matches"
+    warning = next(w for w in result.draft_warnings if click_step["id"] in w)
+    assert "matched 2 elements" in warning
+    assert "will refuse to guess" in warning
+    assert "re-record this step" in warning
+
+
+#: The shape of the real production failure: each project "card" is a bare
+#: `generic` element with no accessible name at all -- no button, no link,
+#: nothing to give position a name to be a fallback from. A real replay found
+#: this same page exposing zero generic-role elements minutes later, proving
+#: the match count was never a stable property of the page.
+GENERIC_CARDS = """### Page
+- Page URL: https://vendor.test/projects
+### Snapshot
+```yaml
+- list [ref=e1]:
+  - generic [ref=e2]
+  - generic [ref=e3]
+  - generic [ref=e4]
+```
+"""
+
+
+async def test_a_click_on_an_unnamed_generic_wrapper_gets_the_unreliable_warning():
+    """Distinct from, and worse than, the "2nd of the Chat buttons" case above:
+    `nth` still gets computed, but resolving by position among anonymous,
+    unnamed structural elements is not something a replay should be told is
+    safe. This step must not get the mild "by position on the page" note even
+    though its leading rung has `nth > 0` -- it must get the strong,
+    differently-worded warning telling a reviewer to re-record against
+    something with a real name."""
+    from agent import run_agent_session
+
+    provider = FakeMCP({"browser_snapshot": GENERIC_CARDS})
+    llm = LangChainLLM(
+        ScriptedChatModel(responses=[
+            turn_calling("browser_snapshot"),
+            turn_calling("mark_setup_complete"),
+            turn_calling("begin_row", key="project-b"),
+            turn_calling("browser_click", target="e3", element="second project card"),
+            turn_calling("end_row"),
+            turn_calling(FINISH, summary="Opened the second project."),
+        ]),
+        "scripted-model",
+    )
+
+    result = await run_agent_session(
+        request(), llm=llm, provider=provider, emit=_ignore,
+        replay=_replays_cleanly, name="Open a project",
+    )
+
+    assert result.use_case is not None
+    click_step = next(s for s in result.use_case["row_steps"] if s["action"] == "click")
+    assert click_step["locators"][0]["role"] == "generic"
+    assert click_step["locators"][0]["nth"] == 1, "e3 is the second of the three matches"
+    warning = next(w for w in result.draft_warnings if click_step["id"] in w)
+    assert "not a real control" in warning
+    assert "is not something a replay can trust" in warning
+    assert "by position on the page" not in warning, "the milder nth-resolved note must not fire here"
+    assert "Re-record this step" in warning
 
 
 async def a_run(*, replay=None, turns=None):

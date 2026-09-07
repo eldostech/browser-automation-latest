@@ -344,6 +344,24 @@ async def test_a_refusal_is_audited_exactly_like_a_call_that_ran():
     assert [r.seq for r in recorded] == [1, 2]
 
 
+async def test_a_navigate_call_is_not_reported_as_ambiguous():
+    """`browser_navigate` has no `target` at all -- it goes to a URL, not an
+    element -- but describing one was called anyway, on whatever an absent
+    `target` argument stringified to (an empty ref), which found nothing to
+    describe and reported back as "matched 0 elements". Distillation then
+    warned that a navigate step needed re-recording for being "ambiguous",
+    which it was never at risk of being. Only a call that actually names a
+    `target` should be described at all."""
+    recorded = []
+
+    async with await session(recorder=lambda r: _collect(recorded, r)) as tools:
+        await tools.call("browser_navigate", {"url": "https://vendor.test/"})
+
+    navigate = next(r for r in recorded if r.name == "browser_navigate")
+    assert navigate.match_count == 1
+    assert navigate.locators == []
+
+
 async def _collect(bucket, record):
     bucket.append(record)
 

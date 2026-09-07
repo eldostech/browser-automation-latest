@@ -90,6 +90,17 @@ class Described:
     #: Set when the accessible name is a substring of another element's, which
     #: is when `exact` stops being optional.
     shadowed_by: tuple[str, ...] = ()
+    #: Set when the element has no accessible name at all and a purely
+    #: structural role (generic/group/none/presentation -- the same set
+    #: `Node.interactive` already excludes). Found for real: a step recorded
+    #: as "the 14th of 40 `generic` elements" replayed against a page that,
+    #: minutes later, exposed *zero* generic-role elements -- the count itself
+    #: was never a property of the control, only of how that render happened
+    #: to nest anonymous wrapper divs. Position among *named* duplicates (11
+    #: identical "Chat" buttons, say) is a real, if imperfect, proxy for which
+    #: one was meant; position among anonymous structural wrappers is not --
+    #: there is no name for it to even be a fallback from.
+    unreliable: bool = False
 
     @property
     def ambiguous(self) -> bool:
@@ -116,7 +127,23 @@ class Described:
         if not self.ladder:
             return f"{self.ref} is not on the page as it now stands."
         lines = [f"{self.ref} is {self.describe_first()}"]
-        if self.ambiguous and self.ladder[0].nth > 0:
+        if self.ambiguous and self.unreliable:
+            # Worse than merely ambiguous: nothing about this element is a
+            # name to fall back to, so even a resolved position is trust
+            # placed in how many anonymous wrapper elements a render happens
+            # to produce -- which is not a property of the control. Said
+            # regardless of whether nth is 0: unlike the named-duplicate
+            # case below, there is no "safe once nth is set" here.
+            lines.append(
+                f"WARNING: {self.matches} elements share this role with no name "
+                "to tell any of them apart -- this is a generic wrapper, not a "
+                "real control. Its position among the others is not something "
+                "to rely on: it can differ the next time this page renders for "
+                "reasons that have nothing to do with which one you meant. Find "
+                "a labelled button, link or heading near it and act on that "
+                "instead, or say this step needs a person."
+            )
+        elif self.ambiguous and self.ladder[0].nth > 0:
             position = self.ladder[0].nth + 1
             lines.append(
                 f"NOTE: role and name alone match {self.matches} elements; this "
@@ -214,6 +241,12 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
         ladder=ladder,
         matches=matches,
         shadowed_by=_shadowing(snapshot, node),
+        # `interactive` is false for exactly the structural roles (generic,
+        # group, none, presentation) that carry no meaning of their own --
+        # see Node.interactive. Combined with no name at all, position is the
+        # *only* thing distinguishing this from its siblings, and position
+        # among anonymous wrappers is not a property of the control.
+        unreliable=matches > 1 and not node.interactive and not node.name,
     )
 
 

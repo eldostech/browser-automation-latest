@@ -327,7 +327,16 @@ class AgentToolSession:
         # Resolved here, before dispatch, and not afterwards. After the call
         # the page has re-rendered and this ref names something else or
         # nothing at all.
-        described = self._describe(str(arguments.get("target") or ""))
+        #
+        # Only for a call that actually names one: `browser_navigate` and
+        # its neighbours (`browser_navigate_back`, `browser_press_key`,
+        # `browser_wait_for`, `browser_snapshot`, ...) have no `target` at
+        # all, and describing an empty ref found nothing to describe --
+        # `Described(matches=0)` -- which a distilled step then reported as
+        # "matched 0 elements, not one", a warning about ambiguity on a step
+        # that was never pointing at an element to begin with.
+        target_ref = str(arguments.get("target") or "")
+        described = self._describe(target_ref) if target_ref else None
 
         # `arguments` -- the placeholder-bearing version -- is what gets
         # recorded, redacted and shown back to the model. `dispatched` is a

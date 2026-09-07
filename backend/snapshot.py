@@ -78,7 +78,7 @@ _ATTR_RE = re.compile(r"\[(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?:=(?P<value>[^\]]*))?
 
 #: Roles that never describe something a person interacts with. Kept out of
 #: `locate` results so a wrapper `generic` never shadows the real control.
-_STRUCTURAL_ROLES: frozenset[str] = frozenset({"generic", "group", "none", "presentation"})
+STRUCTURAL_ROLES: frozenset[str] = frozenset({"generic", "group", "none", "presentation"})
 
 
 @dataclass(slots=True)
@@ -95,7 +95,7 @@ class Node:
 
     @property
     def interactive(self) -> bool:
-        return self.role not in _STRUCTURAL_ROLES
+        return self.role not in STRUCTURAL_ROLES
 
     def describe(self) -> str:
         """Human-readable identity, for review UIs and failure messages."""
@@ -241,7 +241,7 @@ class Snapshot:
         distillation warns about those steps so a reviewer sees it before a
         batch does.
         """
-        if role in _STRUCTURAL_ROLES and not name:
+        if role in STRUCTURAL_ROLES and not name:
             return None
         matches = self.find(role, name)
         interactive = [n for n in matches if n.interactive]

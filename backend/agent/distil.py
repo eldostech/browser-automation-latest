@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
+from snapshot import STRUCTURAL_ROLES, ordinal_suffix
 from usecase import InputSpec, Locator, SecretSpec, Step, UseCase
 
 from .marks import Mark, Marks
@@ -217,21 +218,65 @@ def _steps(
             )
             continue
         steps.append(step)
-        if call.match_count != 1:
-            # The click itself ran fine -- a ref is position-specific, so it is
-            # never ambiguous -- but the *durable* locator distilled from it
-            # (role/name, no ref) already matched more than one element on the
-            # very page it was recorded from. A replay hitting the same page
-            # will refuse to guess which one was meant, correctly; the warning
-            # exists so that is found on the review screen, not days later in
-            # a failed batch.
-            warnings.append(
-                f"Step {step.id} ({step.action} {step.description!r}) matched "
-                f"{call.match_count} elements when it was recorded, not one. "
-                "A replay will refuse to guess which one was meant. Point at "
-                "something more specific -- inside the right row or card -- "
-                "and re-record this step."
+        if call.match_count != 1 and step.locators:
+            # The click itself ran fine -- a ref is position-specific, so it
+            # is never ambiguous -- but the *durable* locator distilled from
+            # it (role/name, no ref) matched more than one element on the
+            # very page it was recorded from.
+            #
+            # `describe_element` (agent/marks.py) already attaches the ref's
+            # position among the matches when it can -- nth > 0 on the
+            # leading rung means a replay *will* resolve this correctly, it
+            # is just resting on page order rather than a name. Only nth == 0
+            # is genuinely unresolved: the ladder format cannot tell "the
+            # first of several" apart from "no position given" (see that
+            # module's own docstring), so a replay really will refuse to
+            # guess there. Warning about both alike would tell a reviewer to
+            # re-record a step that already works.
+            leading = step.locators[0]
+            unreliable = (
+                leading.strategy == "role"
+                and leading.role in STRUCTURAL_ROLES
+                and not leading.name
             )
+            if unreliable:
+                # Found for real: a step recorded as "the 14th of 40 generic
+                # elements" replayed against a page exposing *zero* generic
+                # elements minutes later -- the count was never a property of
+                # the control, only of how that render happened to nest
+                # anonymous wrapper divs. Position among *named* duplicates is
+                # at least a real, if imperfect, proxy for which one was
+                # meant; position among nameless structural wrappers is not,
+                # regardless of nth, so this warns the same way whichever
+                # position it landed on.
+                warnings.append(
+                    f"Step {step.id} ({step.action} {step.description!r}) matched "
+                    f"{call.match_count} identical, unnamed '{leading.role}' "
+                    "elements when it was recorded -- a generic wrapper, not a "
+                    "real control. Its position among the others is not "
+                    "something a replay can trust: it can differ the next time "
+                    "this page renders, for reasons unrelated to which one was "
+                    "meant. Re-record this step against something with a real "
+                    "name -- a nearby button, link or heading -- instead."
+                )
+            elif leading.nth == 0:
+                warnings.append(
+                    f"Step {step.id} ({step.action} {step.description!r}) matched "
+                    f"{call.match_count} elements when it was recorded, not one. "
+                    "A replay will refuse to guess which one was meant. Point at "
+                    "something more specific -- inside the right row or card -- "
+                    "and re-record this step."
+                )
+            else:
+                position = leading.nth + 1
+                warnings.append(
+                    f"Step {step.id} ({step.action} {step.description!r}) is one of "
+                    f"{call.match_count} identical matches; a replay will use "
+                    f"the {position}{ordinal_suffix(position)} one, by position "
+                    "on the page. That works, but only as long as this list does "
+                    "not reorder between runs -- re-record this step against "
+                    "something that names the row or card instead if it can."
+                )
     return steps
 
 
