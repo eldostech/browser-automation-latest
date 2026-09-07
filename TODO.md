@@ -75,10 +75,11 @@ the WebSocket are unauthenticated, and no table has an owner column.
       Backend on 3.11/3.13 against a real Postgres, `alembic check`, frontend
       type-check and build, and a secret scan. The scan caught a real password
       during this work, which is the argument for automating the habit.
-- [x] **B1 — Persistent checkpointer** *(done — `checkpoints.py`)*
-      Postgres where psycopg's async mode can run, a SQLite *file* on Windows
-      where it cannot (psycopg needs a Selector loop; the browser subprocess
-      needs Proactor). Durable on both.
+- [x] **B1 — Persistent checkpointer** *(done, then simplified — `agent/graph.py:memory_checkpointer`)*
+      The Postgres/SQLite dual-backend checkpointer (`checkpoints.py`) that
+      this line used to describe is gone: the `create_agent` rewrite moved to
+      LangGraph's in-memory saver, one per session. `checkpoints.py` no
+      longer exists — do not point new readers at it.
 - [x] **B2 + D2 — Postgres via SQLAlchemy 2.0 + Alembic** *(done)*
       Ownership columns were born in the initial migration, as planned.
       Artifacts still go to local disk — S3 remains outstanding.
@@ -132,12 +133,14 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
       healing and repair still speak Anthropic-shaped dicts. Migrating those three
       call sites to LangChain messages deletes **≈150 lines** and one of the two
       message dialects. Already flagged in the `f0037a0` commit message.
-- [ ] **C3 — Approvals via LangGraph `interrupt()`** *(Medium, M — after B1)*
-      Two pause mechanisms coexist today: the graph, and a custom future-based
-      rendezvous (`RunApprovalGate`). With a persistent checkpointer,
-      `interrupt()` + `Command(resume=)` makes a **pending approval survive a
-      restart** — a genuinely new property. Restructures the run-task lifecycle and
-      the approve endpoint, so it needs its own change.
+- [x] **C3 — Approvals via LangGraph `interrupt()`** *(done —
+      `HumanInTheLoopMiddleware` in `agent/graph.py`)*
+      An irreversible action suspends the graph via `interrupt()`; `resume()`
+      answers with `Command(resume=...)`. The custom future-based rendezvous
+      is gone. The one caveat B1 used to promise — surviving a process
+      restart — no longer holds now that the checkpointer is in-memory rather
+      than Postgres-backed; a pending approval survives within the process,
+      not across a restart.
 - [x] **D3 — `Settings` by injection** *(done)*
       The module-level `settings` object is gone; `create_app(settings)` is a
       factory. This is what closed the "`.env` leaks into tests" class.

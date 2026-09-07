@@ -1,7 +1,13 @@
-# Browser Automation
+# TRACE
+
+**T**ask **R**ecording & **C**onsistent **E**xecution.
 
 Record a browser workflow by doing it **once**, map a spreadsheet onto it, and
 replay it over a thousand rows — **without an LLM in the loop**.
+
+New install? Start with [`INSTALL.md`](INSTALL.md) — an ordered, copy-paste
+walkthrough from a fresh clone to a signed-in dashboard. This document covers
+the same setup in more depth, plus everything after it.
 
 > Sign in to the supplier portal, open each order in this spreadsheet, and mark
 > it dispatched.
@@ -41,10 +47,10 @@ favours being obvious over being clever.
 
 ## Why it is built this way
 
-This project used to record workflows with an **LLM agent**: you described a
-task in English and a model drove the browser until it worked. That is the
-right design for *figuring out* how to do something and the wrong one for doing
-the same thing a thousand times.
+This project's first version recorded workflows with an **LLM agent**: you
+described a task in English and a model drove the browser until it worked.
+That was the right design for *figuring out* how to do something and the wrong
+one for doing the same thing a thousand times.
 
 The cost was measurable, from this repository's own data. One recorded workflow
 — 35 steps — consumed roughly **247,000 input tokens**, because the agent
@@ -55,19 +61,30 @@ The observation that replaced it: **the user already knows how to do the task.**
 They do it every day. They do not need a model to discover it; they need the
 software to watch them do it once.
 
-So recording is now `playwright codegen` — a real browser, your hands, zero
-tokens — and the resulting script is *parsed*, not interpreted. What remains of
-the old design is the part that was always right: a use case is a durable,
-parameterised list of steps that replays with no model at all.
+So the default recording path is `playwright codegen` — a real browser, your
+hands, zero tokens — and the resulting script is *parsed*, not interpreted. A
+use case is a durable, parameterised list of steps that replays with **no
+model at all**, and that guarantee is mechanical: `engine.py` does not import
+`llm`, and a test asserts it.
+
+**The agent came back, beside the deterministic engine rather than instead of
+it, once that guarantee no longer had to be given up to get it.** Describing a
+task in English still records a use case — the same draft, the same review
+screen, the same free replay afterward — for the cases codegen cannot reach at
+all: a task easier to describe than to click through by hand, or a page whose
+structure changes in a way that breaks the recorded steps. What changed since
+the first version is where the model's work stops: it authors the recording
+once, is asked to repair one broken step when a site redesigns, and is never in
+the loop for the row-after-row replay that used to cost 247,000 tokens.
 
 For what is stored where -- every table, what it holds and why -- see
 [`docs/design/data-model.md`](docs/design/data-model.md).
 
-For the proposed design that adds an LLM agent beside the deterministic engine
--- authoring a workflow by describing it, and running one adaptively, without
-losing free replay -- see
+For the design of the agent path -- authoring a workflow by describing it,
+`create_agent` and its middleware, the tool registry that lets a workspace give
+the agent more than the browser, and how a mid-replay repair shares the same
+guardrails -- see
 [`docs/design/agent-and-deterministic.md`](docs/design/agent-and-deterministic.md).
-Nothing in that document is built.
 
 If you want the full reasoning, including the three things the design document
 asserted that turned out to be wrong, read
@@ -80,7 +97,8 @@ asserted that turned out to be wrong, read
 ```mermaid
 flowchart TB
     subgraph FE["React + Tailwind dashboard"]
-        REC["Record"]
+        REC["Record — do it myself"]
+        AGENTREC["Record — describe it"]
         MAP["Upload + map columns"]
         TRAIL["Timeline + visual diff"]
         LEARN["What it has learned"]
@@ -89,6 +107,7 @@ flowchart TB
     subgraph API["FastAPI"]
         RECORDER["recorder.py<br/>codegen subprocess"]
         CODEGEN["codegen.py<br/>AST parser"]
+        AGENT["agent/graph.py<br/>create_agent + middleware"]
         INGEST["ingest.py + mapping.py<br/>pandas"]
         QUEUE["jobs.py<br/>Postgres work queue"]
     end
@@ -98,8 +117,9 @@ flowchart TB
         BROWSER["browser.py<br/>async Playwright"]
     end
 
-    subgraph HEAL["Only on failure"]
+    subgraph HEAL["Only on failure, or in explore mode"]
         HEALER["healing.py"]
+        OPERATE["agent/operate.py<br/>recover / explore"]
         MEM["memory.py<br/>pgvector recall"]
     end
 
@@ -107,28 +127,35 @@ flowchart TB
     ART[("Artifacts<br/>disk or S3")]
 
     REC --> RECORDER --> CODEGEN --> DB
+    AGENTREC --> AGENT -->|"distil + verify"| DB
     MAP --> INGEST --> DB
     QUEUE --> ENGINE --> BROWSER
     ENGINE --> ART
     ENGINE -->|"a locator broke"| HEALER
+    ENGINE -->|"guided / explore mode"| OPERATE
     HEALER <--> MEM <--> DB
+    OPERATE <--> MEM
     DB --> TRAIL
     DB --> LEARN
 ```
 
-**Three phases, and only one of them can spend money.**
+**Four phases, and only replay is guaranteed to spend nothing.**
 
 | Phase | What happens | Model cost |
 |---|---|---|
-| **Record** | `playwright codegen` captures your session; `codegen.py` parses it | none |
+| **Record** | `playwright codegen`, **or** describe the task to an agent that drives a real browser and marks what varies | none, or a bounded one-time spend |
 | **Map** | Column names matched to fields by string handling and value shape | none, usually |
 | **Replay** | `engine.py` drives Playwright directly, row after row | **none, ever** |
-| **Heal** | Only when a locator stops matching, and only if enabled | one call, budgeted |
+| **Heal** | Only when a locator stops matching (`guided`/`explore` modes), and only if enabled | one call, budgeted |
 
-**The zero-token guarantee is structural, not a promise.** `engine.py` does not
-import `llm`, `UseCaseExecutor` has no parameter that could accept a model
-client, and a test asserts both. A healer is *injected*; with none passed there
-is no code path to a model at all.
+**The zero-token replay guarantee is structural, not a promise.** `engine.py`
+does not import `llm`, `UseCaseExecutor` has no parameter that could accept a
+model client, and a test asserts both. A healer is *injected*; with none
+passed there is no code path to a model at all. The agent path is a
+**separate, optional package** (`agent/`, `pip install -r
+backend/requirements-agent.txt`) that produces the same kind of use case
+codegen does — the guarantee is about what runs *afterward*, not about how a
+use case was written down in the first place.
 
 ---
 
@@ -166,7 +193,7 @@ who would rather not install Postgres, not the intended path.
 | Requirement | Version | Why |
 |---|---|---|
 | **Python** | 3.11+ (3.11–3.13 tested) | The backend. Uses `X \| Y` unions and `asyncio.timeout`. |
-| **Node.js** | 20+ | Builds the frontend. **Not** needed to record — Playwright's Python package ships its own codegen. |
+| **Node.js** | 18+ | Builds the frontend. **Not** needed to record with codegen — Playwright's Python package ships its own. **Needed for the agent** — it drives the browser over `npx @playwright/mcp`. |
 | **PostgreSQL** | 14+ (17/18 tested) | Everything: runs, use cases, credentials, the job queue, the event fan-out, and healing memory. |
 | **pgvector** | any recent | The `vector` extension, for healing memory. Optional if you turn that off. |
 | **AWS credentials** | — | Claude on Bedrock, for mapping and healing. No API key. |
@@ -269,6 +296,18 @@ python -m venv .venv
 **Use the venv.** Installing these into a system Python will fight with whatever
 else lives there — these pin `langchain-core`, `pydantic` and `boto3`, and pip
 will happily upgrade them out from under your other projects.
+
+**Optional: the agent.** `requirements.txt` alone gives you deterministic
+recording and replay. To also record by describing a task in English:
+
+```bash
+.venv/Scripts/python -m pip install -r backend/requirements-agent.txt
+```
+
+This is deliberately a separate file — it adds `mcp`, `langgraph` and
+`langchain`, and a deployment that only replays should not need any of them
+installed. With it absent, `AGENT_ENABLED` reports why rather than the app
+failing to start; recording still works with just "Do it myself".
 
 ### 4. The browser
 
@@ -390,11 +429,20 @@ To separate them, set `WORKER_ENABLED=false` on the API and run, from `backend/`
 
 ### 1. Record
 
-**Record** → give a starting URL → a real browser window opens.
+Two ways in, one result — both land on the same review screen and produce the
+same kind of use case, replayed the same way afterward.
 
-Do the task once, by hand. Sign in, fill the form, submit it. Then **close the
+**Do it myself** → give a starting URL → a real browser window opens. Do the
+task once, by hand. Sign in, fill the form, submit it. Then **close the
 window** — that is how you finish. Nothing is sent to a model; your actions are
 captured directly.
+
+**Describe it** → give the task in English and a starting URL → an agent
+drives a browser, in a window you can watch. It marks what varies per row and
+what to read out as it goes, and before you see a draft it replays what it
+recorded from a cold start to prove it actually works. This costs tokens once,
+bounded by a budget shown before it starts — never per row afterward. It needs
+the agent extra installed (above) and `AGENT_ENABLED=true`.
 
 ### 2. Say what you typed
 
@@ -423,6 +471,15 @@ silently on row 12 and report success on all of them.
 Lines the parser could not represent are listed rather than guessed at — a
 chained locator, an iframe, a file upload. It refuses instead of approximating,
 because the alternative is a step that clicks something *adjacent* on row one.
+
+A draft can also warn that a step's locator **matched more than one element
+when it was recorded** — a "Chat" button that exists once per row of a list,
+say. The click itself always landed on the right one; what got saved is a
+description (role and name) durable enough to survive a redesign, and on a
+repeated-element page that description can fit several controls. Replay will
+refuse to guess among them rather than act on the wrong row, so this is worth
+fixing before publishing: re-record the step pointing at something that names
+the right row or card, not just the control inside it.
 
 ### 4. Upload data and confirm the mapping
 
@@ -578,8 +635,10 @@ likely to touch:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `LLM_REPAIR_MODEL` | a Claude inference profile | The only model role left. |
+| `LLM_REPAIR_MODEL` | a Claude inference profile | Used for repair, healing, and the agent's authoring loop. |
 | `AWS_REGION`, `AWS_PROFILE` | unset | Usually best left to the credential chain. |
+| `AGENT_ENABLED` | `false` | Turns on "Describe it" recording. Needs `requirements-agent.txt` installed and Node on `PATH`. |
+| `AGENT_MCP_VERSION` | pinned | Which `@playwright/mcp` release the agent drives — bumping it is deliberate; `agent/guardrails/catalog.py` is written against it. |
 
 ### Browser and recording
 
@@ -621,7 +680,9 @@ Bearer token on every route except `/healthz` and `/api/auth/login`.
 
 | Area | Endpoints |
 |---|---|
-| **Recording** | `POST /api/recordings`, `GET /api/recordings/{id}`, `POST /api/recordings/{id}/save`, `/cancel`, `DELETE` |
+| **Recording — do it myself** | `POST /api/recordings`, `GET /api/recordings/{id}`, `POST /api/recordings/{id}/save`, `/cancel`, `DELETE` |
+| **Recording — describe it** | `POST /api/agent-sessions`, `GET /api/agent-sessions/{id}`, `POST /{id}/decide`, `/save`, `/cancel` (needs the agent extra installed) |
+| **Agent tool servers** | `GET/POST /api/agent-tool-servers`, `DELETE /{id}`, `POST /preview` — what an agent session may reach for beyond the browser |
 | **Use cases** | `GET/PUT/PATCH/DELETE /api/usecases/{id}`, `/publish`, `/repair`, `/scripts`, `/activity` |
 | **Data** | `POST /api/datasets` (multipart), `GET /api/datasets`, `POST /api/usecases/{id}/mapping` |
 | **Running** | `POST /api/usecases/{id}/execute`, `/batch`, `GET /api/batches/{id}`, `/resume`, `/cancel`, `/results.csv` |
@@ -658,9 +719,20 @@ JavaScript in a session that may be signed in, so both the use case's own
 `allow_scripts` *and* a separate admin-only flag on the resource must agree. An
 author cannot grant themselves code execution by editing JSON.
 
-**The model cannot invent a locator.** Healing and repair both present a
-numbered list of controls actually on the page and take back an index. A
-hallucinated selector has no route into something that runs unattended.
+**The model cannot invent a locator.** Healing, repair and the agent all act by
+reference into a snapshot the page actually reported — a raw selector the
+model composed itself is refused, and refused as a rule enforced by the guard,
+not a rule the model was merely asked to follow.
+
+**An agent session cannot leave the allowlist, act on a stale reference, or
+take an irreversible action without a person.** The same guard the
+deterministic engine's ref discipline is built on decides, from the call's own
+arguments, whether a submit, a payment or a delete stops and asks — never from
+the model's opinion of its own next action. A workspace can also give an agent session more tools than the browser, via a
+registered MCP server (`POST /api/agent-tool-servers` — no dashboard screen
+yet, API only); a tool from one of those is classified the same
+deny-by-default way when it does not say otherwise about itself, and is never
+recorded as a replay step — only what the browser did becomes one.
 
 ---
 
@@ -670,22 +742,37 @@ hallucinated selector has no route into something that runs unattended.
 cd backend && ../.venv/Scripts/python -m pytest -q
 ```
 
-**655 tests: 644 run by default, 11 are skipped** because they need a real
-browser (below). They want a running PostgreSQL and use their own schema
-(`browser_test`), so they never touch your development data. Nothing in the
-default run calls AWS or opens a browser.
+**Around 925 tests run by default; another ~30 are skipped** because they need
+a real browser, a real Node subprocess, or real Bedrock spend (below). They
+want a running PostgreSQL and use their own schema (`browser_test`), so they
+never touch your development data. Nothing in the default run calls AWS or
+opens a browser.
 
-The real-browser tests are opt-in, because they launch Chromium:
+Three opt-in tiers, each pricier than the last:
 
 ```bash
+# real Chromium, replay end to end — no AWS, no Node
 cd backend && RUN_E2E=1 ../.venv/Scripts/python -m pytest -q -m e2e
+
+# real npx @playwright/mcp + Chromium, driving the agent's tool layer
+cd backend && RUN_MCP=1 ../.venv/Scripts/python -m pytest -q tests/test_agent_mcp_live.py
+
+# a real Bedrock model — spends a small amount of real money
+cd backend && RUN_LLM=1 ../.venv/Scripts/python -m pytest -q -s tests/test_agent_live_model.py
 ```
 
-Those eleven are worth knowing about. They serve a two-page site from a temp
-directory, record a codegen script against it, parse it, and replay it — nothing
-stubbed. They check parameterisation per row, the setup/row split, locator
-drift, assertions, extraction, screenshots, traces and the allowlist. Writing
-them found three things the design document had asserted and should not have.
+The `RUN_E2E` tests serve a two-page site from a temp directory, record a
+codegen script against it, parse it, and replay it — nothing stubbed. They
+check parameterisation per row, the setup/row split, locator drift, assertions,
+extraction, screenshots, traces and the allowlist.
+
+The `RUN_LLM` tier exists because a scripted fake model can only prove the
+*graph* is correct — the interrupt, the budget, the tool dispatch — not that a
+real model actually follows these prompts. Every real behavioural bug found in
+this codebase (a model fabricating a credential it was never given, an agent
+that narrated "the task is complete" without calling the tool that says so, a
+model taking 95 seconds before its first visible action) was caught here and
+nowhere else.
 
 Frontend:
 
@@ -785,6 +872,29 @@ backend/
   routers/           One module per resource
   recorder.py        The codegen subprocess
   codegen.py         Parses what it writes. Never executes it.
+  agent/             Optional: record and repair by describing a task
+    tools/             What this codebase implements itself, one tool per
+                        file — the marks, and `finish`. Playwright's own
+                        tools are advertised by Playwright MCP and never
+                        appear here.
+    guardrails/         What's allowed, and what needs a person first:
+                        `guard.py` decides, `catalog.py` is the data (both
+                        Playwright's tool names and what this codebase's
+                        own tools need).
+    providers/          Where the browser/MCP connection comes from —
+                        `local_playwright.py`, `stdio_mcp.py` (a registered
+                        server), `inprocess.py` (mid-replay recovery,
+                        sharing the replay's own browser).
+    session.py          Ties guard + dispatch + secrets + marks together
+                        for one session — see `tool_adapter.py` for how its
+                        tools reach `create_agent`.
+    middleware.py         Budget, prompt caching, the `finish` tool
+    graph.py               `create_agent` + middleware, wired together
+    manager.py         Adapter between HTTP and `agent.run.AgentSession`
+    run.py             Entry point: one session, browser open across a pause
+    distil.py          A trajectory becomes a UseCase document
+    verify.py          Proves the draft replays, cold, before anyone sees it
+    operate.py         Mid-replay repair and `explore` mode, same guardrails
   ingest.py          CSV/Excel/text → rows + column profiles (pandas)
   mapping.py         Columns → declared fields, heuristics first
   usecase.py         The UseCase schema — the contract between phases
@@ -802,9 +912,9 @@ backend/
   policy.py          The domain allowlist
   redaction.py       Secrets never reach the event log
   migrations/        Alembic
-  tests/             655 tests, 11 of them opt-in
+  tests/             ~950 tests; RUN_E2E / RUN_MCP / RUN_LLM are opt-in
 frontend/src/
-  components/        RecordWorkflow, DatasetMapper, StepTrail, HealingMemory…
+  components/        RecordWorkflow, AgentSession, DatasetMapper, StepTrail…
   lib/               API client, event types, run stream
 deploy/              EKS manifests and their reasoning
 docs/design/         Why it is shaped this way, and the data model
