@@ -35,6 +35,55 @@ async def test_events_replay_after_a_sequence_number(store):
     assert [event.seq for event in replayed] == [4, 5]
 
 
+async def test_creating_many_executions_at_once_matches_one_at_a_time(store):
+    """A batch used to insert its execution rows one at a time, each a
+    separate session/round trip -- on a remote database that scaled the wait
+    before row 0 even started with the row count. `create_executions` is the
+    replacement: one session, one bulk insert, the identical rows."""
+    usecase_id, _ = await store.save_usecase(
+        {
+            "id": "uc00000000000000000000000000ex01",
+            "name": "Bulk insert target",
+            "status": "ready",
+            "allowed_domains": ["vendor.test"],
+            "row_steps": [
+                {"id": "s1", "action": "click",
+                 "locators": [{"strategy": "role", "role": "button", "name": "Go"}]}
+            ],
+        }
+    )
+    # No batch_id: a real one is a foreign key to a row in `batches`, which
+    # this test has no reason to create just to prove a bulk insert works --
+    # `run_id` alone is enough to identify these rows as one group.
+    rows = [
+        {
+            "id": f"ex{i:030d}",
+            "usecase_id": usecase_id,
+            "version": 1,
+            "run_id": "r-bulk-insert-test",
+            "row_index": i,
+            "inputs": {"n": i},
+            "owner_id": None,
+            "owner_email": "person@example.com",
+        }
+        for i in range(5)
+    ]
+
+    await store.create_executions(rows)
+
+    saved = await store.list_executions(usecase_id=usecase_id)
+    assert len(saved) == 5
+    assert [row["row_index"] for row in saved] == [0, 1, 2, 3, 4]
+    assert saved[0]["status"] == "pending"
+    assert saved[3]["inputs"] == {"n": 3}
+    assert saved[0]["owner_email"] == "person@example.com"
+
+
+async def test_creating_no_executions_is_a_quiet_no_op(store):
+    await store.create_executions([])
+    assert await store.list_executions(batch_id="nothing-here") == []
+
+
 async def test_thinking_events_upsert_on_the_same_seq(store):
     """Streaming rewrites one row rather than appending a bubble per delta."""
     await store.create_run("r1", "t", None, {})

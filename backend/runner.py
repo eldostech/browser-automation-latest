@@ -299,8 +299,19 @@ class ReplayManager:
         refusal, which is the point -- falling back to the recorded URL would
         send a use case promoted to production at whatever host it was recorded
         against, silently.
+
+        Skips the read entirely when ``override`` is already given:
+        ``resolve_base_url`` returns it outright without ever looking at
+        ``targets`` in that case, so querying them first was a round trip
+        spent on an answer that was always going to be thrown away -- a batch
+        that already pinned its base URL in ``start_batch`` pays for this
+        query a second time, for nothing, on every row-group it drives.
         """
-        targets = await self.data(workspace_id).target_urls() if workspace_id else {}
+        targets = (
+            await self.data(workspace_id).target_urls()
+            if workspace_id and not override
+            else {}
+        )
         base = resolve_base_url(
             target=usecase.target,
             targets=targets,
@@ -687,6 +698,13 @@ class ReplayManager:
                 run_id, data, self.bus, redactor=redactor
             ) as run:
                 result = await self._drive(request, run_id, run.sink, redactor)
+                if result.repair_proposal is not None:
+                    # Before `run.finish`, not after: the live event and the
+                    # stored execution must agree on the final error text.
+                    await _persist_repair_proposal(
+                        data, usecase.id, result,
+                        owner_id=request.owner_id, owner_email=request.owner_email,
+                    )
                 run.finish(replay_terminal(result))
 
             await data.finish_execution(
@@ -696,6 +714,8 @@ class ReplayManager:
                 failed_step_id=result.failed_step_id,
                 error=result.error,
                 duration_ms=result.duration_ms,
+                llm_calls=result.llm_calls,
+                llm_tokens=result.llm_tokens,
             )
             return {
                 "execution_id": execution_id,
@@ -734,8 +754,15 @@ class ReplayManager:
 
         result = RowResult(ok=False, error="replay did not start")
         try:
-            baselines = await self.data(request.workspace_id).baseline_steps(
-                request.usecase.id, request.version, exclude_run=run_id
+            # Neither read depends on the other's result, so they cost one
+            # round trip's worth of wait rather than two -- on a remote
+            # database this is the difference between waiting out one RTT
+            # and waiting out two before the browser even opens.
+            baselines, env = await asyncio.gather(
+                self.data(request.workspace_id).baseline_steps(
+                    request.usecase.id, request.version, exclude_run=run_id
+                ),
+                self.resolve_env(request.usecase, request.workspace_id, request.base_url),
             )
             async with PlaywrightSession(browser_config) as browser:
                 executor = UseCaseExecutor(
@@ -746,9 +773,7 @@ class ReplayManager:
                     secrets=request.secrets,
                     redactor=redactor,
                     step_timeout=self.settings.replay_step_timeout,
-                    env=await self.resolve_env(
-                        request.usecase, request.workspace_id, request.base_url
-                    ),
+                    env=env,
                     screenshots=self.settings.replay_screenshots,
                     healer=self.make_healer(
                         request.workspace_id,
@@ -926,25 +951,32 @@ async def _drive_batch(
     # One execution row per input row, created up-front so a batch that stops
     # early leaves the unattempted rows visibly `pending` rather than absent.
     execution_ids: dict[int, str] = {}
-    for position, row_index in enumerate(indices):
-        execution_id = uuid.uuid4().hex
-        execution_ids[position] = execution_id
-        await store.create_execution(
-            execution_id,
-            usecase.id,
-            request.version,
-            run_id=run_id,
-            batch_id=batch_id,
-            row_index=row_index,
-            inputs=rows[position],
-            owner_id=request.owner_id,
-            owner_email=request.owner_email,
-        )
+    for position in range(len(indices)):
+        execution_ids[position] = uuid.uuid4().hex
+    await store.create_executions(
+        [
+            {
+                "id": execution_ids[position],
+                "usecase_id": usecase.id,
+                "version": request.version,
+                "run_id": run_id,
+                "batch_id": batch_id,
+                "row_index": row_index,
+                "inputs": rows[position],
+                "owner_id": request.owner_id,
+                "owner_email": request.owner_email,
+            }
+            for position, row_index in enumerate(indices)
+        ]
+    )
 
     progress = BatchProgress(total=len(rows), pending=len(rows))
     try:
-        baselines = await store.baseline_steps(
-            usecase.id, request.version, exclude_run=run_id
+        # See the identical comment in `_drive` -- one round trip's wait
+        # instead of two, when a remote database makes that wait real.
+        baselines, env = await asyncio.gather(
+            store.baseline_steps(usecase.id, request.version, exclude_run=run_id),
+            manager.resolve_env(usecase, request.workspace_id, request.base_url),
         )
         async with PlaywrightSession(browser_config) as browser:
             executor = UseCaseExecutor(
@@ -955,9 +987,7 @@ async def _drive_batch(
                 secrets=request.secrets,
                 redactor=redactor,
                 step_timeout=manager.settings.replay_step_timeout,
-                env=await manager.resolve_env(
-                    usecase, request.workspace_id, request.base_url
-                ),
+                env=env,
                 screenshots=manager.settings.replay_screenshots,
                 healer=manager.make_healer(
                     request.workspace_id, usecase.id, mode=usecase.mode
@@ -991,8 +1021,25 @@ async def _drive_batch(
                 ),
             )
 
+            #: Steps a repair has already been proposed for in this batch.
+            #: Without this, four thousand rows hitting the same broken
+            #: locator would each independently produce their own diagnosis
+            #: and their own near-identical draft version -- one is enough
+            #: for a person to review; the rest just add noise.
+            proposed_for: set[str] = set()
+
             async def record(position: int, row: dict[str, Any], result: RowResult) -> None:
                 """Persist each row as it finishes, so progress survives a crash."""
+                if result.repair_proposal is not None:
+                    step_id = result.failed_step_id or ""
+                    if step_id and step_id in proposed_for:
+                        result.repair_proposal = None
+                    else:
+                        proposed_for.add(step_id)
+                        await _persist_repair_proposal(
+                            store, usecase.id, result,
+                            owner_id=request.owner_id, owner_email=request.owner_email,
+                        )
                 await store.finish_execution(
                     execution_ids[position],
                     "succeeded" if result.ok else "failed",
@@ -1000,6 +1047,8 @@ async def _drive_batch(
                     failed_step_id=result.failed_step_id,
                     error=result.error,
                     duration_ms=result.duration_ms,
+                    llm_calls=result.llm_calls,
+                    llm_tokens=result.llm_tokens,
                 )
                 await store.update_batch(
                     batch_id,
@@ -1097,3 +1146,81 @@ async def _persist_repairs(store: WorkspaceStore, usecase_id: str, repairs: list
         "wrote healed locators back",
         extra={"usecase_id": usecase_id, "version": version, "repairs": len(repairs)},
     )
+
+
+async def _persist_repair_proposal(
+    store: WorkspaceStore,
+    usecase_id: str,
+    result: RowResult,
+    *,
+    owner_id: str | None,
+    owner_email: str = "",
+) -> None:
+    """Turn a row's automatic repair proposal into a draft version, or drop it.
+
+    `agent/operate.py` produced the diagnosis but has no store -- the same
+    reason `engine.py` cannot import `llm` -- so this is where the "propose,
+    never apply unreviewed" rule that `repair.py`'s own router enforces gets
+    enforced here too: a draft version, published only when a person presses
+    Publish, exactly the gate every other repair goes through.
+
+    Consumes `result.repair_proposal` either way (sets it back to `None`), so
+    nothing downstream of this call sees a pending proposal that either was
+    already turned into a draft or was never going to be one.
+    """
+    pending = result.repair_proposal
+    result.repair_proposal = None
+    if pending is None:
+        return
+
+    from pydantic import ValidationError
+    from repair import apply_fixes, candidates, is_unchanged, validate_patched
+
+    try:
+        definition = await store.get_usecase(usecase_id)
+        if definition is None:
+            return
+        patched, applied = apply_fixes(
+            definition, pending.proposal, candidates(pending.snapshot), pending.snapshot
+        )
+        if is_unchanged(definition, patched):
+            return
+        patched["status"] = "draft"
+        validate_patched(patched)
+        _, version = await store.save_usecase(
+            patched, created_by="auto-repair", created_by_id=owner_id
+        )
+        await store.set_usecase_status(usecase_id, "draft")
+        await store.audit(
+            "usecase.repair",
+            actor_id=owner_id,
+            actor_email=owner_email,
+            resource_type="usecase",
+            resource_id=usecase_id,
+            detail={
+                "version": version,
+                "fixes": len(applied),
+                "tokens": pending.proposal.tokens,
+                "automatic": True,
+            },
+        )
+    except ValidationError:
+        log.warning(
+            "an automatic repair proposal produced an invalid draft, dropped",
+            extra={"usecase_id": usecase_id},
+        )
+        return
+    except Exception:  # noqa: BLE001 - a bonus attempt must not break the row
+        log.exception(
+            "failed to save an automatic repair proposal", extra={"usecase_id": usecase_id}
+        )
+        return
+
+    log.info(
+        "an agent recovery could not clear the way; proposed a repair automatically",
+        extra={"usecase_id": usecase_id, "version": version},
+    )
+    result.error = (
+        f"{result.error or ''} A repair was proposed automatically and saved as "
+        f"draft version {version} for review: {pending.proposal.diagnosis}"
+    ).strip()

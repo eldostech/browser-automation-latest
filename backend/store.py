@@ -1196,6 +1196,42 @@ class WorkspaceStore:
             )
             await session.commit()
 
+    async def create_executions(self, rows: list[dict[str, Any]]) -> None:
+        """Insert many execution rows in one transaction.
+
+        A batch creates one of these per input row, up front, before the
+        browser even opens -- calling `create_execution` in a loop meant N
+        separate sessions, each paying a full round trip (pool checkout,
+        pre-ping, INSERT, COMMIT) before row 0 could start. On a remote
+        database that is the dominant cost in "queued, but slow to actually
+        start" -- proportional to row count and RTT, and paid entirely
+        before any work begins. One session, one bulk insert, one commit
+        removes the row-count factor; it is still O(1) round trips whether
+        the batch has ten rows or ten thousand.
+        """
+        if not rows:
+            return
+        async with self._sessions() as session:
+            session.add_all(
+                [
+                    Execution(
+                        id=row["id"],
+                        workspace_id=self._ws,
+                        owner_id=row.get("owner_id"),
+                        owner_email=row.get("owner_email") or "",
+                        batch_id=row.get("batch_id"),
+                        usecase_id=row["usecase_id"],
+                        version=row["version"],
+                        run_id=row.get("run_id"),
+                        row_index=row.get("row_index"),
+                        inputs=row.get("inputs") or {},
+                        status="pending",
+                    )
+                    for row in rows
+                ]
+            )
+            await session.commit()
+
     async def finish_execution(
         self,
         execution_id: str,
