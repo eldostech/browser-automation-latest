@@ -15,8 +15,8 @@
  * If this ever holds anything more valuable, revisit that.
  */
 
-const TOKEN_KEY = 'understudy.token';
-const USER_KEY = 'understudy.user';
+const TOKEN_KEY = 'trace.token';
+const USER_KEY = 'trace.user';
 
 export interface CurrentUser {
   id: string;

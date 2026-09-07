@@ -1540,9 +1540,10 @@ table.mapping .examples {
   border-radius: var(--radius-sm);
 }
 
-/* --- help ----------------------------------------------------------------
-   A slide-over rather than a page, so the guidance sits beside whatever you
-   were stuck on rather than replacing it. */
+/* --- help ------------------------------------------------------------
+   A page rather than a popup: a technical reader wants the architecture,
+   not a slide-over's worth of it, and both readers want a URL they can
+   bookmark and hand to a teammate. See components/Help.tsx. */
 .topbar .help-button {
   display: inline-flex;
   align-items: center;
@@ -1558,50 +1559,120 @@ table.mapping .examples {
   background: rgba(255, 255, 255, 0.16);
   border-color: var(--gold);
 }
-.help-scrim {
-  position: fixed;
-  inset: 0;
-  background: rgba(18, 41, 61, 0.35);
-  z-index: 40;
+.topbar .help-button.active {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: var(--gold);
 }
-.help-panel {
-  position: fixed;
+
+.help-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 18px;
+}
+.help-page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+.help-page-head h2 {
+  margin: 0 0 4px;
+  font-size: 22px;
+}
+.help-page-head .hint {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.help-page-tabs {
+  margin: 0;
+  border-bottom: none;
+  flex-shrink: 0;
+}
+.help-page-tabs button {
+  font-size: 13.5px;
+  font-weight: 600;
+  padding: 9px 4px;
+}
+.help-page-tabs button.active {
+  border-bottom-color: var(--gold);
+}
+
+.help-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 32px;
+  align-items: start;
+  flex: 1;
+  min-height: 0;
+}
+
+.help-toc {
+  position: sticky;
   top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(560px, 100vw);
-  background: var(--bg-raised);
-  border-left: 1px solid var(--border);
-  box-shadow: -8px 0 32px rgba(18, 41, 61, 0.12);
-  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding-right: 12px;
+  border-right: 1px solid var(--border);
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+}
+.help-toc-group {
   display: flex;
   flex-direction: column;
 }
-.help-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 18px 24px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
+.help-toc-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 4px;
 }
-.help-head h2 {
-  margin: 0;
-  font-size: 19px;
+.help-toc button {
+  border: 0;
+  background: none;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  padding: 5px 8px;
+  margin: 0 -8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-dim);
 }
+.help-toc button:hover {
+  background: var(--bg-inset);
+  color: var(--text);
+}
+
 .help-body {
-  overflow: auto;
-  padding: 4px 24px 40px;
+  min-width: 0;
+  padding-bottom: 60px;
+}
+.help-body h2 {
+  font-size: 18px;
+  margin: 36px 0 10px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.help-body h2:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
 }
 .help-body h3 {
   font-size: 16px;
-  margin: 26px 0 8px;
+  margin: 24px 0 8px;
 }
 .help-body p,
 .help-body li {
   font-size: 14px;
   line-height: 1.6;
   color: var(--text-dim);
+  max-width: 74ch;
 }
 .help-body ol,
 .help-body ul {
@@ -1643,6 +1714,30 @@ table.mapping .examples {
   font-size: 13.5px;
   line-height: 1.6;
   color: var(--text-dim);
+  max-width: 74ch;
+}
+
+.help-diagram-figure {
+  margin: 16px 0 24px;
+  padding: 16px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.help-diagram-figure svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.help-diagram-figure figcaption {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+.help-diagram-figure figcaption code {
+  font-family: var(--mono);
+  font-size: 11.5px;
 }
 
 /* A pointer to a gesture that lives in another window, so it has to stand out

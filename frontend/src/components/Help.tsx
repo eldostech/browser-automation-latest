@@ -1,186 +1,93 @@
 /**
- * How to actually use this thing.
+ * Help, as a page rather than a popup.
  *
- * Written because the product is not self-evident: recording a workflow is
- * discoverable, and getting data *out* of a website is not. The panel is
- * organised by what someone is trying to do rather than by what the software
- * is made of, and it names what still has no screen — telling somebody to
- * click a button that does not exist is worse than telling them there is none.
+ * It used to be a slide-over so the guidance sat beside whatever you were
+ * stuck on. That stopped being enough once there was a second audience: a
+ * technical reader wants the architecture, not a panel's worth of it, and
+ * neither reader wants to lose their place in a modal every time they follow
+ * a cross-reference. A page with its own URL (`#/help`, `#/help/technical`)
+ * can be bookmarked, linked to a teammate, and read section by section.
+ *
+ * The two tracks are deliberately separate components (`HelpUserGuide`,
+ * `HelpTechnical`) rather than one file with a filter, because they have
+ * different authors in spirit — one written for whoever runs this, one for
+ * whoever maintains it — and mixing them would end up serving neither well.
  */
 
-import { useEffect } from 'react';
+import { useRef } from 'react';
+import { HelpUserGuide, USER_GUIDE_TOC } from './HelpUserGuide';
+import { HelpTechnical, TECHNICAL_TOC } from './HelpTechnical';
+
+export type HelpSectionName = 'user' | 'technical';
 
 type Props = {
-  onClose: () => void;
+  section: HelpSectionName;
+  onSection: (section: HelpSectionName) => void;
 };
 
-export function Help({ onClose }: Props) {
-  // Escape closes it. A panel that traps you is worse than no panel.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+export function Help({ section, onSection }: Props) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  const jumpTo = (id: string) => {
+    bodyRef.current?.querySelector<HTMLElement>(`#${id}`)?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    });
+  };
+
+  const toc = section === 'user' ? USER_GUIDE_TOC : TECHNICAL_TOC;
 
   return (
-    <>
-      <div className="help-scrim" onClick={onClose} />
-      <aside className="help-panel" role="dialog" aria-label="How to use Understudy">
-        <header className="help-head">
-          <h2>How this works</h2>
-          <button type="button" className="linkish" onClick={onClose}>
-            Close
-          </button>
-        </header>
-
-        <div className="help-body">
-          <p>
-            You do a task in a browser once. Understudy records it, and then repeats it —
-            once per row of a spreadsheet, with no model involved and no cost per run.
-          </p>
-
-          <h3>Two ways to record, one result</h3>
-          <p>
-            <strong>Do it myself</strong> opens a browser and records what you do. Free,
-            and the right choice when you know the steps.
-          </p>
-          <p>
-            <strong>Describe it</strong> gives the task to an agent, which works it out in
-            a browser you can watch. It costs tokens once. It marks what varies per row and
-            what to read out as it goes, and before you see anything it replays what it
-            recorded to check that it works &mdash; you are told either way.
-          </p>
-          <p>
-            Both land in the same review screen and produce the same use case, which
-            replays for nothing afterwards. Neither publishes anything: a person always
-            reviews before a thousand rows run.
-          </p>
-
-          <h3>Filling a website in from a spreadsheet</h3>
-          <ol>
-            <li>
-              <strong>Record.</strong> Give it a starting address. A browser window opens;
-              do the task by hand, then close the window. Nothing is recorded after that.
-            </li>
-            <li>
-              <strong>Name what you typed.</strong> Every value you entered is listed. Name
-              the ones that change per row — those become spreadsheet columns. Tick the
-              sign-in as a <em>credential</em>: those are entered once per run, stored
-              encrypted, and never written into the workflow.
-            </li>
-            <li>
-              <strong>Publish it.</strong> A recording is a draft until someone reviews it.
-              Publishing re-checks it and is required in each environment separately.
-            </li>
-            <li>
-              <strong>Run a file.</strong> Upload your spreadsheet, confirm which column
-              feeds which field, and start. Rows run in sequence on one browser session, so
-              it signs in once rather than once per row.
-            </li>
-          </ol>
-
-          <h3>Getting data out, into a spreadsheet</h3>
-          <p>
-            While recording, use the recorder&rsquo;s own toolbar:
-            <strong> Assert text</strong> for something shown on the page, or{' '}
-            <strong>Assert value</strong> for something typed into a field. Click the
-            button, then click the thing you want. Do that for each value.
-          </p>
-          <p>
-            When you close the window you are asked <em>What should it read?</em> — name
-            each one, and it becomes a column in the results file. Leave a name blank and
-            it stays a check that the page still says what it said.
-          </p>
-          <p>
-            Values are read on the page you pointed at them on, in the order you did it, so
-            reading something on one screen and then moving to the next works as you would
-            expect.
-          </p>
-          <div className="help-warning">
-            <strong>Still needing the API:</strong> reading a whole table in one step
-            (<code>extract_rows</code>), keeping a file (<code>download</code>), and reading
-            an attribute such as a link&rsquo;s address. Those exist in the engine and have
-            no screen yet.
-          </div>
-
-          <h3>Where the spreadsheet comes from</h3>
-          <p>
-            Results are produced <strong>per batch</strong>, not per single run. Use
-            &ldquo;Run a file&rdquo; even for one row, then use <strong>Results</strong> on
-            that batch — under &ldquo;Earlier runs&rdquo; if you have closed the tab since.
-            You get a CSV with one row out for every row in: your inputs, whether it worked,
-            and every value it read. It opens directly in Excel.
-          </p>
-          <p>
-            Files a <code>download</code> step kept are listed separately on the run, and
-            live wherever this deployment puts artifacts.
-          </p>
-
-          <h3>Finding what to run against in the first place</h3>
-          <p>
-            If you do not already have the list of records — account numbers, references —
-            an <code>extract_rows</code> step can read the site&rsquo;s own list page into
-            rows. When a run produces rows, the screen offers{' '}
-            <strong>Save as a dataset</strong>, and a second use case runs once per row to
-            pull the detail. One pass to find what exists, one to fetch it.
-          </p>
-
-          <h3>How much a model is allowed to do</h3>
-          <p>
-            Each use case chooses, under <em>How it runs</em>, and the choice travels
-            with it when it is promoted.
-          </p>
-          <ul>
-            <li>
-              <strong>Strict</strong> follows the recorded steps. No model can run &mdash;
-              the replay engine cannot reach one &mdash; so this costs nothing, ever.
-            </li>
-            <li>
-              <strong>Guided</strong> is the same until a step stops matching. Then one
-              budgeted call re-finds the control and the run carries on. A row where
-              nothing breaks costs nothing, which on a site that has not changed is all
-              of them.
-            </li>
-            <li>
-              <strong>Explore</strong> has no plan at all: it works each row out from the
-              page and the task. That costs on <em>every</em> row, so four thousand rows
-              is four thousand times. It is for work that genuinely cannot be recorded.
-            </li>
-          </ul>
-          <p>
-            Before a batch starts you are shown what it will cost. If a workspace has a
-            monthly limit (under <strong>Targets</strong>), a run stops when it is
-            reached rather than going past it.
-          </p>
-
-          <h3>Running the same workflow in dev, UAT and production</h3>
-          <p>
-            A use case names a <strong>target</strong>; each deployment says what address
-            that target has, under <strong>Targets</strong>. The workflow itself carries no
-            address, so the same one runs everywhere unchanged. Pick its target on the use
-            case screen under <em>Where it runs</em>.
-          </p>
-
-          <h3>When a step stops working</h3>
-          <p>
-            Sites get redesigned and a recorded control moves. The run stops at that step
-            and shows the page as it was, with <strong>Fix it with AI</strong>: it reads
-            that page, proposes a new locator, and saves it as a new draft version for you
-            to approve. What it learns is remembered, so the same change on the same site
-            costs one model call rather than one per run.
-          </p>
-
-          <h3>Being polite to the site</h3>
-          <p>
-            <em>Pace</em> on the use case screen sets the wait between rows. A long
-            extraction that reads as an attack gets the account blocked — and automating a
-            site you do not own can breach its terms even when the data is yours. Worth
-            checking before a few thousand rows.
+    <div className="help-page">
+      <div className="help-page-head">
+        <div>
+          <h2>Help &amp; documentation</h2>
+          <p className="hint">
+            {section === 'user'
+              ? 'How to use TRACE — recording, running, and reading what comes back.'
+              : 'How TRACE is built — for the team maintaining or extending it.'}
           </p>
         </div>
-      </aside>
-    </>
+        <div className="tabs help-page-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={section === 'user'}
+            className={section === 'user' ? 'active' : ''}
+            onClick={() => onSection('user')}
+          >
+            User guide
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={section === 'technical'}
+            className={section === 'technical' ? 'active' : ''}
+            onClick={() => onSection('technical')}
+          >
+            Technical &amp; architecture
+          </button>
+        </div>
+      </div>
+
+      <div className="help-layout">
+        <nav className="help-toc" aria-label="Sections on this page">
+          {toc.map((group) => (
+            <div className="help-toc-group" key={group.label}>
+              <div className="help-toc-label">{group.label}</div>
+              {group.items.map((item) => (
+                <button type="button" key={item.id} onClick={() => jumpTo(item.id)}>
+                  {item.title}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+
+        <div className="help-body" ref={bodyRef}>
+          {section === 'user' ? <HelpUserGuide /> : <HelpTechnical />}
+        </div>
+      </div>
+    </div>
   );
 }

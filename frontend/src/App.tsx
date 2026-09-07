@@ -18,7 +18,8 @@ type View =
   | { name: 'targets' }
   | { name: 'run'; runId: string }
   | { name: 'usecases' }
-  | { name: 'usecase'; usecaseId: string };
+  | { name: 'usecase'; usecaseId: string }
+  | { name: 'help'; section: 'user' | 'technical' };
 
 /** The run id lives in the URL hash so a live run can be shared or reloaded. */
 function viewFromHash(): View {
@@ -35,6 +36,8 @@ function viewFromHash(): View {
   if (hash === 'memory') return { name: 'memory' };
   if (hash === 'targets') return { name: 'targets' };
   if (hash === 'usecases') return { name: 'usecases' };
+  if (hash === 'help/technical') return { name: 'help', section: 'technical' };
+  if (hash === 'help' || hash === 'help/user') return { name: 'help', section: 'user' };
   return { name: 'record' };
 }
 
@@ -45,6 +48,7 @@ function hashFor(view: View): string {
   if (view.name === 'history') return '#/history';
   if (view.name === 'memory') return '#/memory';
   if (view.name === 'targets') return '#/targets';
+  if (view.name === 'help') return view.section === 'technical' ? '#/help/technical' : '#/help';
   return '#/record';
 }
 
@@ -56,7 +60,6 @@ export default function App() {
     queue?: { queued?: number; running?: number };
   } | null>(null);
   const [environment, setEnvironment] = useState('');
-  const [helpOpen, setHelpOpen] = useState(false);
 
   const navigate = useCallback((next: View) => {
     setView(next);
@@ -121,7 +124,7 @@ export default function App() {
               <path d="M9 12l2.2 2.2L15.5 10" />
             </svg>
           </span>
-          <h1>Understudy</h1>
+          <h1>TRACE</h1>
           <span className="qualifier">Automation Platform</span>
           {environment && (
             <span className="env" title="The deployment this dashboard is pointed at">
@@ -142,9 +145,9 @@ export default function App() {
           </span>
           <button
             type="button"
-            className="help-button"
-            onClick={() => setHelpOpen(true)}
-            title="How to use this"
+            className={`help-button${view.name === 'help' ? ' active' : ''}`}
+            onClick={() => navigate({ name: 'help', section: 'user' })}
+            title="How to use this, and how it's built"
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
               <circle cx="12" cy="12" r="9" />
@@ -200,9 +203,13 @@ export default function App() {
         </nav>
       </header>
 
-      {helpOpen && <Help onClose={() => setHelpOpen(false)} />}
-
-      <main className={view.name === 'run' || view.name === 'usecase' ? 'page' : 'page narrow'}>
+      <main
+        className={
+          view.name === 'run' || view.name === 'usecase' || view.name === 'help'
+            ? 'page'
+            : 'page narrow'
+        }
+      >
         {view.name === 'record' && !session.can('usecase:create') && (
           <div className="banner">
             Your role ({user.role}) cannot record workflows. Ask an administrator for the
@@ -240,6 +247,10 @@ export default function App() {
             onBack={() => navigate({ name: 'usecases' })}
             onOpenRun={(runId) => navigate({ name: 'run', runId })}
           />
+        )}
+
+        {view.name === 'help' && (
+          <Help section={view.section} onSection={(section) => navigate({ name: 'help', section })} />
         )}
       </main>
     </div>

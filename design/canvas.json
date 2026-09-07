@@ -46,7 +46,7 @@
       "x": 760,
       "y": -190,
       "w": 620,
-      "text": "Everything on these screens is your real content: the use cases from your database, the actual locator syntax, the UUID dropdown values, the s7 failure and its page census.\n\nTwo things settled since:\n• The product is Understudy. It watches a person do the task once and then performs that part faithfully — which is what this does now that the agent is gone, and what \"Browser Agent\" stopped describing.\n• The environment badge is permanent. An operator should never be unsure which deployment they are about to run a batch against."
+      "text": "Everything on these screens is your real content: the use cases from your database, the actual locator syntax, the UUID dropdown values, the s7 failure and its page census.\n\nTwo things settled since:\n• The product is TRACE. It watches a person do the task once and then performs that part faithfully — which is what this does now that the agent is gone, and what \"Browser Agent\" stopped describing.\n• The environment badge is permanent. An operator should never be unsure which deployment they are about to run a batch against."
     },
     {
       "id": "detail-note",
