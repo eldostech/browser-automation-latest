@@ -421,6 +421,21 @@ class Marks:
     def as_dicts(self) -> list[dict[str, Any]]:
         return [entry.as_dict() for entry in self.entries]
 
+    def progress_summary(self) -> str:
+        """How far this session actually got, in words.
+
+        For a stop that was not the model's own choice -- a budget run out --
+        the first thing worth knowing is whether that is "ran out with three
+        rows banked" or "ran out having recorded nothing at all". Both show up
+        identically as a token count; they are not identical.
+        """
+        done = len(self.rows)
+        if self._open_row is not None:
+            return f"{done} row(s) completed; {self._open_row[1]!r} was left open, unfinished."
+        if done == 0 and self.setup_ended_at is None:
+            return "Stopped during setup, before any row began."
+        return f"{done} row(s) completed."
+
 
 __all__ = [
     "as_name",

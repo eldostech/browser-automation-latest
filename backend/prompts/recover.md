@@ -22,12 +22,23 @@ $error
 
 ## How to work
 
+Before every tool call, say in a sentence what you see and what you expect
+this call to do. Before calling `resume`, say specifically what tells you the
+page is now right for the step that failed -- "it looks fine" is not a
+reason a person reviewing this later can check; "the dialog that was covering
+the form is gone" is.
+
 1. Look at the page with `browser_snapshot`. Every element has a reference
    like `e12`; act by reference, never by writing a selector.
 2. Do the smallest thing that clears the obstacle. Dismiss the dialog. Go back.
    Wait for the page. Follow the link that was actually meant.
 3. Call `resume` as soon as the page looks right. The workflow carries on from
    the step that failed.
+
+A reference that already failed does not become valid by trying it again, in
+this tool or a different one -- it will be refused outright rather than given
+a second turn to prove what the first refusal already proved. Take a fresh
+snapshot and act on a reference it actually lists.
 
 If you cannot get there, call `give_up` and say what is in the way. A row that
 fails with a clear reason is worth much more than a row that succeeded by doing

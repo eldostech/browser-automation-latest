@@ -103,6 +103,41 @@ def test_a_named_profile_is_passed_through():
     assert "no-such-profile" in str(excinfo.value)
 
 
+# --- extended thinking -------------------------------------------------------
+
+
+def test_thinking_is_off_by_default_setting_value():
+    model = chat_model(settings(llm_thinking_budget_tokens=0))
+    assert not (model.additional_model_request_fields or {}).get("thinking")
+    assert model.temperature == 0.0, "untouched when thinking never gets involved"
+
+
+def test_thinking_is_enabled_with_the_configured_budget():
+    model = chat_model(settings(llm_thinking_budget_tokens=2048, llm_max_tokens=8192))
+    assert model.additional_model_request_fields["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 2048,
+    }
+
+
+def test_temperature_is_dropped_while_thinking_is_enabled():
+    """Confirmed against the real model, not assumed from documentation: a
+    non-default temperature alongside `thinking` is rejected outright --
+    "`temperature` may only be set to 1 when thinking is enabled" -- so this
+    is a request that must never be sent, not one worth handling by retrying."""
+    model = chat_model(settings(llm_thinking_budget_tokens=2048, llm_temperature=0.0))
+    assert model.temperature is None
+
+
+def test_a_budget_that_would_leave_no_room_for_a_reply_is_clamped():
+    model = chat_model(
+        settings(llm_thinking_budget_tokens=8192, llm_max_tokens=4096)
+    )
+    thinking = model.additional_model_request_fields["thinking"]
+    assert thinking["budget_tokens"] < 4096
+    assert thinking["budget_tokens"] >= 1024
+
+
 # --- the bearer-token / profile conflict -----------------------------------
 
 
@@ -355,3 +390,37 @@ def test_a_failed_tool_result_is_marked_as_an_error():
         ]}],
     )
     assert converted[0].status == "error"
+
+
+# --- reading a turn's reasoning back out -------------------------------------
+
+
+def test_extended_thinking_content_reaches_text_of():
+    """The block shape here -- `reasoning_content` holding `text`/`signature`
+    -- is exactly what the real model returned with thinking enabled, not a
+    guess: confirmed by calling it. Without this, a turn could reason at
+    length and `text_of` would still report nothing, because nothing else in
+    this codebase reads any block type but `text`."""
+    from langchain_core.messages import AIMessage
+
+    from chat import text_of
+
+    message = AIMessage(
+        content=[
+            {
+                "type": "reasoning_content",
+                "reasoning_content": {"text": "The button is the second match.", "signature": "abc"},
+            },
+            {"type": "text", "text": "Clicking it now."},
+        ]
+    )
+    assert text_of(message) == "The button is the second match.Clicking it now."
+
+
+def test_a_turn_with_only_a_tool_call_has_no_text():
+    from langchain_core.messages import AIMessage
+
+    from chat import text_of
+
+    message = AIMessage(content=[{"type": "tool_use", "id": "c1", "name": "browser_click", "input": {}}])
+    assert text_of(message) == ""

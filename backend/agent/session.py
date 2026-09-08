@@ -36,6 +36,10 @@ from .tools import TOOLS, ToolDef
 
 log = logging.getLogger(__name__)
 
+#: How many recently-failed targets `AgentToolSession` remembers, per session.
+#: Small on purpose -- see `_failed_targets`'s own comment for what this is for.
+FAILED_TARGET_MEMORY = 8
+
 
 @dataclass(slots=True)
 class ToolCallRecord:
@@ -175,6 +179,21 @@ class AgentToolSession:
         #: exactly that.
         self._refs: frozenset[str] = frozenset()
         self._seq = 0
+        #: `target` values a dispatched call has already failed against,
+        #: mapped to why. Checked before the next dispatch and used to refuse
+        #: it outright rather than let it reach the browser again.
+        #:
+        #: Found for real: a session retried the identical invalid ref across
+        #: four calls and two different tools -- twice after `describe_element`
+        #: had already told it, in as many words, that the ref was "not on the
+        #: page as it now stands" -- and burned its whole token budget on that
+        #: loop before it ever reached the actual task. "A refusal comes back
+        #: as a tool error because that is what lets an agent adapt" (see
+        #: `call`'s own docstring) assumes the agent reads it; this is the
+        #: backstop for when it does not. Bounded, not permanent: a ref string
+        #: a much later snapshot generation happens to reuse must not be
+        #: refused for a mistake an earlier, unrelated snapshot made.
+        self._failed_targets: dict[str, str] = {}
 
     # -- lifecycle ----------------------------------------------------------
     async def __aenter__(self) -> "AgentToolSession":
@@ -338,6 +357,19 @@ class AgentToolSession:
         target_ref = str(arguments.get("target") or "")
         described = self._describe(target_ref) if target_ref else None
 
+        if target_ref and target_ref in self._failed_targets:
+            reason = self._failed_targets[target_ref]
+            return await self._finish(
+                name, arguments,
+                ToolResult.failed(
+                    f"'{target_ref}' already failed on this session: {reason} "
+                    "Retrying it will not make it valid. Take a fresh "
+                    "browser_snapshot and act on a ref that snapshot actually "
+                    "lists."
+                ),
+                verdict, started, refused=True, described=described,
+            )
+
         # `arguments` -- the placeholder-bearing version -- is what gets
         # recorded, redacted and shown back to the model. `dispatched` is a
         # copy with every `{{secret.x}}` turned into the real value, and it is
@@ -364,6 +396,9 @@ class AgentToolSession:
         except Exception as exc:  # noqa: BLE001 - a dead server is a tool error
             log.warning("tool call raised", extra={"tool": name, "error": str(exc)})
             result = ToolResult.failed(f"{name} failed: {exc}")
+
+        if result.is_error and target_ref:
+            self._remember_failed_target(target_ref, result.text)
 
         # Refs are replaced from whatever the page just reported. A result that
         # carries none -- a console dump, say -- leaves the previous set alone,
@@ -432,6 +467,15 @@ class AgentToolSession:
         if self._snapshot is None:
             return Described(ref=ref, role="", name="", matches=0)
         return describe_element(self._snapshot, ref)
+
+    def _remember_failed_target(self, target_ref: str, reason: str) -> None:
+        """Bounded: the oldest entry is dropped once the cap is reached, so a
+        ref string a much later snapshot happens to reuse is judged on its own
+        result rather than refused for a mistake this session made long ago."""
+        self._failed_targets[target_ref] = reason[:200]
+        while len(self._failed_targets) > FAILED_TARGET_MEMORY:
+            oldest = next(iter(self._failed_targets))
+            del self._failed_targets[oldest]
 
     async def _finish(
         self,

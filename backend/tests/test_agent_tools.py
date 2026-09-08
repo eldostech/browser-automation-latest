@@ -91,9 +91,14 @@ class FakeMCP:
 
     async def call(self, name, arguments):
         self.calls.append((name, dict(arguments)))
-        text = self.replies.get(name, SNAPSHOT)
+        reply = self.replies.get(name, SNAPSHOT)
+        # A test simulating a genuine dispatch failure (not merely a
+        # different page) passes a `ToolResult` directly rather than a page
+        # of text there is no honest way to mark as an error.
+        if isinstance(reply, ToolResult):
+            return reply
         return ToolResult(
-            text=text, refs=tuple(dict.fromkeys(REF_IN_SNAPSHOT.findall(text)))
+            text=reply, refs=tuple(dict.fromkeys(REF_IN_SNAPSHOT.findall(reply)))
         )
 
     # -- as a provider ---------------------------------------------------
@@ -198,6 +203,65 @@ async def test_refs_are_replaced_by_what_the_page_last_reported():
         await tools.call("browser_click", {"target": "e3"})
         assert tools.known_refs == {"e7", "e8", "e9", "e10"}
         assert "e3" not in tools.known_refs, "the page behind the dialog is gone"
+
+
+# --- retrying a target that already failed ----------------------------------
+
+
+async def test_a_target_that_already_failed_is_refused_without_retrying_it():
+    """Found for real: a session retried the identical invalid ref across four
+    calls and two different tools, twice after being told in as many words
+    that the ref did not exist, and burned its whole budget on the loop
+    before it ever reached the task. `guard()` accepting a call is not the
+    same as that call succeeding, and nothing before this stopped the second
+    identical mistake -- only the third or fourth. This is the backstop."""
+    async with await session(
+        replies={"browser_click": ToolResult.failed("element is not visible")},
+    ) as tools:
+        await tools.call("browser_snapshot")
+
+        first = await tools.call("browser_click", {"target": "e3"})
+        assert first.is_error
+        assert "element is not visible" in first.text
+
+        second = await tools.call("browser_click", {"target": "e3"})
+        assert second.is_error
+        assert "already failed" in second.text
+        assert "element is not visible" in second.text, "the original reason travels with it"
+        assert len([c for c in tools.provider.calls if c[0] == "browser_click"]) == 1, (
+            "the second attempt must not reach the browser at all"
+        )
+
+
+async def test_a_different_target_after_a_failure_is_not_affected():
+    """The guard is keyed on the exact target string, not "this tool failed
+    recently" -- a different, unrelated ref must still reach the browser."""
+    async with await session(
+        replies={"browser_click": ToolResult.failed("element is not visible")},
+    ) as tools:
+        await tools.call("browser_snapshot")
+        await tools.call("browser_click", {"target": "e3"})
+
+        other = await tools.call("browser_click", {"target": "e4"})
+        assert "already failed" not in other.text
+        assert len(tools.provider.calls) == 3, "e4 reached the browser, unlike a repeat of e3 would"
+
+
+async def test_the_failed_target_memory_is_bounded():
+    """Ref strings are not unique forever -- a much later snapshot generation
+    reusing one must be judged on its own result, not refused for a mistake
+    an earlier, unrelated snapshot made many calls ago."""
+    from agent.session import FAILED_TARGET_MEMORY
+
+    async with await session() as tools:
+        for i in range(FAILED_TARGET_MEMORY + 2):
+            tools._failed_targets[f"e{i}"] = "stale reason"
+
+        assert len(tools._failed_targets) == FAILED_TARGET_MEMORY + 2
+        tools._remember_failed_target("e999", "newest")
+        assert len(tools._failed_targets) == FAILED_TARGET_MEMORY
+        assert "e0" not in tools._failed_targets, "the oldest entries are the ones dropped"
+        assert "e999" in tools._failed_targets
 
 
 # --- the hard gate ---------------------------------------------------------

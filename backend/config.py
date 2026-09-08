@@ -75,6 +75,22 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
 
+    #: Claude's extended-thinking budget, in tokens. 0 disables it. A model
+    #: asked to act with no room to reason first will happily emit a tool
+    #: call with no text at all -- a real session on this model produced 62
+    #: events and not one word of reasoning, then spent its whole budget
+    #: retrying a target ref it had already been told twice did not exist.
+    #: This is the fix for the *first* half of that: room to think before
+    #: acting. Must be less than ``llm_max_tokens``, since thinking tokens are
+    #: drawn from the same budget as the response; a value that leaves no
+    #: room for an actual tool call is clamped down with a warning rather
+    #: than left to fail the request outright.
+    #:
+    #: Anthropic's API rejects a non-default ``temperature`` while thinking is
+    #: enabled, so ``llm_temperature`` above is ignored for calls made while
+    #: this is greater than 0 -- confirmed against the real model, not assumed.
+    llm_thinking_budget_tokens: int = 4096
+
     #: Both are optional. Left unset, the AWS SDK resolves them itself from the
     #: environment, ~/.aws, or the attached IAM role -- which is what lets the
     #: same build run on a laptop and on an EC2/ECS/Lambda role unchanged.

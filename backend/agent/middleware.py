@@ -7,14 +7,14 @@ provides the model-calling and tool-dispatch nodes now, so a budget check or a
 
 Two things are deliberately *not* here. Approval uses LangChain's own
 `HumanInTheLoopMiddleware` directly (see `graph.py`) rather than a hand-rolled
-third middleware -- its `after_model` hook recomputes the interrupt payload
+fourth middleware -- its `after_model` hook recomputes the interrupt payload
 from already-checkpointed state with no id it mints and no side effect,
 which is the safe form of the pattern this codebase's own hand-rolled
 `approve` node got wrong before it was rewritten. And tool dispatch itself
 -- the guard, the ref discipline, secret substitution, marks, redaction,
 audit -- is not middleware either; it already lives in
-`AgentToolSession.call()`, reached through `tool_adapter.py`, and neither of
-these two middlewares touches it.
+`AgentToolSession.call()`, reached through `tool_adapter.py`, and none of
+these three middlewares touch it.
 """
 
 from __future__ import annotations
@@ -27,10 +27,13 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import AgentState, ModelRequest, ModelResponse, hook_config
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
-from chat import usage_of
+from chat import text_of, usage_of
+from events import Thinking
 from llm import translate_access_error
 
+from .author import Emit
 from .budget import Spend
+from .marks import Marks
 from .session import AgentToolSession
 from .tools.finish import NAME as FINISH
 
@@ -66,26 +69,40 @@ class BudgetMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
 
     state_schema = AuthorGraphState
 
-    def __init__(self, spend: Spend, *, model_name: str) -> None:
+    def __init__(self, spend: Spend, *, model_name: str, marks: Marks) -> None:
         super().__init__()
         self.spend = spend
         self.model_name = model_name
+        #: For the stop message only -- see `abefore_model`. Read, never
+        #: written: this middleware does not track progress, it reports it.
+        self.marks = marks
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state: AuthorGraphState, runtime: Any) -> dict[str, Any] | None:
         """A limit is a stop, not a crash: end cleanly and keep everything
-        the session already did, exactly as `stop_for_budget` used to."""
+        the session already did, exactly as `stop_for_budget` used to.
+
+        "Kept everything it did" is doing a lot of work in that sentence when
+        what it did is nothing yet -- a session that runs out of budget before
+        its first row completes looks, from `runs.status` alone, identical to
+        one that banked three of them (`agent/manager.py` maps this status,
+        "partial", to "succeeded" for both, deliberately: there is a draft
+        either way, worth a person's look rather than a bare failure). The
+        `stopped_by` message is where that difference still has to show up,
+        since the status code no longer carries it.
+        """
         hit = self.spend.exceeded()
         if hit is None:
             self.spend.step()
             return None
         limit, message = hit
+        stopped_by = f"{message} {self.marks.progress_summary()}"
         log.info("agent session stopped by budget", extra={"limit": limit})
         return {
             "jump_to": "end",
             "status": "partial",
-            "stopped_by": message,
-            "messages": [AIMessage(content=f"Stopped: {message}")],
+            "stopped_by": stopped_by,
+            "messages": [AIMessage(content=f"Stopped: {stopped_by}")],
         }
 
     async def awrap_model_call(
@@ -117,6 +134,50 @@ class BudgetMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
             usage = usage_of(message)
             if usage.get("input_tokens") or usage.get("output_tokens"):
                 self.spend.turn(usage, self.model_name)
+        return response
+
+
+class ThinkingMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
+    """Surfaces what the model said before it acted -- if it said anything.
+
+    `create_agent`'s tool-dispatch node reads a turn's tool calls and nothing
+    else; ordinary commentary and Claude's extended-thinking blocks alike
+    reached nobody -- not the live transcript, not a person watching, not
+    this codebase's own audit trail. `agent/operate.py`'s older hand-rolled
+    loop always emitted this for its own recover/explore turns; this graph,
+    built later on `create_agent`, never gained the equivalent. A real
+    session went 62 events end to end without one word of reasoning visible
+    anywhere, which is indistinguishable from a model that never reasoned at
+    all even on a turn where, given room to think, it may well have.
+
+    Deliberately its own middleware rather than folded into `BudgetMiddleware`
+    above: that one's docstring already names what it owns, and emitting an
+    event is not a budget concern.
+    """
+
+    state_schema = AuthorGraphState
+
+    def __init__(self, emit: Emit, *, run_id: str, spend: Spend) -> None:
+        super().__init__()
+        self.emit = emit
+        self.run_id = run_id
+        #: For the step number an event is stamped with, only -- the same
+        #: counter `BudgetMiddleware.abefore_model` advances each turn.
+        self.spend = spend
+
+    async def awrap_model_call(
+        self, request: ModelRequest[Any], handler: Any
+    ) -> ModelResponse[Any]:
+        response = await handler(request)
+        for message in response.result:
+            text = text_of(message).strip()
+            if text:
+                await self.emit(
+                    Thinking(
+                        run_id=self.run_id, seq=0, step=self.spend.steps,
+                        text=text, done=True,
+                    )
+                )
         return response
 
 
@@ -203,4 +264,4 @@ def _for_model(messages: list[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
-__all__ = ["AuthorGraphState", "BudgetMiddleware", "FinishMiddleware"]
+__all__ = ["AuthorGraphState", "BudgetMiddleware", "FinishMiddleware", "ThinkingMiddleware"]

@@ -241,6 +241,36 @@ def test_the_row_boundary_is_what_replaces_loop_detection():
     assert marks.setup_ended_at == 5
 
 
+# --- how far it got, for a stop that was not the model's own choice --------
+
+
+def test_a_stop_before_any_row_says_so():
+    """A budget exhausted during setup is a stop with nothing yet to show for
+    it -- distinct from one that banked real rows, even though both currently
+    map to the same "partial" status a run's own record shows."""
+    marks = Marks()
+    assert marks.progress_summary() == "Stopped during setup, before any row began."
+
+
+def test_a_stop_mid_row_names_the_row_left_open():
+    marks = Marks()
+    marks.setup_complete(2)
+    marks.begin_row(3, "A-1001")
+
+    assert marks.progress_summary() == "0 row(s) completed; 'A-1001' was left open, unfinished."
+
+
+def test_a_stop_after_completed_rows_counts_them():
+    marks = Marks()
+    marks.setup_complete(1)
+    marks.begin_row(2, "A-1001")
+    marks.end_row(3)
+    marks.begin_row(4, "A-1002")
+    marks.end_row(5)
+
+    assert marks.progress_summary() == "2 row(s) completed."
+
+
 # --- marking through a session --------------------------------------------
 
 

@@ -10,6 +10,15 @@ once per row of a spreadsheet. Afterwards it is replayed by an engine that has
 no model in it. The engine will do exactly what you recorded, on pages you did
 not see, so anything you leave implicit is lost.
 
+## Think, then act
+
+Before every tool call, say in a sentence or two what you see, what you expect
+this call to do, and how you will tell whether it worked. This is not
+decoration -- it is what stops a wrong guess from turning into four wrong
+guesses. Skipping straight to the call is how a bad first guess becomes a bad
+second, third and fourth one: nothing you write down forces you to notice
+that the plan already failed once.
+
 ## How to work
 
 1. **Look before you act.** `browser_snapshot` gives you the page as an
@@ -95,7 +104,12 @@ when to call `mark_setup_complete`, `begin_row`, or `end_row`.
 - Anything irreversible — submitting, deleting, paying, sending — stops and
   asks a person. Expect that, and do not try to work around it.
 - If a tool refuses, the reason is the answer. Read it and do something
-  different; repeating the same call will get the same refusal.
+  different; repeating the same call will get the same refusal. A reference
+  that failed once does not become valid by trying it again, in this tool or
+  a different one -- the session will refuse it outright the second time
+  rather than spend another turn proving what the first refusal already
+  proved. Take a fresh `browser_snapshot` and act on a reference it actually
+  lists.
 
 ## Before you finish
 

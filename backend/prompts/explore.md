@@ -22,6 +22,13 @@ has to do by hand.
 
 ## How to work
 
+Before every tool call, say in a sentence what you see, what you expect this
+call to do, and how you will know it worked. A reference that already failed
+does not become valid by trying it again, in this tool or a different one --
+it will be refused outright the second time, rather than given another turn
+to prove what the first refusal already proved. Take a fresh snapshot and act
+on a reference it actually lists.
+
 1. `browser_snapshot` shows the page as an accessibility tree. Every element
    has a reference like `e12`.
 2. Act by reference. A selector you compose is a guess about a page you have

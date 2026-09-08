@@ -3,11 +3,16 @@
 This used to be a hand-built `StateGraph`: a `decide` node calling the model,
 an `act` node dispatching tools, and an `approve` node that suspended for a
 person. `create_agent` now provides the model-calling and tool-dispatch nodes,
-and this file's job shrinks to configuring three middleware:
+and this file's job shrinks to configuring four middleware:
 
 * :class:`~agent.middleware.BudgetMiddleware` -- the budget check, the
   prompt-cache hint, and the snapshot-pruning that used to live in `decide`
   and `LangChainLLM.run_turn`.
+* :class:`~agent.middleware.ThinkingMiddleware` -- emits whatever the model
+  said before it acted as the same `Thinking` event the older hand-rolled
+  loop always produced. `create_agent`'s own nodes never looked at a turn's
+  prose, only its tool calls, so without this a session could reason at
+  length and still look silent end to end.
 * :class:`~agent.middleware.FinishMiddleware` -- answers the `finish` call
   and ends the graph, replacing `act`'s special case for it.
 * ``HumanInTheLoopMiddleware`` -- LangChain's own approval flow, not a
@@ -59,7 +64,7 @@ def build(w: Wiring, checkpointer: Any = None):
     from langchain.agents.middleware import HumanInTheLoopMiddleware
     from langchain_core.tools import StructuredTool, ToolException
 
-    from .middleware import AuthorGraphState, BudgetMiddleware, FinishMiddleware
+    from .middleware import AuthorGraphState, BudgetMiddleware, FinishMiddleware, ThinkingMiddleware
 
     async def _unreachable_finish(**kwargs: Any) -> str:
         # `FinishMiddleware.aafter_model` answers every `finish` call itself
@@ -97,7 +102,8 @@ def build(w: Wiring, checkpointer: Any = None):
         tools=tools,
         system_prompt=system_prompt(w.request),
         middleware=[
-            BudgetMiddleware(w.spend, model_name=w.llm.model),
+            BudgetMiddleware(w.spend, model_name=w.llm.model, marks=w.tools.marks),
+            ThinkingMiddleware(w.emit, run_id=w.request.run_id, spend=w.spend),
             FinishMiddleware(w.tools),
             HumanInTheLoopMiddleware(interrupt_on=interrupt_on),
         ],

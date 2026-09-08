@@ -18,16 +18,24 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 
-def turn_calling(tool: str, **arguments: Any) -> AIMessage:
+def turn_calling(tool: str, *, thinking: str = "", **arguments: Any) -> AIMessage:
     """One scripted turn: the model calls exactly one tool.
 
     Carries a fake but nonzero `usage_metadata` -- a real provider always
     reports usage, and `BudgetMiddleware` reads it to feed `Spend.turn()`, so
     a script with no usage at all would under-test the very thing it is
     meant to stand in for.
+
+    `thinking` stands in for whatever prose a real turn would carry alongside
+    its tool call -- ordinary commentary, or Claude's extended-thinking
+    content -- for tests that check a turn's reasoning reaches the transcript
+    rather than only its tool call. Empty by default, matching every scripted
+    turn before this parameter existed. Named apart from `arguments` on
+    purpose: `text` is a real argument of `browser_type` and others, and would
+    collide with it here.
     """
     return AIMessage(
-        content="",
+        content=thinking,
         tool_calls=[{"name": tool, "args": dict(arguments), "id": f"c{tool}-{id(arguments)}", "type": "tool_call"}],
         usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
     )

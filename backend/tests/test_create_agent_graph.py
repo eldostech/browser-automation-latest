@@ -188,6 +188,80 @@ async def test_a_session_that_stops_at_its_budget_still_says_it_is_over():
     assert len([e for e in events if e.type == "run_finished"]) == 1
 
 
+async def test_a_budget_stop_says_how_far_it_actually_got():
+    """`runs.status` maps a budget stop ("partial") to "succeeded" -- there is
+    a draft either way, worth a look -- which means the status code alone can
+    no longer tell a person "ran out having done nothing" apart from "ran out
+    with three rows banked". A real session did the former and looked, from
+    the status alone, exactly like the latter. This is the difference showing
+    up in the one place left for it: the stop message itself.
+    """
+    provider, llm = a_session(*[turn_calling("browser_snapshot")] * 10)
+
+    result = await run_agent_session(
+        request(budget=Budget(steps=2, tokens=None, seconds=None, usd=None)),
+        llm=llm, provider=provider, emit=lambda e: _keep([], e), replay=_replays,
+    )
+
+    assert result.status == "partial"
+    assert "Stopped during setup, before any row began." in result.stopped_by
+
+
+async def test_a_budget_stop_mid_row_says_the_row_was_left_open():
+    provider, llm = a_session(
+        turn_calling("browser_snapshot"),
+        turn_calling("mark_setup_complete"),
+        turn_calling("begin_row", key="A-1001"),
+        *[turn_calling("browser_snapshot")] * 10,
+    )
+
+    result = await run_agent_session(
+        request(budget=Budget(steps=4, tokens=None, seconds=None, usd=None)),
+        llm=llm, provider=provider, emit=lambda e: _keep([], e), replay=_replays,
+    )
+
+    assert result.status == "partial"
+    assert "'A-1001' was left open, unfinished" in result.stopped_by
+
+
+# --- thinking ----------------------------------------------------------
+
+
+async def test_what_the_model_says_reaches_the_transcript():
+    """`create_agent`'s own nodes read a turn's tool calls and nothing else --
+    without `ThinkingMiddleware`, a model's reasoning (ordinary commentary, or
+    an extended-thinking block once one is configured) reached nobody. A real
+    session went 62 events without a single word of it visible anywhere.
+    """
+    provider, llm = a_session(
+        *a_complete_session()[:1],
+        turn_calling(
+            "mark_setup_complete",
+            thinking="The sign-in form is not on this page; setup is already done.",
+        ),
+        *a_complete_session()[2:],
+    )
+    events = []
+
+    await run_agent_session(
+        request(), llm=llm, provider=provider, emit=lambda e: _keep(events, e), replay=_replays,
+    )
+
+    thoughts = [e.text for e in events if e.type == "thinking"]
+    assert "The sign-in form is not on this page; setup is already done." in thoughts
+
+
+async def test_a_turn_with_nothing_to_say_emits_no_thinking_event():
+    provider, llm = a_session(*a_complete_session())
+    events = []
+
+    await run_agent_session(
+        request(), llm=llm, provider=provider, emit=lambda e: _keep(events, e), replay=_replays,
+    )
+
+    assert not [e for e in events if e.type == "thinking"]
+
+
 # --- the interrupt ---------------------------------------------------------
 
 

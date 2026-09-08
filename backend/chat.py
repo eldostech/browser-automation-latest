@@ -60,11 +60,47 @@ def chat_model(settings: Any, model: str | None = None, **overrides: Any):
         "temperature": settings.llm_temperature,
         **overrides,
     }
+    _apply_thinking(kwargs, settings)
     if settings.aws_region:
         kwargs["region_name"] = settings.aws_region
     if settings.aws_profile:
         kwargs["credentials_profile_name"] = settings.aws_profile
     return ChatBedrockConverse(**kwargs)
+
+
+def _apply_thinking(kwargs: dict[str, Any], settings: Any) -> None:
+    """Turn on extended thinking, if configured -- in place, on ``kwargs``.
+
+    Two things confirmed against the real model rather than assumed from
+    documentation: Bedrock rejects the request outright ("`temperature` may
+    only be set to 1 when thinking is enabled") if a non-default temperature
+    rides along, so it is dropped here rather than left to fail at call time;
+    and a reply's thinking block does *not* need to be replayed on the next
+    turn for the conversation to continue -- dropping it (which
+    :func:`to_anthropic_blocks` already does, since it only keeps ``text``
+    and ``tool_use``) is safe, not a shortcut taken under time pressure.
+    """
+    budget = settings.llm_thinking_budget_tokens
+    if not budget:
+        return
+
+    max_tokens = kwargs.get("max_tokens") or 0
+    # Thinking tokens draw from the same ceiling as the response. Left alone,
+    # a misconfigured budget at or above max_tokens does not fail loudly --
+    # it silently starves the actual tool call of room to exist.
+    if max_tokens and budget >= max_tokens:
+        clamped = max(1024, max_tokens // 2)
+        log.warning(
+            "llm_thinking_budget_tokens (%d) leaves no room under "
+            "llm_max_tokens (%d); using %d instead",
+            budget, max_tokens, clamped,
+        )
+        budget = clamped
+
+    fields = dict(kwargs.get("additional_model_request_fields") or {})
+    fields.setdefault("thinking", {"type": "enabled", "budget_tokens": budget})
+    kwargs["additional_model_request_fields"] = fields
+    kwargs.pop("temperature", None)
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +171,28 @@ def _text_of(content: Any) -> str:
 
     LangChain returns block lists for models that interleave text and tool use,
     so ``.content`` is not reliably a string.
+
+    A ``reasoning_content`` block -- confirmed by calling the real model with
+    extended thinking on -- carries the model's deliberation *before* whatever
+    it says out loud, in the same content list a plain ``text`` block would
+    be. Included here, ahead of any ``text``, because dropping it is exactly
+    how a session that reasoned at length still looked silent: nothing else
+    in this codebase reads any other block type out of an assistant turn.
     """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = [
-            block.get("text", "")
+            _reasoning_text(block) if block.get("type") == "reasoning_content" else block.get("text", "")
             for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
+            if isinstance(block, dict) and block.get("type") in ("text", "reasoning_content")
         ]
-        return "".join(parts)
+        return "".join(part for part in parts if part)
     return str(content or "")
+
+
+def _reasoning_text(block: dict[str, Any]) -> str:
+    return str((block.get("reasoning_content") or {}).get("text") or "")
 
 
 def text_of(message: Any) -> str:
