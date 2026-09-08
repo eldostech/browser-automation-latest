@@ -21,6 +21,7 @@ import type {
   WorkspaceSpend,
 } from '../lib/events';
 import { useRunStream } from '../lib/useRunStream';
+import { BrandSpinner, type SpinnerState } from './BrandSpinner';
 
 type Props = {
   onSaved: (usecaseId: string) => void;
@@ -246,7 +247,7 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
             disabled={busy || !task.trim() || (!target && !startUrl.trim())}
             onClick={() => void start()}
           >
-            {busy ? 'Starting…' : 'Start'}
+            {busy ? <BrandSpinner state="working" label="Starting…" /> : 'Start'}
           </button>
         </div>
       </div>
@@ -291,11 +292,42 @@ function Working({
   const spend = session.spend ?? {};
   const verification = session.verification ?? {};
 
+  // Once it has called "finish", every further tool_call event stops -- there
+  // is nothing left to watch happen in the browser -- but the session is not
+  // done: distillation and a from-scratch replay still run before the status
+  // flips. Without this, the screen goes quiet exactly when a person most
+  // wants to know it is still doing something.
+  const isFinishing = useMemo(
+    () => events.some((e) => e.type === 'tool_call' && e.name === 'finish'),
+    [events],
+  );
+  const liveState: SpinnerState = isFinishing ? 'validating' : 'working';
+  const liveDetail = isFinishing
+    ? 'Turning what it did into steps, then replaying them from a cold start to make sure they hold up on their own.'
+    : undefined;
+
   return (
     <>
       <div className="card">
         <div className="row" style={{ justifyContent: 'space-between' }}>
-          <h2 style={{ margin: 0 }}>{titleFor(session.status)}</h2>
+          <h2 style={{ margin: 0 }}>
+            {isLive(session.status) && !session.awaiting ? (
+              <BrandSpinner
+                state={liveState}
+                label={isFinishing ? 'Checking that it replays…' : titleFor(session.status)}
+                detail={liveDetail}
+                size={20}
+              />
+            ) : session.awaiting ? (
+              <BrandSpinner state="waiting" label={titleFor(session.status)} size={20} />
+            ) : session.status === 'succeeded' ? (
+              <BrandSpinner state="success" label={titleFor(session.status)} size={20} />
+            ) : session.status === 'failed' ? (
+              <BrandSpinner state="error" label={titleFor(session.status)} size={20} />
+            ) : (
+              titleFor(session.status)
+            )}
+          </h2>
           <span className="meter">
             <span>{session.steps} steps</span>
             <span>{(spend.tokens ?? 0).toLocaleString()} tokens</span>
@@ -370,7 +402,7 @@ function Working({
 
           <div className="row end" style={{ marginTop: 12 }}>
             <button type="button" className="primary" disabled={busy} onClick={() => void onSave()}>
-              {busy ? 'Saving…' : 'Save as a use case'}
+              {busy ? <BrandSpinner state="working" label="Saving…" /> : 'Save as a use case'}
             </button>
           </div>
           <p className="hint">
@@ -429,7 +461,13 @@ function Transcript({ events }: { events: AgentEvent[] }) {
     [events],
   );
 
-  if (lines.length === 0) return <p className="hint">Waiting for it to start…</p>;
+  if (lines.length === 0) {
+    return (
+      <p className="hint">
+        <BrandSpinner state="working" label="Waiting for it to start…" />
+      </p>
+    );
+  }
 
   return (
     <ol className="transcript">

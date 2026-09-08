@@ -173,12 +173,18 @@ label {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 0 24px;
-  height: 56px;
+  padding: 8px 24px;
+  min-height: 56px;
 }
 .topbar .mark {
   color: var(--gold);
   display: flex;
+}
+.topbar .brand-title {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
 }
 .topbar h1 {
   font-family: var(--serif);
@@ -187,6 +193,17 @@ label {
   margin: 0;
   color: var(--chrome-text);
   letter-spacing: 0;
+}
+.topbar .brand-full {
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.03em;
+  color: var(--chrome-dim);
+  white-space: nowrap;
+}
+.topbar .brand-full strong {
+  font-weight: 700;
+  color: var(--chrome-text);
 }
 .topbar .qualifier {
   font-size: 11px;
@@ -1999,4 +2016,190 @@ table.mapping .examples {
   display: block;
   height: 100%;
   background: var(--accent);
+}
+
+/* ------------------------------------------------------------- spinner */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Any panel an overlay spinner covers needs this, so the overlay's
+   `position: absolute` is relative to the panel and not the page. */
+.spinner-host {
+  position: relative;
+}
+
+.brand-spinner {
+  align-items: center;
+  gap: 8px;
+}
+.brand-spinner.inline {
+  display: inline-flex;
+  gap: 6px;
+  vertical-align: middle;
+}
+.brand-spinner.block {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 16px;
+  text-align: center;
+}
+.brand-spinner.overlay {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: absolute;
+  inset: 0;
+  gap: 10px;
+  padding: 16px;
+  text-align: center;
+  background: color-mix(in srgb, var(--bg-raised) 90%, transparent);
+  border-radius: var(--radius);
+  z-index: 20;
+}
+
+.spinner-label {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 0;
+}
+.brand-spinner.block .spinner-label,
+.brand-spinner.overlay .spinner-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.spinner-detail {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: 0;
+  max-width: 340px;
+  align-self: center;
+}
+.brand-spinner.error .spinner-label {
+  color: var(--danger);
+}
+.brand-spinner.success .spinner-label {
+  color: var(--ok);
+}
+
+.brand-mark .ring {
+  stroke: var(--gold);
+  transform-origin: 16px 16px;
+}
+.brand-mark .hub {
+  fill: var(--gold);
+}
+.brand-mark.working .ring,
+.brand-mark.validating .ring {
+  animation: spin 1.1s linear infinite;
+}
+.brand-mark.validating .ring {
+  animation-duration: 1.7s;
+}
+.brand-mark.working .hub {
+  animation: spinner-pulse 1.4s ease-in-out infinite;
+}
+.brand-mark.waiting .ring {
+  stroke: var(--text-faint);
+  opacity: 0.55;
+  animation: spinner-breathe 2.4s ease-in-out infinite;
+}
+.brand-mark.waiting .hub {
+  fill: var(--text-faint);
+}
+.brand-mark.success .ring {
+  stroke: var(--ok);
+  stroke-dasharray: none;
+}
+.brand-mark.success .hub {
+  fill: var(--ok);
+}
+.brand-mark.error .ring {
+  stroke: var(--danger);
+  stroke-dasharray: none;
+}
+.brand-mark.error .hub {
+  fill: var(--danger);
+}
+.brand-mark .mark-path {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  animation: spinner-draw 0.35s ease forwards;
+}
+.brand-mark.success .mark-path {
+  stroke: var(--ok);
+}
+.brand-mark.error .mark-path {
+  stroke: var(--danger);
+}
+.brand-mark .scan-path {
+  stroke: var(--accent-ink);
+  stroke-dasharray: 24;
+  opacity: 0;
+  animation: spinner-scan 1.8s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes spinner-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+@keyframes spinner-breathe {
+  50% {
+    opacity: 0.2;
+  }
+}
+@keyframes spinner-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes spinner-scan {
+  0% {
+    stroke-dashoffset: 24;
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  55% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+  80% {
+    opacity: 0;
+  }
+  100% {
+    stroke-dashoffset: -24;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark .ring,
+  .brand-mark .hub,
+  .brand-mark .scan-path,
+  .brand-mark .mark-path {
+    animation: none !important;
+  }
+  .brand-mark.validating .scan-path {
+    opacity: 0.85;
+  }
 }

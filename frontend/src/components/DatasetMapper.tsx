@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import type { ColumnProfile, DatasetSummary, MappingSuggestion, UseCase } from '../lib/events';
+import { BrandSpinner } from './BrandSpinner';
 
 type Props = {
   useCase: UseCase;
@@ -149,7 +150,13 @@ export function DatasetMapper({
       )}
 
       {error && <p className="error">{error}</p>}
-      {loading && <p className="hint">Reading the file…</p>}
+      {loading && (
+        <BrandSpinner
+          state="validating"
+          label="Reading the file and matching its columns…"
+          detail="Tries obvious matches first; a model is only asked about the columns that stay unclear."
+        />
+      )}
 
       {dataset && (
         <>
@@ -234,7 +241,7 @@ export function DatasetMapper({
             onClick={() => onReady(dataset, chosen)}
             title={disabled ? disabledReason : undefined}
           >
-            {busy ? 'Starting…' : `Start ${dataset.row_count} rows`}
+            {busy ? <BrandSpinner state="working" label="Starting…" /> : `Start ${dataset.row_count} rows`}
           </button>
           {disabled && disabledReason && <p className="hint">{disabledReason}</p>}
         </>

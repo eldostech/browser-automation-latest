@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import type { RecordingDetail } from '../lib/events';
+import { BrandSpinner } from './BrandSpinner';
 
 type Props = {
   onSaved: (usecaseId: string) => void;
@@ -260,7 +261,7 @@ export function RecordWorkflow({ onSaved, onBack }: Props) {
             disabled={busy || !startUrl.trim()}
             onClick={start}
           >
-            {busy ? 'Opening…' : 'Open the browser and record'}
+            {busy ? <BrandSpinner state="working" label="Opening…" /> : 'Open the browser and record'}
           </button>
         </>
       )}
@@ -273,6 +274,24 @@ export function RecordWorkflow({ onSaved, onBack }: Props) {
           </p>
           <button type="button" onClick={discard}>
             Cancel
+          </button>
+        </>
+      )}
+
+      {recording?.status === 'parsing' && (
+        <BrandSpinner
+          layout="block"
+          state="validating"
+          label="Reading what you recorded…"
+          detail="Turning the recorded actions into steps. Nothing is sent to a model for this — it only takes a moment for a long recording."
+        />
+      )}
+
+      {recording?.status === 'cancelled' && (
+        <>
+          <p className="hint">That recording was cancelled.</p>
+          <button type="button" onClick={discard}>
+            Start again
           </button>
         </>
       )}
@@ -450,7 +469,7 @@ export function RecordWorkflow({ onSaved, onBack }: Props) {
               Throw it away
             </button>
             <button type="button" className="primary" onClick={save} disabled={busy}>
-              {busy ? 'Saving…' : 'Save as a draft workflow'}
+              {busy ? <BrandSpinner state="working" label="Saving…" /> : 'Save as a draft workflow'}
             </button>
           </div>
         </>

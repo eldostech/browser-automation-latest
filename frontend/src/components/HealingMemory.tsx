@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import type { RememberedFix } from '../lib/events';
+import { BrandSpinner } from './BrandSpinner';
 
 export function HealingMemory() {
   const [fixes, setFixes] = useState<RememberedFix[]>([]);
@@ -84,7 +85,7 @@ export function HealingMemory() {
         </div>
       )}
 
-      {loading && <p className="hint">Reading…</p>}
+      {loading && <BrandSpinner state="working" label="Reading…" />}
 
       {!loading && fixes.length === 0 && (
         <p className="hint">

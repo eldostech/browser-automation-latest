@@ -3,6 +3,7 @@ import { api } from '../lib/api';
 import type { RunStatus, RunSummary } from '../lib/events';
 import { formatDuration, formatRelative, truncate } from '../lib/format';
 import { StatusBadge } from './StatusBadge';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   onOpen: (runId: string) => void;
@@ -68,13 +69,15 @@ export function RunHistory({ onOpen }: Props) {
           </button>
         ))}
         <button type="button" onClick={load} style={{ marginLeft: 'auto' }} disabled={loading}>
-          {loading ? 'Refreshing...' : 'Refresh'}
+          {loading ? <BrandSpinner state="working" label="Refreshing…" /> : 'Refresh'}
         </button>
       </div>
 
       {error && <div className="banner error">{error}</div>}
 
-      {runs.length === 0 && !loading ? (
+      {runs.length === 0 && loading ? (
+        <BrandSpinner layout="block" state="working" label="Loading run history…" />
+      ) : runs.length === 0 && !loading ? (
         <div className="empty-state">No runs{filter ? ` with status "${filter}"` : ''} yet.</div>
       ) : (
         <table className="runs">

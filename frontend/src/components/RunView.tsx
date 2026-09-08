@@ -22,6 +22,7 @@ import { ScreenshotPane } from './ScreenshotPane';
 import { StepTrail } from './StepTrail';
 import { ConnectionIndicator, StatusBadge } from './StatusBadge';
 import { Timeline } from './Timeline';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   runId: string;
@@ -91,6 +92,7 @@ export function RunView({ runId, onBack, onOpenUseCase }: Props) {
           &larr; Back
         </button>
         <h2>{detail?.task ?? 'Run'}</h2>
+        {running && <BrandSpinner state="working" size={16} />}
         <StatusBadge status={stream.status} />
         <ConnectionIndicator state={stream.connection} />
         {detail?.duration_ms ? <span className="meta">{formatDuration(detail.duration_ms)}</span> : null}
@@ -142,6 +144,7 @@ export function RunView({ runId, onBack, onOpenUseCase }: Props) {
             history={shots}
             selectedIndex={selected}
             onSelect={setSelected}
+            running={running}
           />
           <ResultPanel finished={finishedEvent} running={running} />
         </section>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import type { UseCaseSummary } from '../lib/events';
 import { formatRelative, truncate } from '../lib/format';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   onOpen: (usecaseId: string) => void;
@@ -59,13 +60,15 @@ export function UseCaseList({ onOpen }: Props) {
           </button>
         ))}
         <button type="button" onClick={load} style={{ marginLeft: 'auto' }} disabled={loading}>
-          {loading ? 'Refreshing...' : 'Refresh'}
+          {loading ? <BrandSpinner state="working" label="Refreshing…" /> : 'Refresh'}
         </button>
       </div>
 
       {error && <div className="banner error">{error}</div>}
 
-      {rows.length === 0 && !loading ? (
+      {rows.length === 0 && loading ? (
+        <BrandSpinner layout="block" state="working" label="Loading use cases…" />
+      ) : rows.length === 0 && !loading ? (
         <div className="empty-state">
           No use cases yet. Open a succeeded run and choose <strong>Save as use case</strong>.
         </div>

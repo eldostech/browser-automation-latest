@@ -21,6 +21,7 @@ import { api } from '../lib/api';
 import type { RunStep } from '../lib/events';
 import { AuthedImage } from './AuthedImage';
 import { formatDuration } from '../lib/format';
+import { BrandSpinner } from './BrandSpinner';
 
 type Props = {
   runId: string;
@@ -94,7 +95,7 @@ export function StepTrail({ runId, usecaseId }: Props) {
     }
   };
 
-  if (loading) return <p className="hint">Reading the step trail…</p>;
+  if (loading) return <BrandSpinner state="working" label="Reading the step trail…" />;
   if (error) return <p className="error">{error}</p>;
   if (!steps.length) {
     return (

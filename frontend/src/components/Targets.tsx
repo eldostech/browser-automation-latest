@@ -16,6 +16,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import type { Target } from '../lib/events';
 import { SpendCard } from './SpendCard';
+import { BrandSpinner } from './BrandSpinner';
 
 export function Targets() {
   const [targets, setTargets] = useState<Target[]>([]);
@@ -126,7 +127,7 @@ export function Targets() {
       </div>
 
       {loading ? (
-        <p className="hint">Loading…</p>
+        <BrandSpinner state="working" label="Loading…" />
       ) : targets.length === 0 ? (
         <div className="empty-state">
           <p>No targets yet.</p>

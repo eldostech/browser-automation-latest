@@ -23,6 +23,7 @@ import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
 import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   usecaseId: string;
@@ -93,6 +94,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which action is in flight, so a person sees a spinner on the one button
+  // they pressed rather than every disabled control looking identically busy.
+  const [busyAction, setBusyAction] = useState<string | null>(null);
   //: Non-null while the title is being edited in place.
   const [draftName, setDraftName] = useState<string | null>(null);
 
@@ -201,8 +205,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   }, [useCase, credentials, credentialId]);
 
   const act = useCallback(
-    async (fn: () => Promise<void>) => {
+    async (fn: () => Promise<void>, action?: string) => {
       setBusy(true);
+      setBusyAction(action ?? null);
       setError(null);
       setNotice(null);
       try {
@@ -211,6 +216,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setBusy(false);
+        setBusyAction(null);
       }
     },
     [],
@@ -221,7 +227,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.publishUseCase(usecaseId);
       setNotice('Published. It can now be run against inputs.');
       await load();
-    });
+    }, 'publish');
 
   /** The author half: this definition is allowed to contain scripts. */
   const allowScripts = () =>
@@ -230,7 +236,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.updateUseCase(usecaseId, { ...useCase, allow_scripts: true });
       setNotice('Raw-JavaScript steps marked as reviewed in this definition.');
       await load();
-    });
+    }, 'allowScripts');
 
   /** The administrator half: this use case may actually execute them. */
   const enableScripts = (enabled: boolean) =>
@@ -242,7 +248,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           : 'Script execution disabled for this use case.',
       );
       await load();
-    });
+    }, enabled ? 'enableScripts' : 'disableScripts');
 
   const removeStep = (phase: 'setup_steps' | 'row_steps') => (stepId: string) =>
     act(async () => {
@@ -362,7 +368,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       // Stay on this screen when it fails: the repair button is here.
       setLastFailure({ execution_id: result.execution_id, error: result.error ?? 'it failed' });
       setError(`Failed: ${result.error}`);
-    });
+    }, 'run');
 
   const runBatch = (dataset: DatasetSummary, mapping: Record<string, string>) =>
     act(async () => {
@@ -374,7 +380,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       });
       setBatch(await api.getBatch(started.batch_id));
       setNotice(`Queued ${started.total} rows. They run on one shared browser session.`);
-    });
+    }, 'runBatch');
 
   const resume = () =>
     act(async () => {
@@ -382,7 +388,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const resumed = await api.resumeBatch(batch.batch.id, credentialId || null);
       setBatch(await api.getBatch(resumed.batch_id));
       setNotice(`Re-running ${resumed.rows} row(s) that had not succeeded.`);
-    });
+    }, 'resume');
 
   const fixIt = (executionId?: string) =>
     act(async () => {
@@ -405,7 +411,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         ].join('\n'),
       );
       await load();
-    });
+    }, 'fixIt');
 
   const rename = (name: string) =>
     act(async () => {
@@ -416,13 +422,13 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.renameUseCase(usecaseId, name);
       setNotice(`Renamed to ${name}.`);
       await load();
-    });
+    }, 'rename');
 
   const archive = () =>
     act(async () => {
       await api.archiveUseCase(usecaseId);
       onBack();
-    });
+    }, 'archive');
 
   const destroy = () =>
     act(async () => {
@@ -442,7 +448,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       }
       await api.deleteUseCase(usecaseId);
       onBack();
-    });
+    }, 'destroy');
 
   if (!useCase) {
     return (
@@ -450,7 +456,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         <button type="button" onClick={onBack}>
           Back
         </button>
-        {error ? <div className="banner error">{error}</div> : <p>Loading...</p>}
+        {error ? (
+          <div className="banner error">{error}</div>
+        ) : (
+          <BrandSpinner state="working" label="Loading…" />
+        )}
       </div>
     );
   }
@@ -466,8 +476,26 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // themselves code execution by editing JSON.
   const scriptsNeedAdmin = scriptSteps.length > 0 && !scriptsEnabled;
 
+  const blockingAction = busyAction === 'fixIt' ? 'fixIt' : busyAction === 'run' ? 'run' : null;
+
   return (
-    <div>
+    <div className="spinner-host">
+      {blockingAction === 'fixIt' && (
+        <BrandSpinner
+          layout="overlay"
+          state="validating"
+          label="Diagnosing the failure and drafting a fix…"
+          detail="One model call: reads the page as it was when the step broke, and proposes a repair. This can take up to half a minute."
+        />
+      )}
+      {blockingAction === 'run' && (
+        <BrandSpinner
+          layout="overlay"
+          state="working"
+          label="Running this workflow…"
+          detail="No model is involved in the replay itself. How long this takes depends on the site it drives — you'll see the full step-by-step trail once it finishes."
+        />
+      )}
       <div className="run-header">
         <button type="button" onClick={onBack}>
           Back
@@ -512,7 +540,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
                 onClick={() => draftName.trim() && rename(draftName.trim())}
                 disabled={busy || !draftName.trim()}
               >
-                Save
+                {busyAction === 'rename' ? <BrandSpinner state="working" label="Saving…" /> : 'Save'}
               </button>
               <button type="button" onClick={() => setDraftName(null)} disabled={busy}>
                 Cancel
@@ -522,16 +550,16 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </div>
         {!isReady && (
           <button type="button" className="primary" onClick={publish} disabled={busy}>
-            Publish
+            {busyAction === 'publish' ? <BrandSpinner state="working" label="Publishing…" /> : 'Publish'}
           </button>
         )}
         {useCase.status !== 'archived' && (
           <button type="button" onClick={archive} disabled={busy} title="Reversible — hides it from the list">
-            Archive
+            {busyAction === 'archive' ? <BrandSpinner state="working" label="Archiving…" /> : 'Archive'}
           </button>
         )}
         <button type="button" className="danger" onClick={destroy} disabled={busy}>
-          Delete
+          {busyAction === 'destroy' ? <BrandSpinner state="working" label="Deleting…" /> : 'Delete'}
         </button>
       </div>
 
@@ -541,7 +569,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           {lastFailure && (
             <p style={{ margin: '8px 0 0' }}>
               <button type="button" onClick={() => fixIt(lastFailure.execution_id)} disabled={busy}>
-                {busy ? 'Looking at it...' : 'Fix it with AI'}
+                {busyAction === 'fixIt' ? <BrandSpinner state="validating" label="Looking at it…" /> : 'Fix it with AI'}
               </button>
               <span className="hint" style={{ display: 'inline', marginLeft: 8 }}>
                 Reads the page as it was when it broke and proposes a repair. One LLM call.
@@ -571,7 +599,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             They refuse to execute until you read the code below and enable them.
           </p>
           <button type="button" onClick={allowScripts} disabled={busy}>
-            I have read the code — enable scripts
+            {busyAction === 'allowScripts' ? (
+              <BrandSpinner state="working" label="Saving…" />
+            ) : (
+              'I have read the code — enable scripts'
+            )}
           </button>
         </div>
       )}
@@ -587,7 +619,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           </p>
           {session.can('script:enable') ? (
             <button type="button" onClick={() => enableScripts(true)} disabled={busy}>
-              I have read the code — allow this use case to run it
+              {busyAction === 'enableScripts' ? (
+                <BrandSpinner state="working" label="Saving…" />
+              ) : (
+                'I have read the code — allow this use case to run it'
+              )}
             </button>
           ) : (
             <p style={{ margin: 0 }}>
@@ -606,7 +642,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             onClick={() => enableScripts(false)}
             disabled={busy}
           >
-            Withdraw it
+            {busyAction === 'disableScripts' ? <BrandSpinner state="working" label="Saving…" /> : 'Withdraw it'}
           </button>
         </div>
       )}
@@ -990,7 +1026,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             onClick={runOnce}
             disabled={busy || missingSlots.length > 0}
           >
-            {busy ? 'Running...' : 'Run'}
+            {busyAction === 'run' ? <BrandSpinner state="working" label="Running…" /> : 'Run'}
           </button>
         </div>
       )}
@@ -1136,11 +1172,15 @@ function BatchProgressPanel({
   const { batch: summary, executions, pending } = batch;
   const done = summary.succeeded + summary.failed;
   const percent = summary.total ? Math.round((done / summary.total) * 100) : 0;
+  const running = batch.running;
 
   return (
     <div className="panel" style={{ marginTop: 16 }}>
       <header>
-        <span>Batch</span>
+        <span className="row" style={{ gap: 6 }}>
+          Batch
+          {running && <BrandSpinner state="working" size={13} />}
+        </span>
         <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)' }}>
           {summary.succeeded} ok · {summary.failed} failed · {pending} not attempted
         </span>

@@ -124,7 +124,13 @@ export default function App() {
               <path d="M9 12l2.2 2.2L15.5 10" />
             </svg>
           </span>
-          <h1>TRACE</h1>
+          <span className="brand-title">
+            <h1>TRACE</h1>
+            <span className="brand-full">
+              <strong>T</strong>ask <strong>R</strong>ecording <strong>A</strong>nd{' '}
+              <strong>C</strong>onsistent <strong>E</strong>xecution
+            </span>
+          </span>
           <span className="qualifier">Automation Platform</span>
           {environment && (
             <span className="env" title="The deployment this dashboard is pointed at">
