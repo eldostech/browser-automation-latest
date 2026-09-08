@@ -9,10 +9,11 @@ from the list the model is shown -- not by asking it in a prompt not to use
 them.
 
 **What may run without a person, and what has to wait for one.** :func:`guard`
-refuses any ``target`` that is not ``eN``-shaped and present in what the page
-last reported -- see ``catalog.py``'s docstring on why that check exists at
-all -- and separately decides whether an *allowed* call still needs a human
-to say yes, which is what the interrupt in ``graph.py`` waits on.
+refuses any ``target`` that is not ref-shaped (``eN``, or ``fN...eN`` for an
+element inside a frame) and present in what the page last reported -- see
+``catalog.py``'s docstring on why that check exists at all -- and separately
+decides whether an *allowed* call still needs a human to say yes, which is
+what the interrupt in ``graph.py`` waits on.
 
 Nothing here imports FastAPI or ``store``.
 """

@@ -61,6 +61,19 @@ await page.getByRole('button', { name: '+ Invite User' }).click();
 ```
 """
 
+#: The shape that broke a real session: an interactive control inside an
+#: iframe, which Playwright MCP addresses with a frame-scoped ref -- one
+#: `f<N>` segment per level of nesting before the element's own `e<N>`.
+IFRAME_SNAPSHOT = """### Page
+- Page URL: https://vendor.test/widget
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - iframe [ref=e2]:
+    - textbox "Answer" [ref=f1e3]
+```
+"""
+
 TOOLS = [
     ToolSpec("browser_navigate", "", {"required": ["url"]}),
     # Advertised by the real server, so the fake advertises it too. A fake
@@ -190,6 +203,39 @@ def test_a_ref_the_page_reported_is_allowed():
     assert guard("browser_click", {"target": "e3"}, context()).allowed
 
 
+def test_a_frame_scoped_ref_is_a_ref_not_a_composed_selector():
+    """The bug this session was built to fix: `REF_FORMAT` used to be
+    `^e\\d+$`, so an element inside an iframe -- `f1e3`, one `f<N>` segment
+    per level of frame nesting before the element's own `e<N>` -- was refused
+    outright as "not an element reference", the same refusal a composed CSS
+    selector gets. Not "stale", not "ambiguous": unreachable, regardless of
+    whether it was ever valid. Found for real, on a page whose only
+    interactive control happened to be inside one."""
+    verdict = guard("browser_click", {"target": "f1e3"}, context(known_refs={"f1e3"}))
+    assert verdict.allowed
+
+
+def test_a_frame_scoped_ref_the_page_never_reported_is_still_refused():
+    """The fix widens what counts as a ref; it must not widen what counts as
+    a known one -- a made-up frame-scoped string is exactly as refusable as a
+    made-up bare one."""
+    verdict = guard("browser_click", {"target": "f1e3"}, context(known_refs={"e3"}))
+    assert not verdict.allowed
+    assert "as it now stands" in verdict.reason
+
+
+async def test_a_frame_scoped_ref_reaches_the_browser_end_to_end():
+    """Not just accepted by the guard in isolation -- reachable through the
+    whole path a real session takes: a snapshot naming an iframe's control,
+    `known_refs` picking it up, and a click on it actually dispatching."""
+    async with await session(replies={"browser_snapshot": IFRAME_SNAPSHOT}) as tools:
+        await tools.call("browser_snapshot")
+        assert "f1e3" in tools.known_refs
+
+        result = await tools.call("browser_click", {"target": "f1e3"})
+        assert not result.is_error
+
+
 async def test_refs_are_replaced_by_what_the_page_last_reported():
     """Accumulating them would let exactly the stale target through.
 
@@ -311,6 +357,30 @@ def test_an_irreversible_action_is_flagged_without_being_refused():
     )
 
     assert verdict.allowed
+
+
+def test_a_form_submit_no_longer_needs_approval():
+    """Deliberately different from `payment`/`destructive` just below: this
+    deployment's operator asked for submit specifically to stop pausing on a
+    person, after being told what that means for every session, not only
+    this one -- see `catalog.IRREVERSIBLE`'s own comment. It is still
+    detected and still allowed either way; only the pause is gone."""
+    verdict = guard(
+        "browser_click", {"target": "e3", "element": "Submit form"}, context()
+    )
+
+    assert verdict.allowed
+    assert not verdict.needs_approval
+    assert "form_submit" in verdict.category
+
+
+def test_payment_and_destructive_still_need_approval():
+    for element in ("Pay now", "Delete account"):
+        verdict = guard(
+            "browser_click", {"target": "e3", "element": element}, context()
+        )
+        assert verdict.allowed
+        assert verdict.needs_approval, element
     assert verdict.needs_approval
     assert verdict.category
 

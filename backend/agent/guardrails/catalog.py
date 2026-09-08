@@ -115,10 +115,16 @@ TARGET_KEYS: tuple[str, ...] = ("target", "startTarget", "endTarget")
 #: how an approval gate stops working, and a gate nobody reads is worse than
 #: no gate because it looks like protection.
 #:
-#: So: what cannot be undone. Submitting, paying, deleting.
-IRREVERSIBLE: frozenset[str] = frozenset(
-    {"form_submit", "payment", "destructive"}
-)
+#: `form_submit` used to be here alongside `payment` and `destructive` --
+#: this deployment's operator asked for it to stop asking, after being shown
+#: what removing it means: no session, for any user of this deployment, is
+#: asked before a form is submitted. `policy.classify` still detects and
+#: records `Category.FORM_SUBMIT` on every call either way -- see
+#: `_argument_text`/`SUBMIT_PATTERNS` in `policy.py` -- so a submit is still
+#: in the audit trail and the transcript; it simply no longer blocks on a
+#: person first. `payment` and `destructive` were not part of that request
+#: and still stop and ask.
+IRREVERSIBLE: frozenset[str] = frozenset({"payment", "destructive"})
 
 __all__ = [
     "DISTILS_TO",

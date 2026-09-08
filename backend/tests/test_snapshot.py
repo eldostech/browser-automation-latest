@@ -211,11 +211,30 @@ def test_roles_histogram_reports_what_was_on_the_page(real: Snapshot):
 
 
 @pytest.mark.parametrize(
-    "value", ["ref=e15", "[ref=e15]", " ref=f1e42 ", "e15", " e407 "]
+    "value", ["ref=e15", "[ref=e15]", " ref=f1e42 ", "e15", " e407 ", "f1e42"]
 )
 def test_is_ref_recognises_every_spelling(value: str):
     assert is_ref(value) is True
     assert extract_ref(value) in {"e15", "f1e42", "e407"}
+
+
+def test_a_bare_ref_inside_an_iframe_is_a_ref_not_a_selector():
+    """The bug this file's own `test_a_bare_ref_is_a_ref_not_a_selector` was
+    written from, one level deeper: `f1e42` -- the shape Playwright MCP gives
+    an element inside a frame, `ref=f1e42` prefixed or bare -- used to only
+    pass this check with the `ref=` prefix on. The bare spelling, which is
+    exactly the one a model's `target` argument actually carries, was refused
+    outright as "not an element reference", regardless of whether it was ever
+    valid. Found for real, on a page whose only interactive widget happened to
+    be inside an iframe -- meaning nothing on that page was reachable at all.
+    """
+    assert is_ref("f1e42") is True
+    assert extract_ref("f1e42") == "f1e42"
+    assert is_ref("f10e107") is True, "more than one digit in either segment"
+
+
+def test_a_doubly_nested_frame_ref_is_still_a_ref():
+    assert is_ref("f10f3e107") is True
 
 
 def test_a_bare_ref_is_a_ref_not_a_selector():

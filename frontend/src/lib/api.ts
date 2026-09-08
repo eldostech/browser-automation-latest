@@ -405,10 +405,15 @@ export const api = {
       extractions?: { line: number; name: string }[];
     },
   ) =>
-    request<{ usecase_id: string; version: number; status: string }>(
-      `/api/recordings/${recordingId}/save`,
-      { method: 'POST', body: JSON.stringify(payload) },
-    ),
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      /** Whether a field marked secret was written straight to the vault --
+       *  never the value itself, just whether it happened. */
+      credential_saved: boolean;
+      credential_name: string | null;
+    }>(`/api/recordings/${recordingId}/save`, { method: 'POST', body: JSON.stringify(payload) }),
 
   // --- datasets --------------------------------------------------------------
 

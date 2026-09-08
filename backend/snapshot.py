@@ -344,10 +344,17 @@ def parse(text: str) -> Snapshot:
     return snapshot
 
 
-#: A ref with no ``ref=`` prefix, which is the spelling Playwright MCP's own
-#: tools use for their ``ref`` argument -- and which the model therefore copies
-#: into ``target`` as well.
-BARE_REF_RE = re.compile(r"e\d+")
+#: The shape of a ref, bare -- no ``ref=`` prefix, which is the spelling
+#: Playwright MCP's own tools use for their ``ref`` argument, and which the
+#: model therefore copies into ``target`` as well.
+#:
+#: An element inside an iframe gets one ``f<N>`` segment per level of frame
+#: nesting before its own ``e<N>`` -- ``f10e107`` for the 108th element of the
+#: 11th frame, ``f10e107`` still if that frame is itself nested one level
+#: deeper... this was ``e\\d+`` alone, which rejected every such ref outright
+#: as not a ref at all, regardless of whether it was ever valid. Found for
+#: real, against a page whose interactive widget happened to live in one.
+BARE_REF_RE = re.compile(r"(?:f\d+)*e\d+")
 
 
 def is_ref(target: str) -> bool:

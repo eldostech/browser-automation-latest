@@ -36,19 +36,25 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from snapshot import BARE_REF_RE
+
 log = logging.getLogger(__name__)
 
-#: How Playwright MCP names an element in a snapshot: ``[ref=e12]``.
+#: How Playwright MCP names an element in a snapshot: ``[ref=e12]``, or
+#: ``[ref=f10e107]`` for the 108th element of the 11th frame. Built from
+#: ``snapshot.BARE_REF_RE`` rather than a second copy of the same shape --
+#: see that constant's own comment for the failure two independent, both
+#: too-narrow copies of it caused.
 #:
 #: Parsed out of *every* tool result rather than only out of ``browser_snapshot``
 #: results, because an action's result carries an updated page section too, and
 #: a ref that has just appeared is exactly the one the next call needs.
-REF_IN_SNAPSHOT = re.compile(r"\[ref=(e\d+)\]")
+REF_IN_SNAPSHOT = re.compile(rf"\[ref=({BARE_REF_RE.pattern})\]")
 
 #: What a valid ``target`` looks like. See ``guardrails/guard.py`` -- the fact
 #: that the server also accepts a raw CSS selector here is the thing the guard
 #: exists to take back.
-REF_FORMAT = re.compile(r"^e\d+$")
+REF_FORMAT = re.compile(rf"^{BARE_REF_RE.pattern}$")
 
 
 @dataclass(slots=True)

@@ -189,6 +189,85 @@ async def test_a_credential_does_not_survive_in_the_saved_steps(client: TestClie
     assert "{{secret.password}}" in body
 
 
+async def test_a_recorded_credential_is_saved_to_the_vault_automatically(client: TestClient):
+    """The value a person just typed while recording is exactly the value the
+    vault needs; making them re-type it on a second screen was the gap."""
+    recording_id = await record(client)
+
+    saved = client.post(
+        f"/api/recordings/{recording_id}/save",
+        json={
+            "name": "Submit orders",
+            "fields": [
+                {"name": "username", "value": "nitin", "secret": True},
+                {"name": "password", "value": "s3cret-Example-Pw", "secret": True},
+                {"name": "reference", "value": "A-1024", "secret": False},
+            ],
+        },
+    ).json()
+
+    assert saved["credential_saved"] is True
+    assert saved["credential_name"] == "Submit orders"
+
+    credentials = client.get("/api/credentials").json()["credentials"]
+    stored = next(c for c in credentials if c["name"] == "Submit orders")
+    assert stored["slots"] == ["password", "username"]
+
+
+async def test_the_auto_saved_credential_value_is_never_in_the_response(client: TestClient):
+    recording_id = await record(client)
+
+    saved = client.post(
+        f"/api/recordings/{recording_id}/save",
+        json={
+            "name": "Submit orders",
+            "fields": [{"name": "password", "value": "s3cret-Example-Pw", "secret": True}],
+        },
+    )
+    assert "s3cret-Example-Pw" not in saved.text
+
+
+async def test_a_recording_with_no_secret_field_saves_no_credential(client: TestClient):
+    recording_id = await record(client)
+
+    saved = client.post(
+        f"/api/recordings/{recording_id}/save",
+        json={"fields": [{"name": "reference", "value": "A-1024", "secret": False}]},
+    ).json()
+
+    assert saved["credential_saved"] is False
+    assert saved["credential_name"] is None
+
+
+async def test_re_saving_under_the_same_name_replaces_the_credential_not_duplicates_it(
+    client: TestClient,
+):
+    """Re-recording the same workflow is the ordinary reason to save under
+    the same name twice; the vault entry should track the newest value, not
+    accumulate one for every take."""
+    first_recording = await record(client)
+    client.post(
+        f"/api/recordings/{first_recording}/save",
+        json={
+            "name": "Submit orders",
+            "fields": [{"name": "password", "value": "old-pw", "secret": True}],
+        },
+    )
+
+    second_recording = await record(client)
+    client.post(
+        f"/api/recordings/{second_recording}/save",
+        json={
+            "name": "Submit orders",
+            "fields": [{"name": "password", "value": "new-pw", "secret": True}],
+        },
+    )
+
+    credentials = client.get("/api/credentials").json()["credentials"]
+    matching = [c for c in credentials if c["name"] == "Submit orders"]
+    assert len(matching) == 1
+
+
 async def test_saving_an_unfinished_recording_is_refused(client: TestClient):
     started = client.post(
         "/api/recordings", json={"start_url": "https://example.com/", "name": "x"}

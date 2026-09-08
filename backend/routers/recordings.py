@@ -31,7 +31,8 @@ from codegen import Recording, urls_of
 # The parser's own ladder builder: a pointed-at element deserves the same
 # semantic-then-weak fallback chain every recorded action gets.
 from codegen import _ladder  # noqa: PLC2701
-from deps import WorkspaceData, require
+from credentials import Vault, new_credential_id
+from deps import WorkspaceData, get_vault, require
 from fields import FieldSet, parameterise
 from recorder import Recorder, RecorderUnavailable
 from routers.schemas import SaveRecordingRequest, StartRecordingRequest
@@ -47,6 +48,7 @@ def get_recorder(request: Request) -> Recorder:
 
 
 RecorderDep = Annotated[Recorder, Depends(get_recorder)]
+VaultDep = Annotated[Vault, Depends(get_vault)]
 
 
 @router.post("", status_code=201)
@@ -123,6 +125,7 @@ async def save_recording(
     body: SaveRecordingRequest,
     data: WorkspaceData,
     recorder: RecorderDep,
+    vault: VaultDep,
     principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
 ) -> dict[str, Any]:
     """Turn a finished recording into a draft use case.
@@ -168,12 +171,79 @@ async def save_recording(
             "unsupported": len(session.recording.unsupported),
         },
     )
+
+    credential = await _save_credential(
+        declared, use_case.name, data=data, vault=vault, principal=principal
+    )
+
     recorder.discard(recording_id, principal.workspace_id)
     log.info(
         "recording saved as a use case",
         extra={"usecase_id": usecase_id, "version": version},
     )
-    return {"usecase_id": usecase_id, "version": version, "status": use_case.status}
+    return {
+        "usecase_id": usecase_id,
+        "version": version,
+        "status": use_case.status,
+        "credential_saved": credential is not None,
+        "credential_name": credential,
+    }
+
+
+async def _save_credential(
+    declared: FieldSet,
+    name: str,
+    *,
+    data: WorkspaceData,
+    vault: Vault,
+    principal: Principal,
+) -> str | None:
+    """Every field marked secret, bundled into one credential named after the
+    use case -- so a person who just typed a real sign-in while recording
+    does not have to go type it again on a second screen.
+
+    Re-saving under the same use case name replaces it (``save_credential``'s
+    own contract), which is the right behaviour for re-recording the same
+    workflow rather than a footgun: two different workflows do not share a
+    use case name, so they do not collide here either.
+
+    Silent, not an error, when there is nothing to save or nowhere to put it
+    -- a recording with no secret field, or a deployment with no vault key
+    configured, saves the use case exactly as it always could; a person can
+    still add the credential by hand on the screen that always existed for
+    it. Returns the credential's name, for the response, or ``None``.
+    """
+    values = declared.secret_values
+    if not values or not vault.available:
+        return None
+
+    try:
+        ciphertext = vault.seal(values)
+    except ValueError:
+        # A field name collided with another credential's slot in a way the
+        # vault rejects -- not this endpoint's decision to work around by
+        # dropping a value. The use case is already saved; a person adds the
+        # credential from the screen that always existed for it.
+        return None
+
+    credential_id = await data.save_credential(
+        new_credential_id(),
+        name,
+        Vault.slots_of(values),
+        ciphertext,
+        owner_id=principal.user_id,
+    )
+    await data.audit(
+        "credential.save",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="credential",
+        resource_id=credential_id,
+        # Names and slot names only -- never a value, here or in any log this
+        # function reaches. `credential.save`'s own audit convention.
+        detail={"name": name, "slots": Vault.slots_of(values), "source": "recording"},
+    )
+    return name
 
 
 #: The actions whose value lands in ``Recording.typed``, in the same order.
