@@ -1,0 +1,161 @@
+<mxfile host="app.diagrams.net" modified="2024-05-18T12:00:00.000Z" agent="Mozilla/5.0" version="21.3.0">
+  <diagram id="decoupled_metadata_arch" name="Target Architecture: Decoupled Metadata">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Mainframe PAS -->
+        <mxCell id="2" value="Mainframe PAS&#xa;(Core Operational DB2)" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="120" y="80" width="180" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- SaaS PAS -->
+        <mxCell id="3" value="SaaS PAS&#xa;(Vendor Core)" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="360" y="80" width="180" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- Mainframe Aux Lookup (Doc Gen) -->
+        <mxCell id="4" value="Mainframe Aux Table&#xa;(Metadata Lookup)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="135" y="240" width="150" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- Mainframe Doc Gen Engine -->
+        <mxCell id="5" value="Mainframe Batch&#xa;Doc Gen Engine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="135" y="380" width="150" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- API Gateway / BFF -->
+        <mxCell id="6" value="Enterprise API Gateway&#xa;(Federation &amp; Semantic Layer)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="640" y="160" width="280" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Decoupled Metadata Store -->
+        <mxCell id="7" value="Decoupled Metadata&#xa;Store (MDM/RDBMS)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="400" y="240" width="160" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Data Lake -->
+        <mxCell id="8" value="Enterprise Data Lake&#xa;(Silver/Gold Curation)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="640" y="440" width="280" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Online Apps / Consumers -->
+        <mxCell id="9" value="Online Applications / Portals&#xa;(B2B, UI, Customer Service)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="640" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- EDGES -->
+
+        <!-- Apps to API Gateway -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="9" target="6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- API Gateway to Mainframe PAS -->
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="6" target="2">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="600" y="190" />
+              <mxPoint x="600" y="120" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="Fetch Core Policy" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e2">
+            <mxGeometry x="-0.2" y="1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+        
+        <!-- API Gateway to SaaS PAS -->
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="6" target="3">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="640" y="120" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="Fetch Core Policy" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e3">
+            <mxGeometry x="-0.1" y="-1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <!-- API Gateway to Metadata Store -->
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="780" y="285" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="Fetch / Mutate Attributes" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e4">
+            <mxGeometry x="-0.2" y="1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <!-- Metadata Store to Mainframe Aux (Reverse Feed) -->
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="7" target="4">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="Batch MFT Feed (Nightly)" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e5">
+            <mxGeometry x="-0.15" y="-1" relative="1" as="geometry">
+              <mxPoint x="-11" y="-1" as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <!-- Mainframe Aux and Mainframe PAS to Doc Gen -->
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="2" target="5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="90" y="120" />
+              <mxPoint x="90" y="350" />
+              <mxPoint x="173" y="350" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry" />
+          <mxCell value="DB2 JOIN" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e7">
+            <mxGeometry x="-0.2" y="-1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <!-- Metadata Store to Data Lake -->
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="7" target="8">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="480" y="485" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="CDC / Direct Ingestion" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e8">
+            <mxGeometry x="-0.3" y="1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+        <!-- PAS to Data Lake -->
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0.25;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;" edge="1" parent="1" source="3" target="8">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="600" y="120" />
+              <mxPoint x="600" y="380" />
+              <mxPoint x="710" y="380" />
+            </Array>
+          </mxGeometry>
+          <mxCell value="Core CDC Pipelines" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" vertex="1" connectable="0" parent="e9">
+            <mxGeometry x="0.1" y="-1" relative="1" as="geometry">
+              <mxPoint as="offset" />
+            </mxGeometry>
+          </mxCell>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
