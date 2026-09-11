@@ -38,8 +38,8 @@ from store import Store
 log = logging.getLogger(__name__)
 
 
-async def _fetch_event(store: Store, run_id: str, seq: int):
-    """Read one event for the cross-process bus.
+async def _fetch_events(store: Store, run_id: str, after_seq: int, limit: int):
+    """Read a range of events for the cross-process bus.
 
     The same shape as the API's own fetcher: the bus is delivering to a
     subscriber that was already authorised for this run, so it must not care
@@ -47,9 +47,10 @@ async def _fetch_event(store: Store, run_id: str, seq: int):
     """
     workspace_id = await store.default_workspace_id()
     if workspace_id is None:
-        return None
-    events = await store.workspace(workspace_id).get_events(run_id, after_seq=seq - 1, limit=1)
-    return events[0] if events else None
+        return []
+    return await store.workspace(workspace_id).get_events(
+        run_id, after_seq=after_seq, limit=limit
+    )
 
 
 async def run(settings: Settings | None = None) -> None:
@@ -69,7 +70,10 @@ async def run(settings: Settings | None = None) -> None:
     # Cross-process: a batch running here has to reach a dashboard tab whose
     # WebSocket is held by the API process, and an in-memory fan-out cannot do
     # that.
-    bus = build_bus(settings, lambda run_id, seq: _fetch_event(store, run_id, seq))
+    bus = build_bus(
+        settings,
+        lambda run_id, after_seq, limit: _fetch_events(store, run_id, after_seq, limit),
+    )
     await bus.start()
 
     replays = ReplayManager(

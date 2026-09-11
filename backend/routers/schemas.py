@@ -462,3 +462,23 @@ class SpendLimitRequest(BaseModel):
     """
 
     limit_usd: float | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class LocatorCheckRequest(BaseModel):
+    """Try some locators against a real page and say what each one matches.
+
+    A person editing a locator is otherwise guessing: the rung reads fine and
+    only a batch discovers it matched nothing, or matched four things. This is
+    the difference between editing a locator and editing a string.
+    """
+
+    #: Where to look. Must be inside the use case's own allowlist -- the same
+    #: gate a run passes, for the same reason.
+    url: str = Field(min_length=1, max_length=2_000)
+    #: The ladder as it would be saved. Validated as `Locator` in the handler,
+    #: so a malformed rung comes back as a message rather than a 422 on a body
+    #: the editor cannot map back to a field.
+    locators: list[dict] = Field(min_length=1, max_length=12)
+    #: A step's own timeout, so a check on a slow page behaves like the step
+    #: it is checking rather than failing faster than the real thing would.
+    timeout_ms: int = Field(default=10_000, ge=1_000, le=60_000)

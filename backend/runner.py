@@ -30,6 +30,7 @@ from typing import Any, Literal
 from batch import BatchProgress, BatchRunner, new_batch_id
 from batch import summarise as batch_summarise
 from bus import EventBus
+from eventbuffer import DEFAULT_INTERVAL, DEFAULT_MAX_BATCH, EventBuffer, RowBuffer
 from config import Settings
 from events import (
     AgentEvent,
@@ -48,11 +49,27 @@ from redaction import NULL_REDACTOR, Redactor
 from browser import BrowserConfig, BrowserError, PlaywrightSession
 from engine import RowResult, UseCaseExecutor, emit_replay_error
 from store import Store, WorkspaceStore
-from usecase import effective_mode, resolve_base_url, Mode, UseCase
+from usecase import (
+    effective_mode,
+    resolve_base_url,
+    unbatchable_reasons,
+    Mode,
+    UseCase,
+)
 
 log = logging.getLogger(__name__)
 
 ApprovalDecision = Literal["approved", "rejected", "timeout"]
+
+
+class BatchNotPossible(RuntimeError):
+    """This use case runs one record but cannot run many.
+
+    Its own class so the router can answer 409 with the reason rather than
+    letting it surface as a 500 -- the message is the whole value here, because
+    it is the only chance the product gets to explain a shape that would
+    otherwise look like the tool being unreliable.
+    """
 
 
 class ModeUnavailable(RuntimeError):
@@ -85,6 +102,19 @@ class RunEventSink:
     Redaction happens here rather than in ``Store`` because this is the single
     point every event passes through on its way to *both* destinations. Doing
     it in the store would leave the WebSocket broadcasting the unredacted copy.
+
+    **Writes are batched.** ``emit`` hands the event to an :class:`EventBuffer`
+    and returns without touching the database; a background flush writes
+    whatever has accumulated in one statement and publishes it afterwards. See
+    ``eventbuffer.py`` for why that is safe -- briefly: an event is a record
+    about work that has already happened, nothing the browser does next depends
+    on it, and the live view is served from an in-memory queue rather than from
+    the database. The flush still happens *before* the publish, so the resume
+    contract is unchanged: a client never sees a ``seq`` a catch-up read cannot
+    return.
+
+    Step rows are batched too, on the row rather than on a timer: nothing reads
+    them until the row is finished.
     """
 
     def __init__(
@@ -94,6 +124,9 @@ class RunEventSink:
         bus: EventBus,
         api_base: str = "",
         redactor: Redactor | None = None,
+        *,
+        flush_interval: float = DEFAULT_INTERVAL,
+        max_batch: int = DEFAULT_MAX_BATCH,
     ) -> None:
         self.run_id = run_id
         self.store = store
@@ -101,6 +134,13 @@ class RunEventSink:
         self.api_base = api_base.rstrip("/")
         self.redactor = redactor or NULL_REDACTOR
         self._seq = 0
+        self._events = EventBuffer(
+            self.store.append_events,
+            lambda batch: self.bus.publish_many(self.run_id, batch),
+            interval=flush_interval,
+            max_batch=max_batch,
+        )
+        self._steps = RowBuffer(self.store.record_steps)
 
     def reserve_seq(self) -> int:
         self._seq += 1
@@ -111,12 +151,23 @@ class RunEventSink:
         return self._seq
 
     async def emit(self, event: AgentEvent) -> None:
-        event = self.redactor.event(event)
-        try:
-            await self.store.append_event(event)
-        except Exception as exc:  # noqa: BLE001 - never let logging kill a run
-            log.error("failed to persist event", extra={"run_id": self.run_id, "error": str(exc)})
-        self.bus.publish(self.run_id, event)
+        """Take an event. No round trip: the flush happens off the step."""
+        self._events.add(self.redactor.event(event))
+
+    async def flush(self) -> None:
+        """Write everything buffered. Called at each row boundary.
+
+        A row is the unit a person resumes, retries and reads results by, so it
+        is the point at which "what happened" has to be on disk rather than in
+        this process.
+        """
+        await self._events.flush()
+        await self._steps.flush()
+
+    async def aclose(self) -> None:
+        """Stop the timer and write what is left. Idempotent."""
+        await self._events.aclose()
+        await self._steps.flush()
 
     async def save_screenshot(
         self, data: bytes, *, seq: int, mime: str = "image/png"
@@ -159,8 +210,12 @@ class RunEventSink:
         return record.id, f"{self.api_base}/api/artifacts/{record.id}"
 
     async def record_step(self, **fields) -> None:
-        """One row per step, for the finished timeline and the visual diff."""
-        await self.store.record_step(**fields)
+        """One row per step, for the finished timeline and the visual diff.
+
+        Buffered until the row ends. Nothing reads these while the row is still
+        running, so paying a round trip per step bought nothing.
+        """
+        self._steps.add(fields)
 
     async def read_artifact(self, artifact_id: str) -> bytes | None:
         """An artifact's bytes, for comparing this run against the baseline."""
@@ -467,6 +522,16 @@ class ReplayManager:
         if self.queue is None:
             raise RuntimeError("no job queue is configured, so batches cannot be queued")
 
+        # Checked here rather than at publish, and that placement is the point.
+        # A use case whose record ends by signing out runs one record perfectly
+        # and cannot run two, so refusing it at publish would block somebody who
+        # only ever meant to run it once -- and leave them with a recording they
+        # could only delete. Here it is both certain and actionable: the person
+        # has just asked for many records, and this is why they would fail.
+        blockers = unbatchable_reasons(request.usecase)
+        if blockers:
+            raise BatchNotPossible("\n\n".join(blockers))
+
         usecase = request.usecase
         indices = (
             list(request.only_rows)
@@ -695,7 +760,12 @@ class ReplayManager:
             )
             redactor = Redactor(request.secrets.values())
             async with RunLifecycle(
-                run_id, data, self.bus, redactor=redactor
+                run_id,
+                data,
+                self.bus,
+                redactor=redactor,
+                flush_interval=self.settings.event_flush_interval,
+                max_batch=self.settings.event_flush_max_batch,
             ) as run:
                 result = await self._drive(request, run_id, run.sink, redactor)
                 if result.repair_proposal is not None:
@@ -918,7 +988,14 @@ async def _run_batch(manager: "ReplayManager", batch_id: str, request: BatchRequ
     )
     await store.update_batch(batch_id, status="running")
 
-    async with RunLifecycle(run_id, store, manager.bus, redactor=redactor) as run:
+    async with RunLifecycle(
+        run_id,
+        store,
+        manager.bus,
+        redactor=redactor,
+        flush_interval=manager.settings.event_flush_interval,
+        max_batch=manager.settings.event_flush_max_batch,
+    ) as run:
         await _drive_batch(manager, store, run, batch_id, run_id, request, rows, indices,
                            browser_config, redactor)
 

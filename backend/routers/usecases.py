@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from auth.rbac import Permission
 from auth.service import Principal
+from browser import BrowserError
 from credentials import NO_KEY_MESSAGE, Vault, new_credential_id
 from deps import (
     WorkspaceData,
@@ -19,6 +20,8 @@ from deps import (
     run_or_404,
     usecase_or_404,
 )
+from engine import probe_locators
+from policy import check_navigation
 from repair import (
     locator_changes,
     RepairError,
@@ -29,10 +32,16 @@ from repair import (
     is_unchanged,
     validate_patched,
 )
-from routers.schemas import DistillRequest, RenameRequest, RepairRequest, ScriptsRequest
+from routers.schemas import (
+    DistillRequest,
+    LocatorCheckRequest,
+    RenameRequest,
+    RepairRequest,
+    ScriptsRequest,
+)
 from runner import ReplayManager
 from services import find_failed_execution
-from usecase import Step, UseCase
+from usecase import Locator, Step, UseCase
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +240,16 @@ async def rename_usecase(
     return {"usecase_id": usecase_id, "name": body.name.strip()}
 
 
+def _refusal(exc: ValidationError) -> str:
+    """Every reason a publish was refused, as prose somebody can act on."""
+    messages = [
+        str(error.get("msg", "")).removeprefix("Value error, ").strip()
+        for error in exc.errors()
+    ]
+    found = [message for message in messages if message]
+    return "\n\n".join(found) or "This use case cannot be published as it stands."
+
+
 @router.post("/usecases/{usecase_id}/publish")
 async def publish_usecase(
     usecase_id: str,
@@ -247,6 +266,12 @@ async def publish_usecase(
 
     try:
         UseCase.model_validate({**definition, "status": "ready"})
+    except ValidationError as exc:
+        # The message, not the report. A publish refusal is read by whoever
+        # recorded the workflow, and it is the one place the product gets to
+        # explain why their use case would have failed -- burying that in a
+        # pydantic dump wastes the only chance to say it.
+        raise HTTPException(status_code=422, detail=_refusal(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -298,6 +323,61 @@ async def set_scripts(
         },
     )
     return {"usecase_id": usecase_id, "scripts_enabled": body.enabled, "by": principal.email}
+
+
+@router.post("/usecases/{usecase_id}/locator-check")
+async def check_locators(
+    usecase_id: str,
+    body: LocatorCheckRequest,
+    data: WorkspaceData,
+    request: Request,
+    _: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+) -> dict[str, Any]:
+    """Open a page and report what each of these locators actually matches.
+
+    This exists because editing a locator without it is editing a string. A
+    rung reads perfectly well and still matches nothing, or matches four
+    things; before this, the only way to find out was to run the use case, and
+    for an ambiguous rung the symptom was a thirty-second timeout on row one of
+    a batch.
+
+    It resolves through ``engine.build_locator`` -- the executor's own
+    composer, not a second implementation of it. A check that answered a
+    slightly different question than the run would is worse than no check, on a
+    screen whose entire purpose is to say whether an edit will work.
+
+    Nothing is saved. The reply describes the page as it is right now, and a
+    person decides what to do about it.
+    """
+    definition = await usecase_or_404(usecase_id, data)
+    use_case = UseCase.model_validate(definition)
+
+    # The same gate a run passes, for the same reason: this opens a browser and
+    # visits a URL somebody typed into a form.
+    check = check_navigation("locator_check", {"url": body.url}, use_case.allowed_domains)
+    if not check.allowed:
+        raise HTTPException(status_code=400, detail=check.reason)
+
+    parsed: list[Locator] = []
+    for index, raw in enumerate(body.locators):
+        try:
+            parsed.append(Locator.model_validate(raw))
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"locator {index} is not valid: {exc.errors()[0].get('msg', exc)}",
+            ) from exc
+
+    settings = request.app.state.settings
+    try:
+        return await probe_locators(
+            parsed, url=body.url, settings=settings, timeout_ms=body.timeout_ms
+        )
+    except BrowserError as exc:
+        # A browser that will not start is a deployment problem, not a bad
+        # locator, and saying so is the difference between fixing the
+        # environment and rewriting a rung that was always correct.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.delete("/usecases/{usecase_id}")

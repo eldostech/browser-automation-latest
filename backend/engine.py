@@ -52,7 +52,7 @@ from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
 import imagediff
-from browser import BrowserError, PlaywrightSession
+from browser import BrowserConfig, BrowserError, PlaywrightSession
 from events import (
     AgentEvent,
     ErrorEvent,
@@ -97,6 +97,11 @@ Phase = Literal["setup", "row", "reset", "teardown"]
 #: the first pass and returns immediately. Only a genuinely absent element
 #: spends the budget. Raise REPLAY_STEP_TIMEOUT for a site slower than this.
 POLL_INTERVAL = 0.25
+
+#: How many matching elements the locator check names back. Enough to see
+#: whether an ambiguous rung is finding the right kind of thing; not so many
+#: that checking a rung matching a whole table reads the whole table.
+PROBE_SAMPLES = 5
 
 #: How much of the page to keep on a failure event. A repair reads this later,
 #: and the interactive nodes it needs are near the top.
@@ -143,6 +148,15 @@ class Healer(Protocol):
 
     @property
     def tokens_used(self) -> int: ...
+
+    async def confirm(self, repair: Any, worked: bool) -> None:
+        """How that repair turned out, once the step has been retried.
+
+        Optional, the way ``record_step`` is optional on the sink. It exists so
+        that a healer which remembers fixes can record only the ones that
+        worked -- which is knowable here and nowhere earlier -- without this
+        module knowing that a memory exists at all.
+        """
 
 
 class StepFailed(RuntimeError):
@@ -306,6 +320,17 @@ class UseCaseExecutor:
         #: The artifact the last capture produced, so the step row can point at
         #: the picture of itself.
         self._last_shot: str | None = None
+        #: The bytes of that screenshot, still in hand.
+        #:
+        #: The visual diff used to fetch them back out of storage immediately
+        #: after writing them -- a database row lookup and an object-store GET,
+        #: per step, for bytes that had not left memory. Against S3 in another
+        #: rack that was most of what an `every_step` run spent its time on.
+        self._last_shot_bytes: bytes | None = None
+        #: Baseline images already fetched, by artifact id. The baseline for a
+        #: step is the *same image on every row*, so a thousand-row batch was
+        #: fetching one identical object a thousand times.
+        self._baseline_cache: dict[str, bytes | None] = {}
         self._last_snapshot: Snapshot | None = None
         self._last_snapshot_text = ""
         self._last_page_url: str | None = None
@@ -548,6 +573,11 @@ class UseCaseExecutor:
         recording already knew instead of losing it.
         """
         assert self.healer is not None
+        # Settled, for the same reason the failure context is: the candidate
+        # list the healer chooses from *is* this snapshot, and offering it a
+        # half-rendered page is how a repair names a control that was on its
+        # way out.
+        await self.browser.settle()
         await self._refresh_snapshot()
         repair = await self.healer.repair(step, self._last_snapshot)
         if repair is None:
@@ -567,7 +597,16 @@ class UseCaseExecutor:
             outcome = await self._perform(step, values, outputs)
         except Exception as exc:  # noqa: BLE001 - a failed repair is a failed row
             log.warning("retry after healing failed", extra={"step_id": step.id, "error": str(exc)})
+            await self._confirm_repair(repair, False)
             return None
+
+        # Whether the repair was right is knowable *here* and nowhere earlier,
+        # so this is where the healer is told. A healer that keeps a memory
+        # used to write the fix down when it proposed one, which recorded what
+        # the model believed rather than what turned out to be true -- and a
+        # confident wrong answer then came back as evidence every time that
+        # site broke again.
+        await self._confirm_repair(repair, outcome.ok)
 
         # The repair may have left a dialog open or the page part-way through
         # something, so put the browser back before the next row inherits it.
@@ -578,6 +617,22 @@ class UseCaseExecutor:
                 log.debug("row_reset after healing failed", extra={"step_id": step.id})
 
         return outcome if outcome.ok else None
+
+    async def _confirm_repair(self, repair: Any, worked: bool) -> None:
+        """Tell the healer how its repair turned out, if it wants to know.
+
+        Optional on the protocol, the way ``record_step`` is optional on the
+        sink: a healer with no memory behind it -- a test's, or one built
+        without an embedder -- simply does not have this, and a healer that
+        raises here must not turn a repaired row into a failed one.
+        """
+        confirm = getattr(self.healer, "confirm", None)
+        if confirm is None:
+            return
+        try:
+            await confirm(repair, worked)
+        except Exception:  # noqa: BLE001 - bookkeeping, never the run
+            log.debug("could not confirm a repair", exc_info=True)
 
     async def _emit_error(self, kind: str, message: str, *, recoverable: bool = False) -> None:
         await self.sink.emit(
@@ -594,6 +649,16 @@ class UseCaseExecutor:
     async def _perform(
         self, step: Step, values: dict[str, Any], outputs: dict[str, Any]
     ) -> StepOutcome:
+        # The one funnel every action passes through, and therefore the place
+        # to say which row is being performed. `_resolve` needs it because a
+        # locator may now name its element by a value from the row -- a search
+        # whose dropdown is filled from the data has no other way to say which
+        # suggestion it means. Set here rather than threaded through eight
+        # signatures, and cleared nowhere: the next step overwrites it, and a
+        # locator that references an input while no row is in hand fails loudly
+        # through `_render` rather than resolving against stale values.
+        self._row_values = values
+
         if step.action == "script" and not self.usecase.allow_scripts:
             raise ScriptBlocked(
                 f"step {step.id!r} is raw JavaScript and this use case has allow_scripts "
@@ -629,7 +694,7 @@ class UseCaseExecutor:
 
         ok, message, duration = await self._act("navigate", {"url": url}, step, go)
         if ok:
-            await self._refresh_snapshot()
+            await self._after_action()
         return StepOutcome(step.id, ok, duration, message)
 
     async def _do_element_action(self, step: Step, values: dict[str, Any]) -> StepOutcome:
@@ -676,7 +741,7 @@ class UseCaseExecutor:
 
         ok, message, duration = await self._act(step.action, arguments, step, perform)
         if ok:
-            await self._refresh_snapshot()
+            await self._after_action()
         return StepOutcome(
             step.id, ok, duration, message, matched_locator=described, locator_rung=rung
         )
@@ -712,7 +777,7 @@ class UseCaseExecutor:
                     step.id, False, 0, f"filling {item.name!r} failed: {message}"
                 )
 
-        await self._refresh_snapshot()
+        await self._after_action()
         return StepOutcome(
             step.id, True, 0, f"filled {len(step.fields)} field(s)", locator_rung=deepest
         )
@@ -955,7 +1020,7 @@ class UseCaseExecutor:
 
         ok, message, duration = await self._act("script", {"code": code}, step, evaluate)
         if ok:
-            await self._refresh_snapshot()
+            await self._after_action()
         return StepOutcome(step.id, ok, duration, message)
 
     def _render_code(self, step: Step, inputs: dict[str, Any]) -> str:
@@ -1003,37 +1068,78 @@ class UseCaseExecutor:
         as a substring, so the dialog's rung found both, took the one behind
         the dialog, and spent the whole step budget waiting for an element the
         dialog was covering. A thirty-second timeout was the only symptom.
+
+        **Counting is done over what is visible.** See :meth:`_visible_only`
+        for why that is not a refinement but a correction. A rung that matches
+        one visible element is taken even when hidden duplicates exist, and the
+        locator returned is the narrowed one, so the action lands on the
+        element that was counted rather than on a sibling of it.
+
+        A rung matching exactly one element that is *not* visible is held back
+        rather than discarded. The page may still be rendering, so the loop
+        keeps polling; if the deadline passes with nothing better, that rung is
+        returned so Playwright raises its own actionability error, which says
+        what the element is and why it could not be used. Failing with "no
+        element matched" when one plainly did sends somebody looking for the
+        wrong problem.
         """
         self._last_node = None
         self._ambiguous = {}
         if not locators:
             return None
 
-        ordered = self._rungs(locators)
+        # Rendered before anything looks at it, so everything downstream --
+        # the ladder order, the match count, the failure message -- is about
+        # the locator this row actually uses rather than about the template.
+        # That is the answer to the standing objection to templating a
+        # locator at all: "when it stops matching you cannot tell whether the
+        # site changed or the input did." A failure names the rendered form.
+        ordered = self._rungs([self._render_locator(spec) for spec in locators])
         deadline = time.monotonic() + self.step_timeout
+        #: The best rung that matched exactly one element nobody can see yet.
+        held: tuple[Any, int, str] | None = None
 
         while True:
+            held = None
             for rung, spec in ordered:
                 locator = self._build(spec)
                 if locator is None:
                     continue
+
+                narrowed = self._visible_only(locator)
                 try:
-                    count = await locator.count()
+                    count = await (narrowed or locator).count()
                 except Exception:  # noqa: BLE001 - mid-navigation; try again
                     continue
+
                 # `extract_rows` passes single=False, because matching many is
                 # the whole point there.
                 if count == 1 or (count > 1 and not single):
                     if rung > 0:
                         self._note_drift(step_id, rung)
-                    return locator, rung, spec.describe()
+                    return (narrowed or locator), rung, spec.describe()
                 if count > 1:
                     # Kept for the failure message. A step that dies saying
                     # "no element matched" when three of them did sends
                     # somebody looking for the wrong problem entirely.
                     self._ambiguous[spec.describe()] = count
+                    continue
+
+                if narrowed is None or held is not None:
+                    continue
+                # Nothing visible matched. If the DOM holds exactly one, keep
+                # it as the answer of last resort and carry on looking.
+                try:
+                    if await locator.count() == 1:
+                        held = (locator, rung, spec.describe())
+                except Exception:  # noqa: BLE001 - mid-navigation; try again
+                    continue
 
             if time.monotonic() >= deadline:
+                if held is not None:
+                    if held[1] > 0:
+                        self._note_drift(step_id, held[1])
+                    return held
                 return None
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -1058,49 +1164,20 @@ class UseCaseExecutor:
             if named and not spec.exact and spec.strategy in NAMED_STRATEGIES:
                 expanded.append((index, spec.model_copy(update={"exact": True})))
             expanded.append((index, spec))
-        return [
-            *[pair for pair in expanded if pair[1].semantic],
-            *[pair for pair in expanded if not pair[1].semantic],
-        ]
+        # Semantic before markup, and within each of those, scoped before
+        # unscoped. A rung that says *where* to look was the recording being
+        # more specific, and specificity is what turns an ambiguous page into
+        # a resolvable one -- so trying it first is the point of recording it.
+        # A stable sort, so rungs that tie stay in the order the ladder lists.
+        return sorted(expanded, key=lambda pair: (not pair[1].semantic, not pair[1].scoped))
 
     def _build(self, spec: Locator):
-        """One rung as a Playwright locator.
+        """One rung as a Playwright locator, against the page this run is on."""
+        return build_locator(self.browser.page, spec)
 
-        One call each, deliberately: the recorder wrote what it saw, and this
-        performs it rather than reinterpreting it.
-        """
-        page = self.browser.page
-        try:
-            # `exact` decides whether the recorded name has to be the whole
-            # accessible name or merely part of it, and Playwright's default is
-            # the loose one. Every strategy that matches by name takes it;
-            # `get_by_test_id` matches an attribute and has no such parameter.
-            if spec.strategy == "role":
-                base = page.get_by_role(
-                    spec.role or "", name=spec.name or None, exact=spec.exact
-                )
-            elif spec.strategy == "label":
-                base = page.get_by_label(spec.text or "", exact=spec.exact)
-            elif spec.strategy == "placeholder":
-                base = page.get_by_placeholder(spec.text or "", exact=spec.exact)
-            elif spec.strategy == "test_id":
-                base = page.get_by_test_id(spec.text or "")
-            elif spec.strategy == "alt_text":
-                base = page.get_by_alt_text(spec.text or "", exact=spec.exact)
-            elif spec.strategy == "text":
-                base = page.get_by_text(spec.text or "", exact=spec.exact)
-            elif spec.strategy == "css":
-                base = page.locator(spec.selector or "")
-            elif spec.strategy == "nth":
-                return None
-            else:  # pragma: no cover - the schema constrains `strategy`
-                return None
-        except Exception:  # noqa: BLE001 - a malformed selector is a dead rung
-            return None
-        if spec.nth < 0:
-            # How ``.last`` is held; see the locator chain reader in codegen.py.
-            return base.last
-        return base.nth(spec.nth) if spec.nth else base
+    @staticmethod
+    def _visible_only(locator):
+        return visible_only(locator)
 
     def _note_drift(self, step_id: str, rung: int) -> None:
         """Record that the preferred locator no longer matched.
@@ -1124,7 +1201,10 @@ class UseCaseExecutor:
                 "was meant, and clicking whichever comes first is how a batch acts on the "
                 "wrong element. Re-record this step, or repair it to pick the right control."
             )
-        tried = "; ".join(loc.describe() for loc in step.locators) or "(no locators recorded)"
+        tried = (
+            "; ".join(self._render_locator(loc).describe() for loc in step.locators)
+            or "(no locators recorded)"
+        )
         available = ""
         if self._last_snapshot is not None:
             roles = self._last_snapshot.roles()
@@ -1260,9 +1340,11 @@ class UseCaseExecutor:
             status = "healed"
 
         shot = self._last_shot
+        shot_bytes = self._last_shot_bytes
         self._last_shot = None
+        self._last_shot_bytes = None
         baseline = self.baselines.get(step.id)
-        diff = await self._compare(baseline, shot)
+        diff = await self._compare(baseline, shot, shot_bytes)
 
         await self._record(
             run_id=self.run_id,
@@ -1284,16 +1366,50 @@ class UseCaseExecutor:
             pixel_diff=diff,
         )
 
-    async def _compare(self, baseline: str | None, shot: str | None) -> float | None:
-        """How much this step's page differs from the last time it worked."""
-        if not baseline or not shot or self.read_artifact is None:
+    async def _compare(
+        self, baseline: str | None, shot: str | None, shot_bytes: bytes | None = None
+    ) -> float | None:
+        """How much this step's page differs from the last time it worked.
+
+        Neither image is fetched if it does not have to be. The *after* side is
+        the screenshot this step just took and still holds, and the *before*
+        side is the same object on every row of a batch, so it is read once and
+        kept. Both used to be read back from storage on every step, which on a
+        remote object store is two round trips per step to learn something
+        about bytes that were already in memory.
+        """
+        if not baseline or not shot:
             return None
-        try:
-            before = await self.read_artifact(baseline)
-            after = await self.read_artifact(shot)
-        except Exception:  # noqa: BLE001 - a diff must never fail a row
+        after = shot_bytes
+        if after is None:
+            if self.read_artifact is None:
+                return None
+            try:
+                after = await self.read_artifact(shot)
+            except Exception:  # noqa: BLE001 - a diff must never fail a row
+                return None
+        before = await self._baseline_bytes(baseline)
+        if before is None or after is None:
             return None
         return imagediff.ratio(before, after)
+
+    async def _baseline_bytes(self, artifact_id: str) -> bytes | None:
+        """The baseline image, fetched at most once per run.
+
+        A failed read is cached too, as ``None``: a baseline that cannot be
+        read will not become readable on row 700, and retrying it every row is
+        a round trip spent to fail again.
+        """
+        if artifact_id in self._baseline_cache:
+            return self._baseline_cache[artifact_id]
+        data: bytes | None = None
+        if self.read_artifact is not None:
+            try:
+                data = await self.read_artifact(artifact_id)
+            except Exception:  # noqa: BLE001 - a diff must never fail a row
+                data = None
+        self._baseline_cache[artifact_id] = data
+        return data
 
     # -- browser plumbing ---------------------------------------------------
     async def _refresh_snapshot(self) -> None:
@@ -1306,6 +1422,33 @@ class UseCaseExecutor:
         self._last_page_url = self._last_snapshot.page_url or self.browser.url
         self._last_snapshot_text = await self.browser.text_content()
 
+    async def _after_action(self) -> None:
+        """Let the page finish what the action started, then look at it.
+
+        Three things in one place because they are one thing: an action can
+        leave the browser somewhere other than where it found it, and every
+        observation between here and the next action is wrong until that has
+        resolved.
+
+        The order is forced. Settle first, because a page mid-navigation
+        reports neither its old state nor its new one. Adopt second, because a
+        click that opened a tab means the page worth reading is not the page
+        the click happened on. Snapshot last, because it is the thing the other
+        two exist to make truthful.
+        """
+        await self.browser.settle()
+        opened = await self.browser.adopt_new_page()
+        if opened:
+            # Worth an event: a run that silently changed which page it was
+            # driving is the hardest kind of failure to read afterwards.
+            await self._emit_error(
+                "tab_opened",
+                f"the site opened a new tab and the run followed it to {opened}",
+                recoverable=True,
+            )
+            await self.browser.settle()
+        await self._refresh_snapshot()
+
     async def _record_failure_context(self, step_id: str, message: str) -> None:
         """Persist the page as it was when a step failed.
 
@@ -1313,7 +1456,15 @@ class UseCaseExecutor:
         and the snapshots taken while resolving locators are internal -- they
         never reach the event log. Recording one here means a repair can be
         proposed from history alone, with no second browser session.
+
+        Settled first, and that is the whole reason :meth:`settle` exists. This
+        snapshot is not a diagnostic nicety: it is what a repair is proposed
+        from and what goes into healing memory to be recalled the next time
+        something breaks on this site. Capturing a page mid-navigation writes
+        something false into that memory, and a false memory is recalled
+        forever.
         """
+        await self.browser.settle()
         await self._refresh_snapshot()
         # The page as text, not as a rendering of the parsed nodes: a repair
         # parses this again, and anything but the original shape gives it
@@ -1372,6 +1523,7 @@ class UseCaseExecutor:
             return None
         artifact_id, url = saved
         self._last_shot = artifact_id
+        self._last_shot_bytes = data
         await self.sink.emit(
             Screenshot(
                 run_id=self.run_id,
@@ -1386,6 +1538,14 @@ class UseCaseExecutor:
         return artifact_id
 
     # -- values -------------------------------------------------------------
+    def _render_locator(self, spec: Locator) -> Locator:
+        """One rung with ``{{input.x}}`` made real for the row in hand.
+
+        Returns the rung unchanged when it holds no template, which is every
+        rung of every recording made before a locator could carry one.
+        """
+        return spec.render(lambda value: self._render(value, self._row_values))
+
     def _render(self, value: str, inputs: dict[str, Any]) -> str:
         try:
             return render_template(
@@ -1441,6 +1601,227 @@ _DOCUMENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
 }
+
+
+# ---------------------------------------------------------------------------
+# Composing a locator
+# ---------------------------------------------------------------------------
+#
+# Module-level rather than methods, and that is not tidying. The review UI
+# offers a "check this locator against a page" button, and a check that
+# resolved locators through *different* code than the executor would be
+# answering a different question -- confidently, in a screen whose entire
+# purpose is to tell somebody whether their edit will work.
+
+
+def build_locator(page: Any, spec: Locator):
+    """``spec`` as a Playwright locator on ``page``, or ``None``.
+
+    One call each, deliberately: the recorder wrote what it saw, and this
+    performs it rather than reinterpreting it. What composition there is -- a
+    frame chain, a scope, a text filter -- performs the *same* calls Playwright
+    would, in the order ``playwright codegen`` writes them, so a recorded chain
+    and the chain rebuilt here are the same locator.
+    """
+    try:
+        root = _frame_root(page, spec.frames)
+        if root is None:
+            return None
+        return _compose(root, spec)
+    except Exception:  # noqa: BLE001 - a malformed selector is a dead rung
+        return None
+
+
+def _frame_root(page: Any, frames: list[str]):
+    """The page, or the innermost frame of a chain of iframes.
+
+    An element inside an iframe is not merely harder to find from the page: it
+    is not there at all. Every rung of a locator that names frames is resolved
+    against the frame, which is why this is the first thing
+    :func:`build_locator` does rather than a special case inside each strategy.
+    """
+    root = page
+    for selector in frames:
+        if not selector:
+            return None
+        root = root.frame_locator(selector)
+    return root
+
+
+def _compose(root: Any, spec: Locator):
+    """``spec`` as a locator under ``root``, scope first.
+
+    Recursive because ``within`` is: the button inside the cell inside the row
+    is three calls, and each one is the same call Playwright would have been
+    given directly.
+    """
+    parent = root
+    if spec.within is not None:
+        parent = _compose(root, spec.within)
+        if parent is None:
+            return None
+
+    # `exact` decides whether the recorded name has to be the whole accessible
+    # name or merely part of it, and Playwright's default is the loose one.
+    # Every strategy that matches by name takes it; `get_by_test_id` matches an
+    # attribute and has no such parameter.
+    if spec.strategy == "role":
+        base = parent.get_by_role(spec.role or "", name=spec.name or None, exact=spec.exact)
+    elif spec.strategy == "label":
+        base = parent.get_by_label(spec.text or "", exact=spec.exact)
+    elif spec.strategy == "placeholder":
+        base = parent.get_by_placeholder(spec.text or "", exact=spec.exact)
+    elif spec.strategy == "test_id":
+        base = parent.get_by_test_id(spec.text or "")
+    elif spec.strategy == "alt_text":
+        base = parent.get_by_alt_text(spec.text or "", exact=spec.exact)
+    elif spec.strategy == "text":
+        base = parent.get_by_text(spec.text or "", exact=spec.exact)
+    elif spec.strategy == "css":
+        base = parent.locator(spec.selector or "")
+    elif spec.strategy == "nth":
+        return None
+    else:  # pragma: no cover - the schema constrains `strategy`
+        return None
+
+    # Filter before indexing. `nth` counts among the matches that survive the
+    # filter, which is what "the second row mentioning Acme" means and is the
+    # order codegen writes the two calls in.
+    if spec.has_text:
+        base = base.filter(has_text=spec.has_text)
+    if spec.nth < 0:
+        # How ``.last`` is held; see the locator chain reader in codegen.py.
+        return base.last
+    return base.nth(spec.nth) if spec.nth else base
+
+
+def visible_only(locator):
+    """``locator`` narrowed to what a person could actually see, or None.
+
+    ``locator.count()`` reports every match in the DOM, visible or not, so one
+    visible control plus one hidden duplicate counts as two and the step is
+    refused as ambiguous on a page a person would call unambiguous.
+
+    **Which rungs this affects is not the obvious answer.** ``get_by_role``
+    resolves against the accessibility tree, and a ``display:none`` element is
+    not in it, so a role rung never saw the duplicate. ``text`` and ``css``
+    rungs match against the DOM, and do. Those are the *fallback* rungs --
+    ``codegen._ladder`` puts a text rung under every named role rung -- so a
+    hidden duplicate costs nothing until the day the role rung stops matching.
+    Then the ladder falls through, and the step fails as ambiguous because of
+    an element nobody can see, on the one occasion the fallback existed for.
+
+    It is not a visibility check in general. Playwright counts an element with
+    a box as visible even when it is off-screen or covered, so an overlay still
+    has to be handled by the step that opens it.
+
+    Returns ``None`` when the installed Playwright predates
+    ``filter(visible=)``, which is inside the supported range: the caller then
+    behaves exactly as it did before this existed.
+    """
+    try:
+        return locator.filter(visible=True)
+    except TypeError:  # Playwright < 1.51
+        return None
+    except Exception:  # noqa: BLE001 - mid-navigation; the caller retries
+        return None
+
+
+async def probe_locators(
+    locators: list[Locator], *, url: str, settings: Any, timeout_ms: int = 10_000
+) -> dict[str, Any]:
+    """Open ``url`` and say what each rung matches, right now.
+
+    The answer a person editing a locator needs, and could not get before: a
+    rung that reads perfectly well matches nothing, or matches four things, and
+    until now the only way to find that out was to run the use case -- where an
+    ambiguous rung shows up as a thirty-second timeout on row one of a batch.
+
+    Both counts are reported. Total is what is in the DOM, visible is what a
+    person could reach, and the gap between them is worth showing rather than
+    hiding: "matches 2, one of them visible" tells somebody their page has a
+    hidden duplicate, which is a thing they may want to know about their site
+    as much as about their locator.
+
+    Read-only. It navigates and counts; it never clicks, fills or submits.
+    """
+    config = BrowserConfig.from_settings(settings, headless=True)
+    config.timeout_ms = timeout_ms
+
+    results: list[dict[str, Any]] = []
+    async with PlaywrightSession(config) as browser:
+        await browser.page.goto(url, timeout=timeout_ms)
+        await browser.settle(timeout_ms)
+
+        for spec in locators:
+            results.append(await _probe_one(browser.page, spec))
+
+        return {
+            "page_url": browser.url,
+            "page_title": await browser.title(),
+            "results": results,
+        }
+
+
+async def _probe_one(page: Any, spec: Locator) -> dict[str, Any]:
+    """One rung's verdict: how many it matches, and what they are."""
+    entry: dict[str, Any] = {
+        "describe": spec.describe(),
+        "total": 0,
+        "visible": 0,
+        "matches": [],
+        "ok": False,
+        "reason": "",
+    }
+
+    locator = build_locator(page, spec)
+    if locator is None:
+        entry["reason"] = (
+            "this rung cannot be turned into a Playwright call -- a 'nth' rung has no "
+            "meaning on its own, and a blank frame selector has nowhere to go"
+        )
+        return entry
+
+    try:
+        entry["total"] = await locator.count()
+        narrowed = visible_only(locator)
+        entry["visible"] = await narrowed.count() if narrowed is not None else entry["total"]
+    except Exception as exc:  # noqa: BLE001 - a bad selector is an answer
+        entry["reason"] = _reason(exc)
+        return entry
+
+    # Named so a person can tell whether the thing found is the thing meant.
+    # A count alone says "1 match" for the wrong element just as happily.
+    countable = (visible_only(locator) or locator) if entry["visible"] else locator
+    for index in range(min(entry["visible"] or entry["total"], PROBE_SAMPLES)):
+        try:
+            one = countable.nth(index)
+            role = await one.get_attribute("role") or ""
+            text = ((await one.inner_text()) or "").strip()
+        except Exception:  # noqa: BLE001 - it was counted, it may still go
+            continue
+        label = " ".join(text.split())[:120]
+        entry["matches"].append(f"{role} {label}".strip() or "(no text)")
+
+    counted = entry["visible"] if visible_only(locator) is not None else entry["total"]
+    if counted == 1:
+        entry["ok"] = True
+    elif counted == 0 and entry["total"]:
+        entry["reason"] = (
+            f"matches {entry['total']} element(s) in the page, none of them visible. A "
+            "step would wait for one to appear and then fail. This is usually a control "
+            "that only exists once a dialog or a tab is opened."
+        )
+    elif counted == 0:
+        entry["reason"] = "matches nothing on this page"
+    else:
+        entry["reason"] = (
+            f"matches {counted} elements, so a step using it is refused as ambiguous "
+            "rather than acting on whichever one comes first. Say which by scoping it "
+            "to the row or dialog it sits in, or by filtering on text."
+        )
+    return entry
+
 
 
 def _mime_for(filename: str) -> str:

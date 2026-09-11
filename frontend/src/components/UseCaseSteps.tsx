@@ -1,24 +1,10 @@
 import { useState } from 'react';
-import type { Locator, UseCaseStep } from '../lib/events';
+import type { Locator, LocatorCheckReport, UseCaseStep } from '../lib/events';
+import { LocatorEditor, describeLocator, isBrittle } from './LocatorEditor';
 
-/** How a locator reads in the review UI. */
-export function describeLocator(locator: Locator): string {
-  switch (locator.strategy) {
-    case 'role':
-      return locator.name ? `role=${locator.role} "${locator.name}"` : `role=${locator.role}`;
-    case 'css':
-      return `css ${locator.selector}`;
-    case 'text':
-      return `text "${locator.text}"`;
-    default:
-      return `nth ${locator.nth ?? 0}`;
-  }
-}
-
-/** The rungs that break on cosmetic change. Worth flagging before a batch runs. */
-function isBrittle(locator: Locator): boolean {
-  return locator.strategy === 'text' || locator.strategy === 'nth';
-}
+// `describeLocator` used to live here and now lives beside the editor, so the
+// list and the thing that edits it cannot disagree about what a rung says.
+export { describeLocator };
 
 function summarise(step: UseCaseStep): string {
   if (step.description) return step.description;
@@ -46,6 +32,18 @@ interface Props {
   /** Saves a single step field (a wrong recorded URL, a typo'd typed value)
    * as a new draft version. Absent means read-only, same as today. */
   onEditField?: (stepId: string, field: 'url' | 'value', value: string) => void;
+  /** Saves a rewritten locator ladder as a new draft version.
+   *
+   * A recorded ladder is what codegen happened to write, and a healed one is
+   * what a model picked off a page. Both are usually right and neither is
+   * always right — and before this the only remedy for one wrong rung was
+   * re-recording the whole workflow. */
+  onEditLocators?: (stepId: string, locators: Locator[]) => void;
+  /** Opens a page and reports what each rung matches. Absent hides the check,
+   * which is what a deployment with no browser should show. */
+  onCheckLocators?: (locators: Locator[], url: string) => Promise<LocatorCheckReport>;
+  /** Where the step under review runs, so the check has somewhere to open. */
+  pageUrlFor?: (stepId: string) => string;
 }
 
 /**
@@ -53,12 +51,24 @@ interface Props {
  * which rung a step relies on is the single best predictor of whether it will
  * still work next month.
  */
-export function UseCaseSteps({ title, hint, steps, onRemove, onEditField }: Props) {
+export function UseCaseSteps({
+  title,
+  hint,
+  steps,
+  onRemove,
+  onEditField,
+  onEditLocators,
+  onCheckLocators,
+  pageUrlFor,
+}: Props) {
   // Which step is mid-edit, and the draft text for it. One at a time: a step
   // list is reviewed top to bottom, and editing two at once just makes it
   // easy to lose track of which unsaved change belongs to which step.
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
+  // Which step's ladder is open. Separate from `editing` above because the
+  // two edit different things and a step can want either.
+  const [editingLocators, setEditingLocators] = useState<string | null>(null);
 
   const startEdit = (step: UseCaseStep) => {
     const field = editableField(step);
@@ -199,19 +209,68 @@ export function UseCaseSteps({ title, hint, steps, onRemove, onEditField }: Prop
                 </div>
               )}
 
-              {step.locators.length > 0 && (
+              {editingLocators === step.id && onEditLocators ? (
+                <LocatorEditor
+                  stepId={step.id}
+                  locators={step.locators}
+                  defaultUrl={pageUrlFor?.(step.id) ?? ''}
+                  onCheck={
+                    onCheckLocators ??
+                    (async () => ({ page_url: '', page_title: '', results: [] }))
+                  }
+                  onSave={(locators) => {
+                    onEditLocators(step.id, locators);
+                    setEditingLocators(null);
+                  }}
+                  onCancel={() => setEditingLocators(null)}
+                />
+              ) : (
+                step.locators.length > 0 && (
+                  <div className="step-detail">
+                    <span className="label">finds it by</span>
+                    <span>
+                      {step.locators.map((locator, index) => (
+                        <code
+                          key={index}
+                          className={isBrittle(locator) ? 'locator brittle' : 'locator'}
+                          title={
+                            index === 0
+                              ? 'Tried first'
+                              : `Fallback ${index}: used only if the ones above stop matching`
+                          }
+                        >
+                          {describeLocator(locator)}
+                        </code>
+                      ))}
+                    </span>
+                    {onEditLocators && (
+                      <button
+                        type="button"
+                        className="link"
+                        onClick={() => setEditingLocators(step.id)}
+                        title="Change how this step finds the element, and check it against a real page before saving"
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </div>
+                )
+              )}
+
+              {/* What the recording said and the draft took out. Shown because a
+                  reviewer deciding whether that was the right call needs to see
+                  it -- a locator made of row one's data reads perfectly well,
+                  and "role=option" on its own does not explain itself. Never
+                  executed: these are not fallbacks. */}
+              {(step.rejected_locators ?? []).length > 0 && (
                 <div className="step-detail">
-                  <span className="label">finds it by</span>
+                  <span className="label">not used</span>
                   <span>
-                    {step.locators.map((locator, index) => (
+                    {step.rejected_locators.map((locator, index) => (
                       <code
                         key={index}
-                        className={isBrittle(locator) ? 'locator brittle' : 'locator'}
-                        title={
-                          index === 0
-                            ? 'Tried first'
-                            : `Fallback ${index}: used only if the ones above stop matching`
-                        }
+                        className="locator rejected"
+                        title="Recorded, then taken out of this step. It is never tried."
                       >
                         {describeLocator(locator)}
                       </code>

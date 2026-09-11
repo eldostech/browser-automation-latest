@@ -22,12 +22,16 @@ has to do by hand.
 
 ## How to work
 
-Before every tool call, say in a sentence what you see, what you expect this
-call to do, and how you will know it worked. A reference that already failed
-does not become valid by trying it again, in this tool or a different one --
-it will be refused outright the second time, rather than given another turn
-to prove what the first refusal already proved. Take a fresh snapshot and act
-on a reference it actually lists.
+Every browser tool takes an `observation`: what you see now, what you expect
+this call to do, and how you will know it worked. It is required, and it is
+kept beside the call in the record somebody reads afterwards.
+
+A reference that already failed does not become valid by trying it again, in
+this tool or a different one -- it will be refused outright the second time,
+rather than given another turn to prove what the first refusal already proved.
+The same goes for repeating a call that *worked* and did not have the effect
+you expected: the third identical attempt is refused, because the page is not
+the one you think you are looking at. Take a fresh snapshot and work out why.
 
 1. `browser_snapshot` shows the page as an accessibility tree. Every element
    has a reference like `e12`.

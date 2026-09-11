@@ -30,7 +30,7 @@ from deps import (
 )
 from credentials import Vault
 from routers.schemas import BatchRequestBody, ExecuteRequest
-from runner import BatchRequest, ExecutionRequest, ReplayManager
+from runner import BatchNotPossible, BatchRequest, ExecutionRequest, ReplayManager
 from services import (
     load_runnable_usecase,
     require_missing_nothing,
@@ -237,6 +237,11 @@ async def start_batch(
                 owner_email=principal.email,
             )
         )
+    except BatchNotPossible as exc:
+        # 422 rather than 409: nothing is busy and nothing conflicts -- the
+        # use case as written cannot do what was asked, and the message says
+        # how to change it.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except TargetMissing as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -362,6 +367,11 @@ async def resume_batch(
                 owner_email=principal.email,
             )
         )
+    except BatchNotPossible as exc:
+        # 422 rather than 409: nothing is busy and nothing conflicts -- the
+        # use case as written cannot do what was asked, and the message says
+        # how to change it.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except TargetMissing as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

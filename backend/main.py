@@ -35,8 +35,11 @@ from store import Store
 log = logging.getLogger(__name__)
 
 
-async def _fetch_event_for_bus(app: FastAPI, run_id: str, seq: int):
-    """Read one event by ``(run_id, seq)`` for the cross-process bus.
+async def _fetch_events_for_bus(app: FastAPI, run_id: str, after_seq: int, limit: int):
+    """Read a range of events for the cross-process bus.
+
+    A range rather than one event, because a notification now describes the
+    batch a flush wrote rather than a single append -- see ``bus.publish_many``.
 
     The bus is handed this rather than a Store because it must not care which
     workspace a run belongs to: it is delivering to a subscriber who has
@@ -45,9 +48,10 @@ async def _fetch_event_for_bus(app: FastAPI, run_id: str, seq: int):
     store: Store = app.state.store
     workspace_id = await store.default_workspace_id()
     if workspace_id is None:
-        return None
-    events = await store.workspace(workspace_id).get_events(run_id, after_seq=seq - 1, limit=1)
-    return events[0] if events else None
+        return []
+    return await store.workspace(workspace_id).get_events(
+        run_id, after_seq=after_seq, limit=limit
+    )
 
 
 @asynccontextmanager
@@ -114,7 +118,9 @@ async def lifespan(app: FastAPI):
 
     app.state.bus = build_bus(
         settings,
-        lambda run_id, seq: _fetch_event_for_bus(app, run_id, seq),
+        lambda run_id, after_seq, limit: _fetch_events_for_bus(
+            app, run_id, after_seq, limit
+        ),
     )
     await app.state.bus.start()
 

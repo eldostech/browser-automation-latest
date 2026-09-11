@@ -487,6 +487,12 @@ def _root_name(node: ast.expr) -> str | None:
 #: an attribute rather than a call.
 _POSITIONS = frozenset({"first", "last"})
 
+#: Everything in a locator chain that is a property rather than a call, so the
+#: reader knows to keep walking through it. ``content_frame`` is here because
+#: newer codegen writes ``page.locator("#pay").content_frame.get_by_role(...)``
+#: where older codegen wrote ``page.frame_locator("#pay").get_by_role(...)``.
+_PROPERTIES = _POSITIONS | {"content_frame"}
+
 
 def _label_of(locators: list[Locator]) -> str:
     """What the person saw on the control they just used, if anything did.
@@ -506,24 +512,41 @@ def _label_of(locators: list[Locator]) -> str:
 def _locator_chain(node: ast.expr) -> list[Locator] | None:
     """The ladder for ``page.get_by_role(...).first``, ``.nth(1)`` and friends.
 
-    Returns ``None`` when the chain contains something that cannot be recorded
-    -- a frame, a filter, or one locator scoped inside another. Those are not
-    failures of the recording; they are shapes this schema has no rung for, and
-    inventing an approximation would produce a use case that clicks something
-    else on row one.
+    Reads the whole chain codegen writes, including the three shapes it used
+    to refuse:
+
+    ``page.get_by_role("dialog").get_by_role("button", name="Invite")``
+        A locator scoped inside another. Recorded as ``within``. This is the
+        shape codegen produces *precisely when the page is ambiguous*, so
+        dropping it discarded the recording's answer to the only question the
+        executor could not work out for itself, and left the step to be
+        refused as ambiguous at replay time instead.
+
+    ``page.get_by_role("row").filter(has_text="Acme")``
+        Recorded as ``has_text``. How a row is picked out of a table.
+
+    ``page.frame_locator("#pay").get_by_role("textbox", name="Card")``
+        Recorded as ``frames``. Also written by newer codegen as
+        ``page.locator("#pay").content_frame.get_by_role(...)``, and both
+        spellings mean the same hop.
+
+    Still returns ``None`` for anything else, and that is still the right
+    answer: an unrecognised shape becomes an ``Unsupported`` line a person
+    reads, never a guess about an element nobody here has seen.
     """
-    # ``.first`` and ``.last`` are properties, not calls, so they arrive as an
-    # ast.Attribute wrapping the chain rather than as another ast.Call. Walking
-    # only calls made the whole chain unreadable, and codegen writes ``.first``
-    # whenever a locator matched more than one element -- which is most of the
-    # time on a real page. Every step addressed that way was being dropped.
+    # ``.first``, ``.last`` and ``.content_frame`` are properties, not calls,
+    # so they arrive as an ast.Attribute wrapping the chain rather than as
+    # another ast.Call. Walking only calls made the whole chain unreadable, and
+    # codegen writes ``.first`` whenever a locator matched more than one
+    # element -- which is most of the time on a real page. Every step addressed
+    # that way was being dropped.
     steps: list[tuple[str, ast.Call | None]] = []
     current = node
     while True:
         if isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
             steps.append((current.func.attr, current))
             current = current.func.value
-        elif isinstance(current, ast.Attribute) and current.attr in _POSITIONS:
+        elif isinstance(current, ast.Attribute) and current.attr in _PROPERTIES:
             steps.append((current.attr, None))
             current = current.value
         else:
@@ -533,46 +556,89 @@ def _locator_chain(node: ast.expr) -> list[Locator] | None:
         return None
 
     steps.reverse()
+    #: The locator built so far. A later ``get_by_*`` scopes itself inside it.
     locator: Locator | None = None
-    nth = 0
+    #: iframes crossed, outermost first. Only ever collected before the first
+    #: rung: everything after a frame hop is inside that frame.
+    frames: list[str] = []
+
+    def scoped(made: Locator | None) -> Locator | None:
+        if made is None:
+            return None
+        made.within = locator
+        return made
 
     for name, call in steps:
         if name in _GET_BY:
             assert call is not None
-            if locator is not None:
-                # A second get_by_* means one locator scoped inside another.
-                return None
-            locator = _locator_from(name, call)
+            locator = scoped(_locator_from(name, call))
             if locator is None:
                 return None
         elif name == "locator":
-            if locator is not None or call is None:
+            if call is None:
                 return None
             selector = _string_arg(call, 0)
             if selector is None:
                 return None
-            locator = Locator(strategy="css", selector=selector)
+            locator = scoped(Locator(strategy="css", selector=selector))
+        elif name == "frame_locator":
+            if call is None or locator is not None:
+                return None
+            selector = _string_arg(call, 0)
+            if selector is None:
+                return None
+            frames.append(selector)
+        elif name == "content_frame":
+            # The newer spelling: the frame element is found as a locator and
+            # then stepped into. Only a plain, unindexed CSS rung converts --
+            # anything else would mean guessing which of several frames the
+            # recording meant.
+            if locator is None or locator.strategy != "css" or locator.within is not None:
+                return None
+            if locator.nth or locator.has_text:
+                return None
+            frames.append(locator.selector or "")
+            locator = None
+        elif name == "filter":
+            if call is None or locator is None:
+                return None
+            has_text = _keyword_string(call, "has_text")
+            if not has_text:
+                # `has=`, `has_not=` and friends take a locator, not a string.
+                # Those are a shape this schema has no rung for.
+                return None
+            locator.has_text = has_text
         elif name == "nth":
-            if call is None:
+            if call is None or locator is None:
                 return None
             index = _int_arg(call, 0)
             if index is None:
                 return None
-            nth = index
+            locator.nth = index
         elif name == "first":
-            nth = 0
+            if locator is None:
+                return None
+            locator.nth = 0
         elif name == "last":
             # Held as -1 and performed as Playwright's own ``.last``, so it
             # stays "whichever is last when this runs" rather than becoming a
             # fixed index guessed from the recording -- which is how a batch
             # ends up clicking the wrong row.
-            nth = -1
+            if locator is None:
+                return None
+            locator.nth = -1
         else:
             return None
 
     if locator is None:
         return None
-    locator.nth = nth
+    try:
+        locator.frames = frames
+        # Depth bounds live on the model, so a chain deeper than the schema
+        # allows becomes an Unsupported line rather than an exception here.
+        locator = Locator.model_validate(locator.model_dump())
+    except Exception:  # noqa: BLE001 - too deep, or a frame in the wrong place
+        return None
     return _ladder(locator)
 
 
@@ -611,9 +677,21 @@ def _ladder(primary: Locator) -> list[Locator]:
     if primary.strategy == "role" and primary.name:
         # Carrying `exact` down to the fallback matters as much as it does on
         # the rung above: a loose text rung under an exact role rung would
-        # find the very control the exact one exists to avoid.
+        # find the very control the exact one exists to avoid. The scope and
+        # the frame come down for the same reason and more strongly: a text
+        # rung that searched the whole page would look outside the dialog the
+        # rung above it exists to stay inside, and one that searched the main
+        # document could not reach an element in a frame at all.
         ladder.append(
-            Locator(strategy="text", text=primary.name, nth=primary.nth, exact=primary.exact)
+            Locator(
+                strategy="text",
+                text=primary.name,
+                nth=primary.nth,
+                exact=primary.exact,
+                within=primary.within,
+                has_text=primary.has_text,
+                frames=list(primary.frames),
+            )
         )
     return ladder
 

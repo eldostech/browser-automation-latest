@@ -35,7 +35,7 @@ from snapshot import (
     Node,
     Snapshot,
     count_matches,
-    index_among,
+    locator_for,
     parse as parse_snapshot,
 )
 from usecase import Assertion, Locator, UseCase
@@ -572,37 +572,35 @@ def apply_fixes(
                 continue
             node = options[index]
             group_size = count_matches(counted_against, node, False)
-            position = index_among(counted_against, node, False) if group_size > 1 else 0
-            if group_size > 1 and position == 0:
-                # `nth=0` is how the schema spells "no position given" --
-                # deliberately, so the executor's resolver keeps refusing an
-                # ambiguous rung with no explicit nth rather than silently
-                # acting on whichever element loads first. That means the
-                # element that IS the first of the group cannot record its
-                # own position, so applying this fix as written would look
-                # like progress in the diff and still fail at replay for the
-                # identical reason. Refuse it rather than propose something
-                # that cannot work.
+            # `locator_for` narrows an ambiguous element by *where it sits*
+            # before it resorts to counting, so the commonest shape of this
+            # refusal is gone: the first "Chat" button of three cards is now
+            # "the Chat button on the Alpha Project card" rather than an
+            # element with no spelling. What is left is the case where nothing
+            # around it has a name either, and that is still refused.
+            healed = locator_for(counted_against, node)
+            if healed is None:
                 applied.append(
                     f"SKIPPED {step_id}: {node.role} {node.name!r} matches {group_size} "
-                    "elements and this is the first of them, which a locator cannot name "
-                    "specifically (only the 2nd match onward can be pinned by position). "
-                    "Point at a different one of the matches, or re-record this step "
-                    "against something that names the element itself."
+                    "elements, this is the first of them, and nothing around it is named "
+                    "either -- so no locator can single it out (only the 2nd match onward "
+                    "can be pinned by position). Point at a different one of the matches, "
+                    "or re-record this step against something that names the element."
                 )
                 continue
-            healed = Locator(
-                strategy="role",
-                role=node.role,
-                name=node.name or None,
-                nth=position,
-            )
-            if group_size > 1:
+            if group_size > 1 and healed.within is not None:
                 applied.append(
                     f"{step_id}: {node.role} {node.name!r} matches {group_size} elements on "
-                    f"the page the doctor saw; pinned to position {healed.nth} of them. "
-                    "Positional, not a name -- if this list can reorder between runs, treat "
-                    "this as a stopgap and re-record the step properly."
+                    f"the page the doctor saw; narrowed to the one in "
+                    f"{healed.within.describe()}."
+                )
+            elif group_size > 1:
+                applied.append(
+                    f"{step_id}: {node.role} {node.name!r} matches {group_size} elements on "
+                    f"the page the doctor saw, and nothing on the page tells them apart; "
+                    f"pinned to position {healed.nth} of them. Positional, not a name -- if "
+                    "this list can reorder between runs, treat this as a stopgap and "
+                    "re-record the step properly."
                 )
 
             def ladder_for(holder: dict[str, Any]) -> list[dict[str, Any]]:

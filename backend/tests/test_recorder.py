@@ -321,12 +321,21 @@ def test_a_saved_recording_is_a_draft():
 
 
 def test_dropped_lines_are_carried_into_the_use_case():
-    with_frame = RECORDED.replace(
+    """A shape the parser cannot represent becomes a line a person reads.
+
+    The example here used to be an iframe, which is recordable now. It is a
+    `filter(has=...)` instead -- that takes a locator rather than a string, and
+    the schema has no rung for it. The point of the test is unchanged: what
+    cannot be represented is *reported*, never approximated, because an
+    approximation is a step that clicks something adjacent on row one.
+    """
+    unrepresentable = RECORDED.replace(
         '    await page.get_by_placeholder("Order reference").fill("A-1024")\n',
-        '    await page.frame_locator("#f").get_by_label("Reference").fill("A-1024")\n',
+        '    await page.get_by_role("row").filter(has=page.get_by_text("A-1024"))'
+        '.get_by_role("textbox").fill("A-1024")\n',
     )
     use_case = build_usecase(
-        parse(with_frame), name="x", description="", declared=declared(("a", "nitin", False))
+        parse(unrepresentable), name="x", description="", declared=declared(("a", "nitin", False))
     )
     assert use_case.dropped
     assert any("could not be represented" in w for w in use_case.warnings)
@@ -496,3 +505,106 @@ def test_a_third_party_host_is_left_alone():
     navigations = [s.url for s in use_case.all_steps if s.action == "navigate"]
     assert navigations == ["{{env.base_url}}/login", "https://sso.vendor.com/authorize"]
     assert use_case.allowed_domains == ["{{env.base_url}}", "sso.vendor.com"]
+
+
+# ---------------------------------------------------------------------------
+# Recording behind single sign-on
+# ---------------------------------------------------------------------------
+#
+# The whole flow, because the three defects here compound: the identity
+# provider becomes the use case's own address, the sign-in request keeps a
+# `state` the provider will refuse the second time it sees it, and the page it
+# redirected back to is recorded as a step that replays a spent code.
+
+
+SSO = '''import asyncio
+from playwright.async_api import Playwright, async_playwright, expect
+
+
+async def run(playwright: Playwright) -> None:
+    browser = await playwright.chromium.launch(headless=False)
+    context = await browser.new_context()
+    page = await context.new_page()
+    await page.goto("https://login.example.com/oauth2/authorize?client_id=8b21&response_type=code&redirect_uri=https%3A%2F%2Fcrm.example.com%2Fcb&scope=openid&state=Ab9xQ2zKp&nonce=Nn41Kd")
+    await page.get_by_label("Email").fill("ada@example.com")
+    await page.get_by_label("Password").fill("s3cret-Example-Pw")
+    await page.get_by_role("button", name="Sign in").click()
+    await page.goto("https://crm.example.com/cb?code=0.AXkAr9&state=Ab9xQ2zKp&session_state=4f1c")
+    await page.goto("https://crm.example.com/orders?ref=A-1024&sessionDataKey=91ab")
+    await page.get_by_placeholder("Order reference").fill("A-1024")
+
+    # ---------------------
+    await context.close()
+    await browser.close()
+'''
+
+
+def signed_in():
+    return build_usecase(
+        parse(SSO),
+        name="Orders",
+        description="",
+        declared=declared(
+            ("email", "ada@example.com", True),
+            ("password", "s3cret-Example-Pw", True),
+            ("reference", "A-1024", False),
+        ),
+    )
+
+
+def test_the_use_case_belongs_to_the_application_not_the_identity_provider():
+    """`{{env.base_url}}` used to bind to login.example.com, because that is
+    where the address bar was when recording started.
+
+    Promoting the use case to UAT then repointed the *identity provider* at the
+    UAT address -- which nobody meant, and which is very hard to see in a diff.
+    """
+    use_case = signed_in()
+
+    assert use_case.base_url == "https://crm.example.com"
+    assert use_case.target == "crm"
+
+
+def test_the_identity_provider_is_still_allowed_to_be_visited():
+    """Fixing which host is *ours* must not stop the sign-in reaching theirs."""
+    use_case = signed_in()
+
+    assert "login.example.com" in use_case.allowed_domains
+    assert "{{env.base_url}}" in use_case.allowed_domains
+
+
+def test_the_sign_in_request_keeps_its_address_and_loses_its_single_use_parts():
+    use_case = signed_in()
+
+    authorize = use_case.setup_steps[0]
+    assert authorize.url is not None
+    assert authorize.url.startswith("https://login.example.com/oauth2/authorize")
+    assert "client_id=8b21" in authorize.url, "still a valid request"
+    assert "state=" not in authorize.url and "nonce=" not in authorize.url
+
+
+def test_the_page_the_provider_redirected_back_to_is_not_a_step():
+    """Nobody types a callback address, and everything in it is spent. The
+    sign-in steps above it put the browser there again by themselves."""
+    use_case = signed_in()
+
+    urls = [step.url or "" for step in use_case.all_steps]
+    assert not any("/cb?" in url for url in urls)
+    assert any("one-time code" in warning for warning in use_case.warnings)
+
+
+def test_a_session_key_is_removed_while_the_row_value_survives():
+    """The two live in the same query string, and only one of them is data
+    from the sign-in."""
+    use_case = signed_in()
+
+    orders = [step for step in use_case.row_steps if step.action == "navigate"][0]
+    assert orders.url == "{{env.base_url}}/orders?ref={{input.reference}}"
+
+
+def test_the_draft_says_what_it_took_out_of_the_addresses():
+    use_case = signed_in()
+
+    notes = [w for w in use_case.warnings if "address" in w]
+    assert notes, "a person has to be told the recording was edited"
+    assert any("'state'" in note for note in notes)

@@ -30,13 +30,22 @@ into a use case, exactly as in distillation.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from memory import HealingMemory, as_prompt
 from pricing import price_of
 from prompt_loader import HEAL, HEAL_REQUEST, load, render
-from snapshot import Node, Snapshot
+from snapshot import (
+    Node,
+    Snapshot,
+    container_of,
+    count_matches,
+    index_among,
+    locator_for,
+    ordinal_suffix,
+)
 from usecase import Locator, Step
 
 log = logging.getLogger(__name__)
@@ -52,6 +61,11 @@ _INTERESTING = frozenset(
 
 #: Never offer more than this many candidates: a huge page would otherwise put
 #: the original snapshot cost straight back into the context window.
+#:
+#: What changed under this number is which candidates survive the cut. It used
+#: to be whichever came first in the document, so on a long form the list ended
+#: somewhere above the submit button. They are ranked by resemblance to the
+#: broken locator now, so the cut falls at the end of what is plausible.
 MAX_CANDIDATES = 60
 
 CHOOSE_TOOL: dict[str, Any] = {
@@ -135,6 +149,15 @@ class Repair:
     #: Whether this was recalled rather than worked out. A recalled fix costs
     #: nothing and is worth counting separately from one that did.
     recalled: bool = False
+    #: What `remember` will need if this repair turns out to have worked.
+    #:
+    #: Held rather than written immediately because "worked" is not known here.
+    #: The retry happens in `engine.py`, which then calls :meth:`StepHealer.
+    #: confirm`. Writing at proposal time meant the memory recorded what the
+    #: model *believed*, and a confident wrong answer was then recalled as
+    #: evidence every time that site broke again -- which is the one way a
+    #: memory makes healing worse rather than cheaper.
+    pending: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -168,24 +191,44 @@ class StepHealer:
     def calls_used(self) -> int:
         return self.budget.attempts_used
 
-    def candidates(self, snapshot: Snapshot) -> list[Node]:
-        """Interactive, named controls currently on the page."""
-        seen: set[tuple[str, str]] = set()
-        chosen: list[Node] = []
-        for node in snapshot:
-            if node.role not in _INTERESTING:
-                continue
-            label = node.name or node.text
-            if not label:
-                continue
-            key = (node.role, label)
-            if key in seen:
-                continue
-            seen.add(key)
-            chosen.append(node)
-            if len(chosen) >= MAX_CANDIDATES:
-                break
-        return chosen
+    def candidates(self, snapshot: Snapshot, wanted: str = "") -> list[Node]:
+        """Interactive, named controls currently on the page.
+
+        Two rules here used to lose the answer before the model ever saw the
+        question, and both are gone.
+
+        **Nothing is deduplicated.** This kept one entry per ``(role, name)``
+        pair, so a table with an "Edit" link on every row offered exactly one
+        "Edit" -- and the model could not say it meant the second even when
+        the second was plainly right. Duplicates are kept and numbered by
+        :func:`_listing` instead, which is what makes "the third one" an
+        answer that can be given at all.
+
+        **The cut is by relevance, not by document order.** The list was
+        truncated wherever the page happened to reach the cap, which on a long
+        form is somewhere above the submit button. Candidates are now ordered
+        by how much they look like the locator that broke, so the cut falls at
+        the end of what is plausible rather than at the end of the header.
+        Document order is preserved among equally plausible ones, because a
+        page reads top to bottom and so should the list.
+        """
+        chosen = [
+            node
+            for node in snapshot
+            if node.role in _INTERESTING and (node.name or node.text)
+        ]
+        if len(chosen) <= MAX_CANDIDATES:
+            return chosen
+
+        order = {id(node): index for index, node in enumerate(chosen)}
+        ranked = sorted(
+            chosen,
+            key=lambda node: (-_resemblance(node, wanted), order[id(node)]),
+        )
+        # Back into document order once the cut is made: the model reads this
+        # as a page, and a page whose controls arrive in relevance order is
+        # harder to reason about than one that arrives in the order it renders.
+        return sorted(ranked[:MAX_CANDIDATES], key=lambda node: order[id(node)])
 
     async def repair(self, step: Step, snapshot: Snapshot | None) -> Repair | None:
         """Propose a replacement locator, or ``None``.
@@ -200,14 +243,12 @@ class StepHealer:
         if snapshot is None or not len(snapshot):
             return None
 
-        options = self.candidates(snapshot)
+        wanted = step.locators[0].describe() if step.locators else "(no locator recorded)"
+        options = self.candidates(snapshot, wanted)
         if not options:
             return None
 
-        listing = "\n".join(
-            f"{index}. {node.role} \"{node.name or node.text}\"" for index, node in enumerate(options)
-        )
-        wanted = step.locators[0].describe() if step.locators else "(no locator recorded)"
+        listing = _listing(snapshot, options)
 
         # What was done about this before, on this site. Evidence for the
         # model, never an instruction: whatever it picks still has to be one of
@@ -258,9 +299,22 @@ class StepHealer:
             return None
 
         node = options[index]
+        chosen = locator_for(snapshot, node)
+        if chosen is None:
+            # The model picked an element no locator can single out: the first
+            # of several identical controls with nothing named around it.
+            # Declining costs a failed row; accepting would write a locator
+            # into the use case that is refused as ambiguous on every future
+            # row, which is the same failure made permanent.
+            log.info(
+                "healer picked an element that cannot be named uniquely",
+                extra={"step_id": step.id, "element": node.describe()},
+            )
+            return None
+
         repair = Repair(
             step_id=step.id,
-            locator=Locator(strategy="role", role=node.role, name=node.name or None),
+            locator=chosen,
             reason=str(call.input.get("reason") or ""),
             confidence=str(call.input.get("confidence") or "medium"),
             explanation=str(call.input.get("explanation") or call.input.get("reason") or ""),
@@ -269,22 +323,20 @@ class StepHealer:
         )
         self.repairs.append(repair)
 
-        # Remembered only when the model was sure. A low-confidence guess is
-        # exactly the answer not to give next time, and writing every attempt
-        # down would fill the table with the ones that were wrong.
-        if self.memory is not None and repair.confidence == "high":
-            await self.memory.remember(
-                usecase_id=self.usecase_id,
-                step_id=step.id,
-                page_url=snapshot.page_url or "",
-                page=listing,
-                step_summary=step.summary(),
-                wanted=wanted,
-                old_locator=repair.old_locator.model_dump() if repair.old_locator else None,
-                new_locator=repair.locator.model_dump(),
-                explanation=repair.explanation,
-                confirmed_by="model",
-            )
+        # Everything `remember` needs, kept until the retry says whether this
+        # was right. See `Repair.pending` and :meth:`confirm`.
+        repair.pending = {
+            "usecase_id": self.usecase_id,
+            "step_id": step.id,
+            "page_url": snapshot.page_url or "",
+            "page": listing,
+            "step_summary": step.summary(),
+            "wanted": wanted,
+            "old_locator": repair.old_locator.model_dump() if repair.old_locator else None,
+            "new_locator": repair.locator.model_dump(),
+            "explanation": repair.explanation,
+            "confirmed_by": "model",
+        }
         log.info(
             "healed a step",
             extra={
@@ -295,6 +347,82 @@ class StepHealer:
             },
         )
         return repair
+
+    async def confirm(self, repair: Repair, worked: bool) -> None:
+        """Record the fix, now that the retry has said whether it was right.
+
+        Called by ``engine.py`` after it re-runs the step. Two conditions, and
+        the second is the one that was missing:
+
+        **The model was sure.** A low-confidence guess is exactly the answer
+        not to give next time.
+
+        **It actually worked.** This used to be written at proposal time, so
+        the memory recorded what the model *believed* about a page rather than
+        what turned out to be true of it. A confident wrong answer was then
+        recalled as evidence every time that site broke again -- and since
+        recall puts past fixes in front of the model as context, a wrong one
+        does not merely fail to help, it argues for repeating itself. That is
+        the single way a memory can make healing worse rather than cheaper,
+        and it was the way this one was built.
+        """
+        if not worked or self.memory is None or repair.confidence != "high":
+            return
+        if not repair.pending:
+            return
+        await self.memory.remember(**repair.pending)
+
+
+def _words(value: str) -> set[str]:
+    return {word for word in re.split(r"[^a-z0-9]+", (value or "").casefold()) if word}
+
+
+def _resemblance(node: Node, wanted: str) -> float:
+    """How much this candidate looks like the locator that stopped matching.
+
+    Deliberately crude: a shared role counts for something, and shared words in
+    the name count for more. This orders a truncation, it does not make the
+    choice -- the model still picks, from a list it can see all of.
+
+    Crude is also the right amount of clever. A better similarity would be an
+    embedding, and an embedding here would mean a network call on the failure
+    path of every healed step, to rank a list the model is about to read in
+    full anyway.
+    """
+    if not wanted:
+        return 0.0
+    wanted_words = _words(wanted)
+    if not wanted_words:
+        return 0.0
+    score = 0.0
+    if node.role and node.role.casefold() in wanted.casefold():
+        score += 1.0
+    shared = _words(node.name or node.text) & wanted_words
+    if shared:
+        score += 2.0 * len(shared) / len(wanted_words)
+    return score
+
+
+def _listing(snapshot: Snapshot, options: list[Node]) -> str:
+    """The candidate list as the model reads it.
+
+    Each line says which of several identical controls this one is, and where
+    on the page it sits. Both exist so an answer can be *given*: with neither,
+    a page holding six "Edit" links offers six lines that read identically, and
+    every one of them is an equally good answer to a question that has one.
+    """
+    lines: list[str] = []
+    for index, node in enumerate(options):
+        line = f'{index}. {node.role} "{node.name or node.text}"'
+        total = count_matches(snapshot, node, True)
+        if total > 1:
+            position = index_among(snapshot, node, True) + 1
+            line += f" ({position}{ordinal_suffix(position)} of {total} like this)"
+        container = container_of(snapshot, node)
+        if container is not None:
+            line += f' in {container.role} "{container.name or container.text}"'
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _identity(locator: dict[str, Any]) -> tuple:

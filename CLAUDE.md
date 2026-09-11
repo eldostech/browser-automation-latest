@@ -68,8 +68,17 @@ Three phases, and only one of them can spend tokens:
 `setup_steps` (once per session), `row_steps` (once per input row), `row_reset`
 (between rows) — because a batch shares one browser session and sign-in must not
 run per row. Locators are a *ranked ladder* (role + accessible name first, recorded
-selectors as fallbacks), not a single selector. `{{input.x}}` / `{{secret.x}}`
-templating is confined to value-bearing fields; the validator refuses it in locators.
+selectors as fallbacks), not a single selector. A rung also says *where* to look:
+`within` scopes it inside another rung, `has_text` filters, `frames` descends
+through iframes. `{{input.x}}` / `{{secret.x}}` templating is confined to
+value-bearing fields; the validator refuses it in locators, `within` included.
+
+A ladder is editable after recording — `LocatorEditor.tsx` writes it back through
+`PUT /usecases/{id}`, and `POST /usecases/{id}/locator-check` opens a page and
+reports what each rung matches. That check resolves through `engine.build_locator`,
+the executor's own composer; a second implementation would answer a different
+question than the run does, on the one screen whose job is to say whether an edit
+will work.
 
 HTTP layering: `main.py` wires app state in `lifespan` and does nothing else →
 `routers/` (one module per resource) → `services.py` (logic shared by the single-row
@@ -78,8 +87,18 @@ test swaps a database, a fake LLM or a fixed principal by overriding one depende
 
 Batches run on a durable Postgres queue (`jobs.py`, `SELECT ... FOR UPDATE SKIP LOCKED`,
 leases not flags) so a restart does not lose them; `bus.py` fans events out across
-processes via `LISTEN/NOTIFY` carrying `run_id:seq:origin`, never the payload.
+processes via `LISTEN/NOTIFY` carrying a `run_id` and a seq *range*, never the payload.
 Every event has a sequence number and that number is the client's resume token.
+
+**Writes are batched, because latency is the deployment's and round trips are ours.**
+`eventbuffer.py` collects a run's events and writes them in one statement; step rows
+go the same way, flushed per row. A ten-step row costs 5 remote round trips instead
+of 94. Two rules keep it honest: an event is published to the bus only *after* the
+batch is durable (the resume token must never name a seq a catch-up read cannot
+return), and a flush happens at every row boundary and in `RunLifecycle._persist`
+before the run row is marked finished. The live view never waited on any of this
+anyway — the WebSocket serves from an in-memory queue and touches the database only
+to catch up after a reconnect.
 
 ## Invariants — do not break these
 
@@ -95,8 +114,61 @@ Every event has a sequence number and that number is the client's resume token.
 - **Codegen output is data, never code.** Parse with `ast`; never `exec`, `eval`
   or import it. Unrecognised lines become `Unsupported` entries shown to the user —
   never a guessed-at step.
+- **Two gates, and which one a defect belongs to is the whole design.**
+  `unreplayable_reasons` blocks *publishing* and holds only what can never work on
+  any record — today, a step whose every rung is an unnamed structural role
+  (`role=generic [24]`; `Snapshot.locate` refuses those by design).
+  `unbatchable_reasons` blocks *starting a batch* and holds what breaks only across
+  records — a row that signs out while signing in lives only in setup with no
+  `session_check`. Putting the second at publish was a mistake that cost a user
+  their recording: it ran one record perfectly, so the refusal was wrong, and the
+  only way out was to delete it. A gate must refuse where the failure is and always
+  name the way through.
+- **An unnamed wrapper is recorded by the named control inside it.**
+  `agent/marks.describe_element` used to emit `role=generic [24]` for a click on an
+  anonymous card; it now borrows the card's own uniquely-named descendant (a radio
+  with a person's name on it) and counts `matches` against *that* rung, so the
+  warning cannot contradict the ladder. Refused when the descendant's name is not
+  unique — swapping one ambiguity for another is not a fix.
+- **Keyboard navigation is not workflow.** `drop_focus_keystrokes` removes
+  recorded `Tab`/`Shift+Tab` presses, which codegen aims at whatever had focus —
+  in one real recording, `Shift+Tab` on a "Forgot password?" link in the middle
+  of a login. Safe because `fill` focuses what it fills.
+- **A URL must never be made of one sign-in's data.** `usecase.clean_recorded_urls`
+  strips the OAuth/OIDC/SAML single-use parameters (`VOLATILE_QUERY_PARAMS`) from
+  recorded URLs and drops a navigate step that is only an authorization callback.
+  It edits the *raw query text* rather than parsing and rebuilding it — rebuilding
+  re-encodes a percent-encoded `redirect_uri` and escapes the braces of a templated
+  parameter, turning `{{input.x}}` into a literal that matches nothing.
+  `application_origin` picks the app rather than the identity provider for
+  `{{env.base_url}}`, reading the authorization request's own `redirect_uri` when
+  the recording never leaves the IdP.
+- **A locator must never be made of the row's own data.** `usecase.data_derived_clicks`
+  catches a suggestion clicked after a per-row search, and any locator whose text
+  repeats a declared input's recorded value; `strip_data_locators` removes the name
+  and keeps it in `rejected_locators` for the review screen. Both recorders call it
+  (`routers/recordings.py`, `agent/distil.py`) right after parameterisation, which
+  is the last point at which "this came from the spreadsheet" is known. The name is
+  *deleted, not demoted*: a ladder takes the first rung matching one element, so a
+  demoted data rung sits unused on every row that works and fires on exactly the
+  ambiguous ones — acting only when it is certainly wrong.
+- **Templating is allowed in a locator's name, text and has_text, and refused in
+  its selector and frames.** The split is "is this field a query language"; see
+  `TEMPLATABLE_LOCATOR_FIELDS`. The executor renders a rung before it describes it,
+  so a failure names what that row actually looked for.
 - **The model can never invent a locator.** Healing and repair present a numbered
-  list of controls actually on the page and take back an index.
+  list of controls actually on the page and take back an index. The list is not
+  deduplicated — six "Edit" links are six lines, numbered and labelled with the
+  row they sit in — and `snapshot.locator_for` turns the chosen node into the
+  narrowest locator that finds it alone, returning `None` when nothing can.
+  Callers must refuse on `None` rather than approximate: `nth=0` means "no
+  position given", so the first of several identical controls with nothing named
+  around it has no spelling, and writing one anyway is a repair that looks
+  applied and fails identically.
+- **A fix is remembered only after the retry says it worked.** `StepHealer.confirm`
+  is called by `engine._heal` after the repaired step re-runs. Writing at proposal
+  time recorded what the model believed; recall then argued for repeating a
+  confident wrong answer every time that site broke again.
 - **Secrets are registered with the redactor before any event is emitted**, and
   batches take a stored credential id, never inline values.
 - **`.env.example` is checked against the `Settings` model by `tests/test_config.py`.**
@@ -123,6 +195,21 @@ Every event has a sequence number and that number is the client's resume token.
   point `DB_SCHEMA` at a fresh schema rather than fighting it.
 - **Recording is local-only** (`RECORDER_ENABLED`); a codegen window needs a display,
   so Docker and the EKS manifests in `deploy/` run replay only.
+- **`locator.count()` counts hidden elements, so ambiguity is judged over
+  `filter(visible=True)`.** Which rungs this affects is not the obvious answer:
+  `get_by_role` reads the accessibility tree and never saw a `display:none`
+  duplicate, while `text` and `css` rungs match the DOM and did — and those are
+  the *fallback* rungs `codegen._ladder` writes under every role rung. A hidden
+  duplicate therefore costs nothing until the day the role rung stops matching.
+- **Nothing on the replay path reads back what it just wrote.** The visual diff
+  uses the screenshot bytes still in memory, and a step's baseline image is fetched
+  once per run rather than once per row — it is the same object on every row, so a
+  thousand-row batch was fetching one identical object a thousand times.
+- **An action can move the page out from under the next observation.**
+  `_after_action` settles, adopts any tab the site opened, then snapshots, in
+  that order. The snapshot taken when a step fails is what a repair is proposed
+  from and what goes into healing memory, so observing a page mid-navigation
+  writes something false into a memory that is then recalled forever.
 
 ## Style
 

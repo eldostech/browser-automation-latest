@@ -209,6 +209,19 @@ class BatchRunner:
             if self.on_row is not None:
                 await self.on_row(index, row, result)
 
+            # A row is the unit somebody resumes, retries and reads results by,
+            # so it is the point at which what happened has to be on disk
+            # rather than in this process. Events are written in batches now
+            # (see `eventbuffer.py`), which makes that a decision rather than a
+            # side effect of writing each one as it happened -- and it bounds
+            # what a hard kill can lose to the row in flight.
+            # Both getattrs matter: a test injects its own `_run_row` with a
+            # stand-in executor, and a sink built for a run with no database
+            # behind it has nothing to flush.
+            flush = getattr(getattr(self.executor, "sink", None), "flush", None)
+            if flush is not None:
+                await flush()
+
             if streak >= self.failure_streak_limit:
                 self.progress.stopped_reason = (
                     f"stopped after {streak} consecutive row failures. Something is broken "

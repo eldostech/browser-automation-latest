@@ -29,6 +29,13 @@ Only a fix somebody stands behind: one the model proposed with high confidence
 and that then *worked*, or one a person confirmed. Writing down every attempt
 would fill the table with the guesses that failed, and those are exactly the
 answers not to give next time.
+
+"And that then worked" is enforced by :meth:`healing.StepHealer.confirm`, which
+the executor calls once it has retried the repaired step. It used to be written
+at proposal time, which recorded what the model *believed* about a page rather
+than what turned out to be true of it -- and since recall puts past fixes in
+front of the model as context, a confident wrong answer did not merely fail to
+help, it argued for repeating itself every time that site broke again.
 """
 
 from __future__ import annotations

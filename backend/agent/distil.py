@@ -38,7 +38,16 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from snapshot import STRUCTURAL_ROLES, ordinal_suffix
-from usecase import InputSpec, Locator, SecretSpec, Step, UseCase
+from usecase import (
+    InputSpec,
+    Locator,
+    SecretSpec,
+    Step,
+    UseCase,
+    clean_recorded_urls,
+    drop_focus_keystrokes,
+    strip_data_locators,
+)
 
 from .marks import Mark, Marks
 from .session import ToolCallRecord
@@ -112,6 +121,25 @@ def distil(
     row_steps = _steps(row_calls, bindings, warnings)
     setup_steps, row_steps = _move_per_row_work(setup_steps, row_steps, warnings)
     outputs = _insert_reads(row_steps, row_calls, marks, first_row, warnings)
+
+    # The same defect the codegen recorder has, for the same reason: an agent
+    # that types a customer number and clicks the suggestion records the
+    # suggestion by the name it was showing, and that name is the row's data.
+    # Applied after `_bindings` has turned the typed values into templates,
+    # because "did a per-row value produce this suggestion?" is a question
+    # about the parameterised steps rather than the recorded ones.
+    # `typed` holds the literal text the agent put in each per-row field, which
+    # is what the echo rule compares against. Secrets are deliberately absent
+    # from it and belong nowhere near a locator anyway.
+    warnings.extend(strip_data_locators(row_steps, list(typed.values())))
+
+    # The sign-in the agent drove is the same sign-in a codegen recording
+    # captures, and leaves the same single-use parameters in the addresses it
+    # went to. Both step lists, because an SSO redirect lands in setup.
+    warnings.extend(clean_recorded_urls(setup_steps))
+    warnings.extend(clean_recorded_urls(row_steps))
+    warnings.extend(drop_focus_keystrokes(setup_steps))
+    warnings.extend(drop_focus_keystrokes(row_steps))
 
     if len(marks.rows) > 1:
         warnings.extend(_compare_spans(calls, marks, row_calls))

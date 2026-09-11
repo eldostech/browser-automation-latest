@@ -183,9 +183,16 @@ await page.get_by_test_id("checkout").click()
 # --- what it refuses to guess about ----------------------------------------
 
 
-def test_a_chained_locator_is_reported_rather_than_approximated():
-    """One locator scoped inside another has no rung in this schema, and an
-    approximation clicks something else on row one."""
+def test_a_chained_locator_records_the_scope_rather_than_dropping_the_step():
+    """This used to be refused, on the reasoning that the schema had no rung
+    for it and an approximation clicks something else on row one.
+
+    The reasoning was right and the conclusion was backwards. Codegen writes a
+    chain exactly when the page holds two controls it cannot tell apart, so
+    refusing the shape discarded the recording's answer to the one question the
+    executor cannot work out for itself. The rung exists now, and nothing is
+    approximated: each call in the chain is performed as the call it was.
+    """
     recording = parse(
         script(
             """
@@ -194,8 +201,12 @@ await page.get_by_role("row", name="Ada").get_by_role("button", name="Edit").cli
 """
         )
     )
-    assert len(recording.steps) == 1
-    assert "cannot record" in recording.unsupported[0].reason
+    assert len(recording.steps) == 2
+    assert not recording.unsupported
+    primary = recording.steps[1].locators[0]
+    assert (primary.role, primary.name) == ("button", "Edit")
+    assert primary.within is not None
+    assert (primary.within.role, primary.within.name) == ("row", "Ada")
 
 
 def test_last_is_recorded_as_a_position_never_as_a_fixed_index():
@@ -225,7 +236,10 @@ await page.get_by_role("button", name="Remove").last.click()
     ), "every rung of the ladder addresses the same one"
 
 
-def test_a_frame_is_reported():
+def test_a_frame_is_recorded_as_a_hop_rather_than_reported():
+    """An element in an iframe used to be unrecordable, which meant a workflow
+    with a payment form or an embedded editor could not be automated at all --
+    the step was dropped at parse time and nothing downstream ever saw it."""
     recording = parse(
         script(
             """
@@ -234,8 +248,9 @@ await page.frame_locator("#payment").get_by_label("Card number").fill("4111")
 """
         )
     )
-    assert len(recording.steps) == 1
-    assert recording.unsupported
+    assert len(recording.steps) == 2
+    assert not recording.unsupported
+    assert recording.steps[1].locators[0].frames == ["#payment"]
 
 
 def test_a_file_upload_says_why_it_cannot_be_replayed():
@@ -472,8 +487,14 @@ await page.locator("tr:nth-child(14) > td:nth-child(3)").first.click()
     assert "d8ec9327-b8e3" in recording.typed, "a chosen option is a value you can parameterise"
 
 
-def test_one_locator_scoped_inside_another_is_still_refused():
-    """The shape the schema genuinely has no rung for, kept honest."""
+def test_a_css_scope_around_a_text_rung_is_recorded_and_marked_as_markup():
+    """A menu addressed by its id, and the item inside it by its wording.
+
+    Recorded rather than refused -- but the scope is CSS, so the whole rung
+    counts as markup and the ladder walks it *after* any purely semantic rung.
+    Ordering it first would put the more fragile of two rungs ahead of the
+    other, which is the one thing the ladder's ordering exists to prevent.
+    """
     recording = parse(
         script(
             """
@@ -483,9 +504,11 @@ await page.locator("#profileDropdown").get_by_text("Log out").click()
         )
     )
 
-    assert [s.action for s in recording.steps] == ["navigate"]
-    assert len(recording.unsupported) == 1
-    assert "chained" in recording.unsupported[0].reason
+    assert [s.action for s in recording.steps] == ["navigate", "click"]
+    assert not recording.unsupported
+    primary = recording.steps[1].locators[0]
+    assert primary.within is not None and primary.within.selector == "#profileDropdown"
+    assert not primary.semantic
 
 
 def test_selecting_several_options_at_once_says_what_it_could_not_take():
@@ -615,3 +638,103 @@ def test_exact_survives_a_round_trip_through_the_document():
     stored = Locator(strategy="role", role="button", name="Invite", exact=True)
     assert Locator.model_validate(stored.model_dump()).exact is True
     assert "exact" in stored.describe()
+
+
+# ---------------------------------------------------------------------------
+# Chains: scope, filter and frame
+# ---------------------------------------------------------------------------
+#
+# All three were refused outright until now, and each became an `Unsupported`
+# line reading "the element is addressed in a way this cannot record". That was
+# the wrong call in a specific and expensive way: codegen writes a chain
+# *precisely when the page is ambiguous*, so discarding it threw away the
+# recording's answer to the only question the executor cannot work out for
+# itself -- and left the step to be refused as ambiguous at replay instead.
+
+
+def test_a_scoped_locator_records_where_to_look():
+    recording = parse(
+        script('await page.get_by_role("dialog").get_by_role("button", name="Invite").click()')
+    )
+
+    assert not recording.unsupported
+    primary = recording.steps[0].locators[0]
+    assert (primary.role, primary.name) == ("button", "Invite")
+    assert primary.within is not None
+    assert primary.within.role == "dialog"
+
+
+def test_a_row_filter_records_the_text_that_picks_the_row():
+    recording = parse(
+        script(
+            'await page.get_by_role("row").filter(has_text="Acme Ltd")'
+            '.get_by_role("link", name="Edit").click()'
+        )
+    )
+
+    assert not recording.unsupported
+    primary = recording.steps[0].locators[0]
+    assert primary.within is not None
+    assert primary.within.has_text == "Acme Ltd"
+
+
+def test_both_spellings_of_a_frame_hop_record_the_same_thing():
+    """Older codegen writes `frame_locator`; newer writes `.content_frame`."""
+    old = parse(
+        script('await page.frame_locator("#pay").get_by_role("button", name="Pay").click()')
+    )
+    new = parse(
+        script('await page.locator("#pay").content_frame.get_by_role("button", name="Pay").click()')
+    )
+
+    assert not old.unsupported and not new.unsupported
+    assert old.steps[0].locators[0].frames == ["#pay"]
+    assert new.steps[0].locators[0].frames == ["#pay"]
+
+
+def test_the_free_text_fallback_stays_inside_the_scope_it_was_recorded_in():
+    """A role rung implies a text rung, and an unscoped one would search the
+    whole page -- looking outside the very dialog the rung above it exists to
+    stay inside, and finding the control it exists to avoid."""
+    recording = parse(
+        script('await page.get_by_role("dialog").get_by_role("button", name="Invite").click()')
+    )
+
+    fallback = recording.steps[0].locators[1]
+    assert fallback.strategy == "text"
+    assert fallback.within is not None and fallback.within.role == "dialog"
+
+
+def test_a_scope_deeper_than_the_schema_allows_is_still_unsupported():
+    """The refusal did not go away, it moved to where it is a real limit.
+
+    An unrecognised shape must become a line a person reads, never a guess
+    about an element nobody here has seen.
+    """
+    recording = parse(
+        script(
+            """
+await page.goto("https://example.com/")
+await page.get_by_role("main").get_by_role("region", name="A").get_by_role("table").get_by_role("row").get_by_role("cell").get_by_role("button", name="X").click()
+"""
+        )
+    )
+
+    assert [s.action for s in recording.steps] == ["navigate"]
+    assert recording.unsupported
+
+
+def test_a_filter_by_locator_is_still_unsupported():
+    """`filter(has=...)` takes a locator, not a string. There is no rung for
+    it, and approximating one would record a different element."""
+    recording = parse(
+        script(
+            """
+await page.goto("https://example.com/")
+await page.get_by_role("row").filter(has=page.get_by_text("Acme")).get_by_role("button").click()
+"""
+        )
+    )
+
+    assert [s.action for s in recording.steps] == ["navigate"]
+    assert recording.unsupported

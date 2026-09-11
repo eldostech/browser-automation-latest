@@ -16,6 +16,8 @@ import type {
   BatchSummary,
   CredentialSummary,
   DatasetSummary,
+  Locator,
+  LocatorCheckReport,
   MappingResult,
   RememberedFix,
   RunStep,
@@ -197,6 +199,19 @@ export const api = {
     request<{ usecase_id: string; version: number; status: string }>(`/api/usecases/${id}`, {
       method: 'PUT',
       body: JSON.stringify(definition),
+    }),
+
+  /** What these locators match on a real page, right now.
+   *
+   * Nothing is saved. This exists because editing a locator without it is
+   * editing a string: a rung reads perfectly well and still matches nothing,
+   * or matches four things, and the only way to find out used to be running
+   * the use case and waiting out a timeout on row one of a batch.
+   */
+  checkLocators: (id: string, url: string, locators: Locator[], timeoutMs = 10000) =>
+    request<LocatorCheckReport>(`/api/usecases/${id}/locator-check`, {
+      method: 'POST',
+      body: JSON.stringify({ url, locators, timeout_ms: timeoutMs }),
     }),
 
   /** Change the label only. No new version — a name is not part of the recipe. */

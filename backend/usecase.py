@@ -18,9 +18,13 @@ the first time the site ships a redesign. ``role`` + accessible name resolved
 against a *live* snapshot survives markup churn, so it leads the list and the
 recorded selectors follow as fallbacks.
 
-**Templating is confined to value-bearing fields.** ``{{input.x}}`` in a
-selector would be a selector-injection hole and would make locator drift
-impossible to debug, so the validator refuses it outright.
+**Templating is confined to what is matched as a plain string.** ``{{input.x}}``
+in a CSS selector would be a selector-injection hole, so the validator refuses
+it there. It is *allowed* in an accessible name, a label, a placeholder, alt
+text and a text filter, because Playwright compares those as strings and a
+value has no syntax to escape into -- and because a search whose dropdown is
+filled from the row has no replayable locator without it. See
+:data:`TEMPLATABLE_LOCATOR_FIELDS`.
 """
 
 from __future__ import annotations
@@ -29,7 +33,8 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -81,6 +86,11 @@ Mode = Literal["strict", "guided", "explore"]
 #: looking at, and so the two authoring paths can be told apart in a list.
 AuthoredBy = Literal["person", "agent"]
 FailureMode = Literal["abort", "continue", "heal"]
+
+
+#: Spelled out, because an escaped newline inside a nested f-string in this
+#: file has been got wrong twice.
+NEWLINE = "\n"
 
 
 def _now() -> str:
@@ -309,6 +319,43 @@ SEMANTIC_STRATEGIES = frozenset({"role", "label", "placeholder", "alt_text"})
 #: and ``nth`` are not names at all.
 NAMED_STRATEGIES = frozenset({"role", "label", "placeholder", "alt_text", "text"})
 
+#: Locator fields a ``{{input.x}}`` may appear in, and the two it may not.
+#:
+#: The rule used to be "never, anywhere in a locator", for two reasons. One
+#: still holds completely and one turned out to be about *which field*.
+#:
+#: **Injection.** A templated CSS selector is a selector-injection hole: the
+#: value is spliced into a query language, and a row whose spreadsheet cell
+#: reads ``a, button`` addresses every link on the page. That argument is
+#: exactly as strong as it ever was for ``selector`` and ``frames``, which are
+#: the only two fields here that *are* a query language. It does not transfer
+#: to the fields below: an accessible name, a label, a placeholder, alt text
+#: and a text filter are matched by Playwright as plain strings, and there is
+#: no syntax in them for a value to escape into.
+#:
+#: **Debuggability.** "When a locator stops matching you can no longer tell
+#: whether the site changed or the input did." Real, and answered rather than
+#: avoided: the resolver renders a rung before it describes it, so a failure
+#: says what was actually looked for on that row rather than the template.
+#:
+#: Keeping the blanket ban cost more than it saved. A search whose dropdown is
+#: filled from the row -- type a customer number, pick the customer name --
+#: has *no* replayable locator without this: the recorded name belongs to the
+#: row it was recorded on, and no rung available to the schema could say "the
+#: name from this row's spreadsheet column".
+TEMPLATABLE_LOCATOR_FIELDS = frozenset({"name", "text", "has_text"})
+
+
+#: How deep ``within`` may nest. Three is already more than any real page
+#: needs -- dialog, row, cell -- and a bound is what stops a hand-edited or
+#: model-proposed locator from becoming a recursion that only the executor
+#: discovers.
+MAX_SCOPE_DEPTH = 3
+
+#: How many frames a locator may reach through. Nested iframes exist (a widget
+#: inside an embedded document); four levels of them do not.
+MAX_FRAME_DEPTH = 3
+
 
 class Locator(BaseModel):
     """One rung of the locator ladder.
@@ -328,6 +375,26 @@ class Locator(BaseModel):
     ``test_id`` is a contract the site's own authors maintain, so it is stable
     until they change it -- but it is markup, not meaning, and it is absent
     from most pages.
+
+    Three fields describe *where to look* rather than *what to look for*, and
+    they exist because without them this schema could not record what
+    ``playwright codegen`` already writes:
+
+    ``within`` scopes the search inside another element. This is the standard
+    answer to two controls with the same name -- the "Invite" button in the
+    dialog, not the "Invite" link in the sidebar -- and until it existed the
+    only recourse was ``nth``, which is a guess about ordering, or refusing
+    the step as ambiguous. A recording that names a scope is *narrower* than
+    one that does not, so a scoped rung leads its unscoped twin.
+
+    ``has_text`` keeps only matches containing some text. It is how a row is
+    picked out of a table: ``role=row`` filtered by the customer's name, then
+    the button inside it.
+
+    ``frames`` is the chain of iframes to descend through, outermost first,
+    each a CSS selector for the frame element. An element inside an iframe is
+    unreachable without this -- not merely harder to find, absent from the
+    page as far as every other rung is concerned.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -351,6 +418,16 @@ class Locator(BaseModel):
     #: The string for every strategy in :data:`STRING_STRATEGIES`.
     text: str | None = None
 
+    #: Search inside this element rather than the whole page. Recursive, so a
+    #: button in a cell in a row is expressible; bounded by
+    #: :data:`MAX_SCOPE_DEPTH` so a malformed one is rejected here rather than
+    #: found by the executor.
+    within: "Locator | None" = None
+    #: Keep only matches whose text contains this.
+    has_text: str | None = None
+    #: iframes to descend through, outermost first, as CSS selectors.
+    frames: list[str] = Field(default_factory=list)
+
     @model_validator(mode="after")
     def _requires_its_own_field(self) -> "Locator":
         if self.strategy in STRING_STRATEGIES:
@@ -363,10 +440,104 @@ class Locator(BaseModel):
             raise ValueError("locator strategy 'nth' requires a non-negative nth")
         return self
 
+    @model_validator(mode="after")
+    def _scope_is_bounded(self) -> "Locator":
+        """A scope chain has a depth limit, and only the outermost rung
+        carries the frames.
+
+        Both halves matter for the same reason: ``_build`` walks this
+        structure and composes one Playwright call per level. A chain with no
+        bound, or with a frame hop buried three levels in, is a shape the
+        executor would have to interpret rather than perform.
+        """
+        if len(self.frames) > MAX_FRAME_DEPTH:
+            raise ValueError(
+                f"a locator may reach through at most {MAX_FRAME_DEPTH} frames, not "
+                f"{len(self.frames)}"
+            )
+        if any(not frame.strip() for frame in self.frames):
+            raise ValueError("a frame in 'frames' cannot be blank")
+
+        depth, scope = 0, self.within
+        while scope is not None:
+            depth += 1
+            if depth > MAX_SCOPE_DEPTH:
+                raise ValueError(
+                    f"a locator may be scoped at most {MAX_SCOPE_DEPTH} levels deep"
+                )
+            if scope.frames:
+                raise ValueError(
+                    "only the outermost locator carries 'frames'; a scope inside it is "
+                    "already in that frame"
+                )
+            scope = scope.within
+        return self
+
     @property
     def semantic(self) -> bool:
-        """Whether this rung describes meaning rather than markup."""
-        return self.strategy in SEMANTIC_STRATEGIES
+        """Whether this rung describes meaning rather than markup.
+
+        The whole chain has to qualify, not just the rung's own strategy. A
+        role scoped inside a CSS selector breaks when the markup changes, so
+        ordering it ahead of an unscoped role rung would put the more fragile
+        of the two first -- which is the one thing the ladder's ordering
+        exists to prevent.
+        """
+        if self.strategy not in SEMANTIC_STRATEGIES:
+            return False
+        return self.within is None or self.within.semantic
+
+    @property
+    def scoped(self) -> bool:
+        """Whether this rung narrows the search at all.
+
+        Read by the ladder: between two rungs that are otherwise equal, the
+        one that says *where* is the one the recording was more specific
+        about, and it goes first.
+        """
+        return self.within is not None or bool(self.has_text) or bool(self.frames)
+
+    def templated_selector(self) -> str:
+        """Which CSS-bearing field of this chain holds a template, or "".
+
+        Walks the scope chain, because ``within`` is where a templated selector
+        would most easily hide: the rung a reviewer reads says ``role=button``
+        and the thing it is scoped inside is the injection.
+        """
+        if has_template(self.selector):
+            return "selector"
+        if has_template(self.frames):
+            return "frames"
+        return self.within.templated_selector() if self.within is not None else ""
+
+    def template_values(self) -> list[str]:
+        """Every string of this chain a template may legitimately appear in.
+
+        What :meth:`Step.references` counts, so an input named only by a
+        locator is still a declared input. A step that finds its element by
+        ``{{input.customer_name}}`` and does not declare that input would
+        otherwise pass review and then look for the literal text on every row.
+        """
+        mine = [self.name or "", self.text or "", self.has_text or ""]
+        return mine + (self.within.template_values() if self.within is not None else [])
+
+    def render(self, render: Any) -> "Locator":
+        """This rung with ``{{input.x}}`` made real, through ``render``.
+
+        Returns ``self`` unchanged when there is nothing to substitute, which
+        is every rung of every recording made before templating was allowed
+        here -- so the common path allocates nothing.
+        """
+        if not has_template(self.template_values()):
+            return self
+        update: dict[str, Any] = {}
+        for field in TEMPLATABLE_LOCATOR_FIELDS:
+            value = getattr(self, field)
+            if value and has_template(value):
+                update[field] = render(value)
+        if self.within is not None:
+            update["within"] = self.within.render(render)
+        return self.model_copy(update=update)
 
     def describe(self) -> str:
         if self.strategy == "role":
@@ -379,7 +550,22 @@ class Locator(BaseModel):
             base = f"nth={self.nth}"
         if self.exact and self.strategy in NAMED_STRATEGIES:
             base += " exact"
-        return base if self.nth == 0 or self.strategy == "nth" else f"{base} [{self.nth}]"
+        if self.has_text:
+            base += f" has_text={self.has_text!r}"
+        if self.nth != 0 and self.strategy != "nth":
+            base += f" [{self.nth}]"
+        if self.within is not None:
+            base = f"{base} in {self.within.describe()}"
+        if self.frames:
+            base = f"{base} in frame {' > '.join(self.frames)}"
+        return base
+
+
+#: ``within`` refers to ``Locator`` from inside its own body. Pydantic can
+#: usually work that out unaided; saying so explicitly means a failure to
+#: resolve it is an import error here rather than a validation error on the
+#: first use case someone edits.
+Locator.model_rebuild()
 
 
 class Assertion(BaseModel):
@@ -614,23 +800,30 @@ class Step(BaseModel):
 
     @model_validator(mode="after")
     def _selectors_are_never_templated(self) -> "Step":
-        """A templated selector is a selector-injection hole.
+        """A templated *selector* is a selector-injection hole.
 
-        It also makes drift undebuggable: when a locator stops matching you can
-        no longer tell whether the site changed or the input did.
+        A templated accessible name is not, and the difference is which of them
+        is a query language -- see :data:`TEMPLATABLE_LOCATOR_FIELDS` for the
+        whole argument. ``selector`` and ``frames`` are CSS and stay closed;
+        the fields Playwright matches as plain strings are open, because a
+        search whose dropdown is filled from the row has no replayable locator
+        without them.
         """
-        for locator in [*self.locators, *self.rejected_locators]:
-            if has_template(locator.model_dump()):
+        everywhere = [
+            *self.locators,
+            *self.rejected_locators,
+            *[loc for field in self.fields for loc in field.locators],
+        ]
+        for locator in everywhere:
+            offending = locator.templated_selector()
+            if offending:
                 raise ValueError(
-                    f"step {self.id!r}: templating is not allowed inside a locator "
-                    f"({locator.describe()})"
+                    f"step {self.id!r}: templating is not allowed in a locator's "
+                    f"{offending} -- it is a CSS selector, and a row whose value "
+                    f"contained selector syntax would address a different element "
+                    f"({locator.describe()}). Match on a name, a label or a text "
+                    "filter instead, which are compared as plain strings."
                 )
-        for field in self.fields:
-            for locator in field.locators:
-                if has_template(locator.model_dump()):
-                    raise ValueError(
-                        f"step {self.id!r}: templating is not allowed inside a form field locator"
-                    )
         return self
 
     def references(self) -> set[tuple[str, str]]:
@@ -640,6 +833,14 @@ class Step(BaseModel):
                 "url": self.url,
                 "value": self.value,
                 "fields": [f.value for f in self.fields],
+                # Locators count too, now that a name may be templated. A step
+                # that finds its element by "{{input.customer_name}}" and does
+                # not declare that input would otherwise pass review and then
+                # look for the literal text on every row.
+                "locators": [loc.template_values() for loc in self.locators],
+                "field_locators": [
+                    loc.template_values() for f in self.fields for loc in f.locators
+                ],
                 "assert": self.assertion.value if self.assertion else None,
                 "wait": self.wait_for.value if self.wait_for else None,
                 # Script code counts. It used to be excluded because nothing
@@ -662,6 +863,755 @@ class Step(BaseModel):
         if self.locators:
             return f"{self.action} {self.locators[0].describe()}"
         return self.action
+
+
+# ---------------------------------------------------------------------------
+# A locator made of the row's own data
+# ---------------------------------------------------------------------------
+#
+# The defect this exists for, in the shape it was found in: a search box whose
+# dropdown is filled from what you type. You type a customer *number*, the
+# dropdown offers customer *names*, and you click one. `playwright codegen`
+# writes `get_by_role("option", name="Acme Ltd")`, because that is what was on
+# the screen -- and it is completely right about the run it watched.
+#
+# It is wrong about every other run. "Acme Ltd" is not part of the page's
+# design, it is row one's answer, and a recording that carries it is good for
+# exactly one customer. The failure is quiet in the worst way: row one passes,
+# so the recording looks correct, and rows two onward fail on a step that reads
+# perfectly well.
+#
+# Nothing downstream can catch this. The locator is well-formed, it is
+# semantic, it is the kind of rung this whole schema argues for -- it is just
+# made of the wrong thing. It has to be caught where the recording is turned
+# into a use case, which is the last point at which "this value came from the
+# person's spreadsheet" is still known.
+
+#: Roles an element takes when it is a *result* rather than a control. A page
+#: does not author these; a search fills them in. ``option`` is the ARIA
+#: combobox/listbox pattern and the rest are its menu and tree equivalents.
+SUGGESTION_ROLES: frozenset[str] = frozenset(
+    {"option", "menuitem", "menuitemradio", "menuitemcheckbox", "treeitem"}
+)
+
+#: Steps that may sit between typing a search and clicking its result without
+#: breaking the connection between the two. Waiting for the dropdown, pressing
+#: Enter to open it, hovering an entry -- none of those change whose data the
+#: suggestion is showing.
+_BETWEEN_SEARCH_AND_RESULT: frozenset[str] = frozenset({"wait", "press", "hover"})
+
+
+def _names_a_row_value(step: "Step") -> bool:
+    """Whether this step typed something that differs from row to row."""
+    if step.action not in {"fill", "fill_form", "select", "press"}:
+        return False
+    return any(kind == "input" for kind, _ in step.references())
+
+
+def _after_a_per_row_search(steps: list["Step"], index: int) -> bool:
+    """Whether the nearest preceding typing action typed per-row data.
+
+    The nearest one decides, whichever way it decides: anything before it was
+    typed into a different control on a different part of the workflow, and
+    says nothing about this dropdown.
+    """
+    for earlier in reversed(steps[:index]):
+        if earlier.action in _BETWEEN_SEARCH_AND_RESULT:
+            continue
+        return _names_a_row_value(earlier)
+    return False
+
+
+#: Shorter than this, a recorded value is not evidence of anything. "A" or
+#: "12" appears inside half the labels on a page, and matching on one would
+#: strip the name off a perfectly good locator.
+_MIN_TELLTALE = 3
+
+
+def _echoes_a_recorded_value(locator: "Locator", recorded: list[str]) -> str:
+    """The recorded row value this locator's own text repeats, or "".
+
+    The second detector, and the certain one. When a dropdown echoes what was
+    typed -- search "C-1001", the suggestion reads "C-1001 Acme Ltd" -- the
+    locator contains, verbatim, a value the person told us is a per-row input.
+    That is not an inference about the page; it is the same string twice.
+
+    Works on any strategy, which is what makes it worth having beside the
+    role-based rule: a dropdown built from plain divs carries no ARIA role to
+    recognise, so nothing else can see it.
+    """
+    haystack = " ".join(locator.template_values()).casefold()
+    if not haystack.strip():
+        return ""
+    for value in recorded:
+        text = (value or "").strip()
+        if len(text) >= _MIN_TELLTALE and text.casefold() in haystack:
+            return text
+    return ""
+
+
+def data_derived_clicks(
+    steps: list["Step"], recorded_values: Iterable[str] = ()
+) -> list[int]:
+    """Indexes of steps whose locator was made out of the row's own data.
+
+    Two rules, and a step qualifies on either.
+
+    **A suggestion, after a per-row search.** The leading rung is a ``role``
+    rung whose role is one a page fills in rather than authors -- see
+    :data:`SUGGESTION_ROLES` -- it was recorded with a name, and the nearest
+    preceding typing action typed a template. That last condition is what saves
+    a static menu: a workflow that picks "Export as CSV" every row has a stable
+    name and nothing to fix, and rewriting it would throw away a good locator
+    and leave the step ambiguous among its siblings.
+
+    **A locator that repeats a recorded value.** The name or text contains,
+    verbatim, a value the person declared as a per-row input. Certain rather
+    than inferred, and it works on a dropdown built from plain divs, which
+    carries no role for the first rule to recognise.
+
+    **What neither catches**, stated so nobody mistakes this for complete: a
+    roleless dropdown whose text has no textual relationship to what was typed.
+    Nothing in the recording distinguishes that click from any other, and
+    guessing would strip the name off correct locators. That case is what the
+    warning, the review screen and a templated name are for.
+    """
+    values = [v for v in recorded_values if v]
+    found: list[int] = []
+    for index, step in enumerate(steps):
+        if step.action not in {"click", "select"} or not step.locators:
+            continue
+        lead = step.locators[0]
+
+        suggestion = (
+            lead.strategy == "role"
+            and lead.role in SUGGESTION_ROLES
+            and bool(lead.name)
+            and _after_a_per_row_search(steps, index)
+        )
+        if suggestion or (values and _echoes_a_recorded_value(lead, values)):
+            found.append(index)
+    return found
+
+
+def without_the_rows_data(locators: list["Locator"]) -> list["Locator"] | None:
+    """``locators`` with the recorded name dropped, or ``None`` if it cannot be.
+
+    The name is *removed*, never demoted to a fallback. A ladder is walked top
+    to bottom and the first rung matching exactly one element wins, so keeping
+    "Acme Ltd" as a later rung would do nothing on the rows where the search
+    narrows to one -- and on the rows where it does not, it would step past the
+    ambiguity refusal and click row one's customer. A demoted data locator is
+    worse than a deleted one, because it acts only when it is certainly wrong.
+
+    What is left is the role: "the suggestion in the list". That resolves
+    whenever the search narrows to a single hit, which is what searching by a
+    unique identifier does, and refuses loudly when it does not -- because at
+    that point the recording genuinely does not say which one a different row
+    should take.
+
+    ``None`` when every rung named the element by its text, which is what a
+    roleless dropdown gives you. There is nothing left once the text goes, and
+    inventing a locator for an element nobody here has seen is the one thing
+    this codebase never does.
+    """
+    usable = [loc for loc in locators if loc.strategy == "role" and loc.role]
+    if not usable:
+        return None
+    lead = usable[0]
+    return [lead.model_copy(update={"name": None, "exact": False, "has_text": None})]
+
+
+def strip_data_locators(
+    steps: list["Step"], recorded_values: Iterable[str] = ()
+) -> list[str]:
+    """Strip row-one's data out of any locator that was made from it.
+
+    Mutates ``steps`` and returns a warning per step changed. The recorded rung
+    is kept on the step as a ``rejected_locators`` entry -- visible on the
+    review screen, never executed -- because a reviewer deciding whether this
+    was the right call needs to see what the recording actually said.
+
+    Rewriting rather than only warning, because a warning alone leaves the
+    default behaviour wrong: the use case would publish, row one would pass,
+    and the batch would fail from row two onward on a step that reads perfectly
+    well. The rewrite is not a guess about the page either -- it drops
+    something the recording should never have carried and keeps what is left.
+    """
+    notes: list[str] = []
+    for index in data_derived_clicks(steps, recorded_values):
+        step = steps[index]
+        recorded = step.locators[0].describe()
+        replacement = without_the_rows_data(step.locators)
+        if replacement is None:
+            notes.append(
+                f"Step {step.id} clicks something the recording could only find by the text "
+                f"it showed on the row you recorded ({recorded}), and that text came from "
+                f"your data rather than from the page. It will look for that one record on "
+                f"every row. Edit the step's locator before publishing -- a column from your "
+                f"file can be used there as {{{{input.your_column}}}}."
+            )
+            continue
+        step.rejected_locators = [*step.rejected_locators, *step.locators]
+        step.locators = replacement
+        notes.append(
+            f"Step {step.id} clicks a suggestion from a search you filled with a value from "
+            f"your data, and the recording addressed it by the text it showed on the row you "
+            f"recorded ({recorded}). That text is row one's answer, not part of the page, so "
+            f"replaying it would look for that one record every time. The step now finds the "
+            f"suggestion by what it is ({replacement[0].describe()}), which works whenever the "
+            f"search narrows to a single hit. If yours can return several, edit the step's "
+            f"locator to say which -- a column from your file can be used there as "
+            f"{{{{input.your_column}}}}."
+        )
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+
+
+class Step(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id: str = Field(default_factory=lambda: f"s{uuid.uuid4().hex[:6]}")
+    action: Action
+    #: Human-readable, shown in the timeline and in failure messages.
+    description: str = ""
+
+    locators: list[Locator] = Field(default_factory=list)
+    #: navigate
+    url: str | None = None
+    #: fill / select / press / upload
+    value: str | None = None
+    #: fill_form
+    fields: list[FormField] = Field(default_factory=list)
+    #: extract_rows -- what to read out of each row the locator matches.
+    columns: list[ExtractColumn] = Field(default_factory=list)
+    #: extract -- read this attribute rather than the element's text. An href
+    #: is the usual reason: the identifier a later pass needs is in the link,
+    #: not in the words a person sees.
+    attribute: str = ""
+    #: extract -- the key this step's value lands under in the row's outputs.
+    output: str | None = None
+    #: script -- raw JavaScript. Refused unless the use case opts in.
+    code: str | None = None
+
+    assertion: Assertion | None = Field(default=None, alias="assert")
+    wait_for: WaitFor | None = None
+
+    optional: bool = False
+    on_failure: FailureMode = "abort"
+    timeout_ms: int = Field(default=30_000, ge=0, le=300_000)
+
+    #: Locator rungs the recorder saw fail. Kept for the review UI so a person
+    #: can see what was tried, never executed.
+    rejected_locators: list[Locator] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _action_has_what_it_needs(self) -> "Step":
+        if self.action in ELEMENT_ACTIONS and not self.locators:
+            raise ValueError(f"step {self.id!r}: action {self.action!r} requires at least one locator")
+        if self.action == "navigate" and not self.url:
+            raise ValueError(f"step {self.id!r}: 'navigate' requires a url")
+        if self.action == "assert" and self.assertion is None:
+            raise ValueError(f"step {self.id!r}: 'assert' requires an assertion")
+        if self.action == "extract" and not self.output:
+            raise ValueError(f"step {self.id!r}: 'extract' requires an output name")
+        if self.action == "script" and not self.code:
+            raise ValueError(f"step {self.id!r}: 'script' requires code")
+        if self.action == "fill_form" and not self.fields:
+            raise ValueError(f"step {self.id!r}: 'fill_form' requires at least one field")
+        if self.action == "extract_rows" and not self.columns:
+            raise ValueError(
+                f"step {self.id!r}: 'extract_rows' requires at least one column. "
+                "Without one it would find the rows and read nothing out of them."
+            )
+        if self.action == "download" and not self.output:
+            raise ValueError(
+                f"step {self.id!r}: 'download' requires an output name. The file is the "
+                "point of the step, and the name is how a later row finds it."
+            )
+        if self.action == "extract_rows" and not self.output:
+            raise ValueError(
+                f"step {self.id!r}: 'extract_rows' requires an output name to land under"
+            )
+        if self.action == "wait" and self.wait_for is None:
+            raise ValueError(f"step {self.id!r}: 'wait' requires wait_for")
+        if self.action == "press" and not self.value:
+            raise ValueError(f"step {self.id!r}: 'press' requires a key")
+        if self.action == "upload" and not self.value:
+            raise ValueError(f"step {self.id!r}: 'upload' requires a file path")
+        return self
+
+    @model_validator(mode="after")
+    def _selectors_are_never_templated(self) -> "Step":
+        """A templated *selector* is a selector-injection hole.
+
+        A templated accessible name is not, and the difference is which of them
+        is a query language -- see :data:`TEMPLATABLE_LOCATOR_FIELDS` for the
+        whole argument. ``selector`` and ``frames`` are CSS and stay closed;
+        the fields Playwright matches as plain strings are open, because a
+        search whose dropdown is filled from the row has no replayable locator
+        without them.
+        """
+        everywhere = [
+            *self.locators,
+            *self.rejected_locators,
+            *[loc for field in self.fields for loc in field.locators],
+        ]
+        for locator in everywhere:
+            offending = locator.templated_selector()
+            if offending:
+                raise ValueError(
+                    f"step {self.id!r}: templating is not allowed in a locator's "
+                    f"{offending} -- it is a CSS selector, and a row whose value "
+                    f"contained selector syntax would address a different element "
+                    f"({locator.describe()}). Match on a name, a label or a text "
+                    "filter instead, which are compared as plain strings."
+                )
+        return self
+
+    def references(self) -> set[tuple[str, str]]:
+        """Every ``(kind, name)`` this step's value-bearing fields reference."""
+        return template_refs(
+            {
+                "url": self.url,
+                "value": self.value,
+                "fields": [f.value for f in self.fields],
+                # Locators count too, now that a name may be templated. A step
+                # that finds its element by "{{input.customer_name}}" and does
+                # not declare that input would otherwise pass review and then
+                # look for the literal text on every row.
+                "locators": [loc.template_values() for loc in self.locators],
+                "field_locators": [
+                    loc.template_values() for f in self.fields for loc in f.locators
+                ],
+                "assert": self.assertion.value if self.assertion else None,
+                "wait": self.wait_for.value if self.wait_for else None,
+                # Script code counts. It used to be excluded because nothing
+                # substituted into it, so an input referenced there could never
+                # be filled -- which meant a recording that drove a form via
+                # JavaScript produced a use case with no inputs at all, asking
+                # for nothing and typing "{{input.full_name}}" into the page.
+                # render_code() makes the reference real, so it is now counted.
+                "code": self.code,
+            }
+        )
+
+    def summary(self) -> str:
+        if self.description:
+            return self.description
+        if self.action == "navigate":
+            return f"navigate to {self.url}"
+        if self.action == "assert" and self.assertion:
+            return f"assert {self.assertion.describe()}"
+        if self.locators:
+            return f"{self.action} {self.locators[0].describe()}"
+        return self.action
+
+
+# ---------------------------------------------------------------------------
+# A URL made of one sign-in's data
+# ---------------------------------------------------------------------------
+#
+# The same defect as the section above, in the address bar. Record a workflow
+# behind single sign-on and the recording captures URLs like
+#
+#   https://login.example.com/oauth2/authorize?client_id=...&state=Ab9xQ2zKp&nonce=Nn41Kd
+#   https://app.example.com/cb?code=0.AXkAr9&state=Ab9xQ2zKp&session_state=4f1c
+#
+# Every interesting part of those is single-use. `state` and `nonce` exist
+# precisely so that the identity provider can reject a second use of them;
+# `code` is exchanged once and burned. A recording that carries them replays a
+# sign-in that has already happened, which does not merely fail -- it fails at
+# the identity provider, with a message about a bad request, on a step that
+# looks like it is just visiting a page.
+#
+# None of this is inference. These parameter names are defined by OAuth 2.0,
+# OpenID Connect and SAML to be per-request; recognising them is reading a
+# specification, not guessing about a site.
+
+#: Query parameters that belong to one sign-in and never to the next.
+#:
+#: Deliberately a closed list of protocol artefacts. Anything a *site* invented
+#: stays, because this cannot know what it means -- and a parameter that varies
+#: per row is already handled, by being templated into `{{input.x}}` when the
+#: person says which column it came from.
+VOLATILE_QUERY_PARAMS: frozenset[str] = frozenset(
+    {
+        # OAuth 2.0 / OpenID Connect
+        "state", "nonce", "code", "code_challenge", "code_challenge_method",
+        "code_verifier", "session_state", "id_token", "id_token_hint",
+        "access_token", "refresh_token", "auth_token", "authuser",
+        # SAML 2.0
+        "samlrequest", "samlresponse", "relaystate", "sigalg", "signature",
+        # CAS, and the session keys several identity products put in the query
+        "ticket", "sessiondatakey", "execution", "client-request-id",
+        "jsessionid", "phpsessid", "sessionid", "session_id",
+    }
+)
+
+#: Parameters whose presence *identifies* a URL as an authorization request.
+#: Required by the specifications, so their absence means it is not one.
+_AUTHORIZE_MARKERS: frozenset[str] = frozenset({"response_type", "samlrequest"})
+
+#: Parameters whose presence identifies a URL as the *answer* to one.
+_CALLBACK_MARKERS: frozenset[str] = frozenset({"code", "samlresponse", "ticket"})
+
+
+def _query_names(url: str) -> set[str]:
+    parsed = urlparse(url)
+    return {name.lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+
+
+def is_authorization_request(url: str) -> bool:
+    """Whether this URL is a sign-in being *asked for*.
+
+    An OAuth authorization request carries ``response_type`` and ``client_id``;
+    a SAML one carries ``SAMLRequest``. Both are required by their
+    specification, which is what makes this a reading rather than a guess.
+    """
+    names = _query_names(url)
+    if "samlrequest" in names:
+        return True
+    return "response_type" in names and "client_id" in names
+
+
+def is_authorization_callback(url: str) -> bool:
+    """Whether this URL is a sign-in being *answered*.
+
+    Two co-occurring protocol parameters rather than one, because ``code`` on
+    its own is an ordinary word that a real application may well use for a
+    product code or a country code. ``code`` *with* ``state`` is an OAuth
+    redirect and nothing else.
+    """
+    names = _query_names(url)
+    if names & {"samlresponse"}:
+        return True
+    if "ticket" in names and "service" in names:  # CAS
+        return True
+    return "code" in names and "state" in names
+
+
+def strip_volatile_params(url: str) -> tuple[str, list[str]]:
+    """``url`` without its single-use parameters, and the names removed.
+
+    Works on the raw query text and keeps every surviving pair exactly as it
+    was recorded. Parsing the query and rebuilding it would have been shorter
+    and was wrong twice over: it re-encodes a ``redirect_uri`` that arrived
+    percent-encoded, and it escapes the braces of a parameter already
+    templated into ``{{input.x}}`` -- turning a working substitution into a
+    literal ``%7B%7Binput.x%7D%7D`` that matches nothing.
+
+    This is only allowed to *shorten* a URL. Everything it keeps, it keeps
+    byte for byte.
+    """
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url, []
+
+    kept: list[str] = []
+    removed: list[str] = []
+    for pair in parsed.query.split("&"):
+        if not pair:
+            continue
+        name = pair.split("=", 1)[0]
+        if name.lower() in VOLATILE_QUERY_PARAMS:
+            removed.append(name)
+        else:
+            kept.append(pair)
+    if not removed:
+        return url, []
+    return urlunparse(parsed._replace(query="&".join(kept))), removed
+
+
+def application_origin(urls: list[str]) -> str:
+    """Which of the recorded hosts is the *application*.
+
+    The first URL used to answer this, and behind single sign-on the first URL
+    is the identity provider -- so a use case recorded behind SSO bound
+    ``{{env.base_url}}`` to ``login.microsoftonline.com``. Promoting it to UAT
+    then repointed the identity provider at the UAT address, which is not a
+    thing anybody meant and is very hard to see in a diff.
+
+    Two rules, in order:
+
+    1. The first recorded URL that is not a sign-in request or its callback.
+       In an SSO recording that is the application; in every other recording it
+       is the first URL, which is what this always did.
+    2. Failing that, the ``redirect_uri`` of the authorization request itself.
+       An authorization request states where the application lives -- that is
+       what the parameter is for -- so this is reading the recording rather
+       than guessing at it.
+    """
+    for url in urls:
+        if not is_authorization_request(url) and not is_authorization_callback(url):
+            return _origin(url)
+
+    for url in urls:
+        if not is_authorization_request(url):
+            continue
+        for name, value in parse_qsl(urlparse(url).query, keep_blank_values=True):
+            if name.lower() == "redirect_uri" and value:
+                origin = _origin(value)
+                if origin:
+                    return origin
+    return _origin(urls[0]) if urls else ""
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def clean_recorded_urls(steps: list["Step"]) -> list[str]:
+    """Take one sign-in's data out of the URLs a recording captured.
+
+    Mutates ``steps`` and returns a warning per change. Two different edits,
+    because the two shapes fail differently.
+
+    **A navigation that is only a callback is dropped.** ``…/cb?code=…&state=…``
+    is not a step anybody took -- it is the browser being sent somewhere by the
+    identity provider -- and there is nothing left of it once the single-use
+    parameters go: a bare callback endpoint with no code is an error page.
+    Replaying it is replaying a consumed authorization code. The sign-in steps
+    above it put the browser here again on their own.
+
+    **Everything else keeps its URL, minus the volatile parameters.** Including
+    an authorization request: it still has to be visited, and with a fresh
+    ``state`` minted by the identity provider rather than last week's.
+    """
+    notes: list[str] = []
+    dropped: list[Step] = []
+
+    for step in steps:
+        if step.action != "navigate" or not step.url:
+            continue
+
+        if is_authorization_callback(step.url):
+            dropped.append(step)
+            notes.append(
+                f"Step {step.id} was the page your identity provider redirected the "
+                f"browser to after signing in, and its address was almost entirely a "
+                f"one-time code. Nobody types that address, and replaying it would "
+                f"replay a code that has already been used, so the step has been "
+                f"removed -- signing in again puts the browser there by itself."
+            )
+            continue
+
+        cleaned, removed = strip_volatile_params(step.url)
+        if not removed:
+            continue
+        step.url = cleaned
+        notes.append(
+            f"Step {step.id} recorded a web address carrying {_and_list(removed)}, "
+            f"{'which belongs' if len(set(removed)) == 1 else 'which belong'} to the "
+            f"sign-in you did while recording and "
+            f"{'is' if len(set(removed)) == 1 else 'are'} refused the second time "
+            f"{'it is' if len(set(removed)) == 1 else 'they are'} used. Taken out of the "
+            f"address; the rest of it is unchanged."
+        )
+
+    for step in dropped:
+        steps.remove(step)
+
+    for step in steps:
+        check = step.assertion
+        if check is None or check.kind != "url_contains" or not check.value:
+            continue
+        cleaned, removed = strip_volatile_params(check.value)
+        if removed:
+            step.assertion = check.model_copy(update={"value": cleaned})
+            notes.append(
+                f"Step {step.id} checked the address for {_and_list(removed)}, which is "
+                f"different on every sign-in. The check now ignores those."
+            )
+    return notes
+
+
+def _and_list(names: list[str]) -> str:
+    quoted = [f"'{name}'" for name in dict.fromkeys(names)]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+
+
+# ---------------------------------------------------------------------------
+# Steps that were never the workflow
+# ---------------------------------------------------------------------------
+#
+# `playwright codegen` records keystrokes, and a person filling a form uses Tab
+# to get between the fields. What lands in the script is a `press` aimed at
+# whatever happened to have focus at that moment -- in one real recording,
+# `press Shift+Tab` on the "Forgot password?" link, twice, in the middle of a
+# login. Nobody meant those as steps. They are how a person's hands move.
+#
+# They are also actively harmful: each one is a locator that has to resolve
+# before the workflow can continue, pointing at a control chosen by the tab
+# order rather than by the task. Dropping them is safe because `fill` focuses
+# the element it fills, so a Tab before a fill was already redundant, and
+# focusing the next field blurs the last one exactly as tabbing away would.
+
+#: Keys that move focus and change nothing else. Deliberately just these two:
+#: Enter submits, Escape dismisses, the arrows choose from a list -- every
+#: other key a recording captures may be the point of the step.
+FOCUS_KEYS: frozenset[str] = frozenset({"tab", "shift+tab"})
+
+
+def drop_focus_keystrokes(steps: list["Step"]) -> list[str]:
+    """Remove the Tab presses a recording captured. Mutates ``steps``."""
+    doomed = [
+        step
+        for step in steps
+        if step.action == "press" and (step.value or "").strip().casefold() in FOCUS_KEYS
+    ]
+    for step in doomed:
+        steps.remove(step)
+    if not doomed:
+        return []
+    keys = ", ".join(sorted({(step.value or "").strip() for step in doomed}))
+    return [
+        f"{len(doomed)} keystroke(s) that only moved the cursor between fields ({keys}) "
+        f"were left out. They are how your hands moved while recording, not part of the "
+        f"task, and replaying them means finding whichever control the tab order happened "
+        f"to reach."
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Shapes that cannot replay
+# ---------------------------------------------------------------------------
+#
+# Checked when a use case is *published*, which is the point the product says
+# "this may now run over a thousand rows". Both of these are certain: neither
+# is a judgement about a site, and neither can be rescued by healing a locator.
+#
+# They exist because both failures are silent in the worst way. The first
+# produces a step that can never match anything, and the draft already said so
+# in a warning that publishing was happy to ignore. The second produces a batch
+# where row one passes and every row after it fails, which reads as flakiness
+# and is actually arithmetic.
+
+#: Phrases that end a session, however a site words it.
+_SIGN_OUT = ("sign out", "signout", "log out", "logout", "sign off", "signoff")
+
+#: Phrases that start one.
+_SIGN_IN = ("sign in", "signin", "log in", "login", "log on", "continue")
+
+
+def _leading_name(step: "Step") -> str:
+    if not step.locators:
+        return ""
+    lead = step.locators[0]
+    return (lead.name or lead.text or "").strip().casefold()
+
+
+def _is_unnameable(locator: "Locator") -> bool:
+    """A structural wrapper with no accessible name.
+
+    ``Snapshot.locate`` refuses these outright, and says why: ``generic`` with
+    no name describes half the wrappers on any real page, so "the 25th one" is
+    a near-arbitrary element. A step whose *every* rung is one of these cannot
+    resolve, ever.
+    """
+    return (
+        locator.strategy == "role"
+        and (locator.role or "") in STRUCTURAL_ROLES_WITHOUT_MEANING
+        and not (locator.name or "").strip()
+    )
+
+
+#: Kept here rather than imported from `snapshot` so the schema does not depend
+#: on the parser. The two lists mean the same thing and are asserted equal by
+#: `tests/test_usecase.py`.
+STRUCTURAL_ROLES_WITHOUT_MEANING: frozenset[str] = frozenset(
+    {"generic", "group", "none", "presentation"}
+)
+
+
+def ends_the_session(step: "Step") -> bool:
+    name = _leading_name(step)
+    return step.action == "click" and any(phrase in name for phrase in _SIGN_OUT)
+
+
+def establishes_the_session(steps: list["Step"]) -> bool:
+    """Whether these steps sign in.
+
+    Either a credential is typed, or something that reads like a sign-in
+    control is clicked. The first is the reliable half -- a `{{secret.x}}`
+    going into a field is what signing in *is*, as far as this schema can see.
+    """
+    for step in steps:
+        if any(kind == "secret" for kind, _ in step.references()):
+            return True
+        if step.action == "click" and any(
+            phrase in _leading_name(step) for phrase in _SIGN_IN
+        ):
+            return True
+    return False
+
+
+def unreplayable_reasons(use_case: "UseCase") -> list[str]:
+    """Why no run of this use case can work, or an empty list.
+
+    This blocks publishing, so the bar is absolute: a step here cannot succeed
+    on *any* row, so letting it through guarantees a failed run and there is
+    nothing a person could know that would make it fine.
+
+    Anything that breaks only *across* rows belongs in
+    :func:`unbatchable_reasons` instead, and anything that is merely unwise
+    belongs in ``warnings``. Getting that boundary wrong turned a recording
+    somebody had just spent ten minutes on into a dead end they could only
+    delete, which is a worse outcome than the failing run it was preventing.
+    """
+    reasons: list[str] = []
+    for step in use_case.all_steps:
+        if step.locators and all(_is_unnameable(loc) for loc in step.locators):
+            reasons.append(
+                f"Step {step.id} ({step.summary()}) can only find its element by "
+                f"counting anonymous page wrappers -- there is no name and no role that "
+                f"means anything, so it cannot work on any record. Two ways out, both on "
+                f"this screen: press Edit beside the step's locator and point it at "
+                f"something with a real name, or remove the step if the workflow does "
+                f"not need it."
+            )
+    return reasons
+
+
+def unbatchable_reasons(use_case: "UseCase") -> list[str]:
+    """Why this use case cannot run over *many* records, or an empty list.
+
+    Separate from :func:`unreplayable_reasons` because the failure is
+    arithmetic about rows rather than a broken step: a single record runs
+    perfectly, and the second one cannot. So this is checked when a batch
+    starts -- where it is certain and where it is actionable -- and not when
+    the use case is published, where it would refuse something the person may
+    only ever intend to run once.
+    """
+    reasons: list[str] = []
+    signs_out = [step for step in use_case.row_steps if ends_the_session(step)]
+    if (
+        signs_out
+        and establishes_the_session(use_case.setup_steps)
+        and not establishes_the_session(use_case.row_steps)
+        and use_case.session_check is None
+    ):
+        first = signs_out[0]
+        reasons.append(
+            f"Step {first.id} signs out at the end of every record, and signing *in* "
+            f"happens once for the whole run rather than once per record -- that is what "
+            f"keeps a thousand records from signing in a thousand times. So record one "
+            f"would work and every record after it would fail with nothing signed in. "
+            f"Three ways to fix it: remove the sign-out step, move the sign-in steps "
+            f"into the per-record section so each record signs in for itself, or add a "
+            f"session check so the run notices it has been signed out and signs in "
+            f"again. A single record runs fine as it stands."
+        )
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +1724,30 @@ class UseCase(BaseModel):
             if step.id in seen:
                 raise ValueError(f"duplicate step id {step.id!r}")
             seen.add(step.id)
+        return self
+
+    @model_validator(mode="after")
+    def _published_steps_must_be_replayable(self) -> "UseCase":
+        """A *published* use case may not contain a step that cannot run.
+
+        Publishing is the point the product says "this may now run over a
+        thousand rows", so it is the right place to refuse a shape that will
+        produce a thousand failures. The draft carried these as warnings, and a
+        warning that publishing ignores is not a gate -- which is how a use case
+        whose own draft said "a replay cannot trust this" came to be published
+        and then failed exactly as predicted.
+
+        See :func:`unreplayable_reasons`; only certainties are listed there.
+        """
+        if self.status != "ready":
+            return self
+        reasons = unreplayable_reasons(self)
+        if reasons:
+            raise ValueError(
+                "This cannot be published yet, because a step in it cannot work on "
+                "any record:" + NEWLINE + NEWLINE
+                + (NEWLINE + NEWLINE).join(f"- {reason}" for reason in reasons)
+            )
         return self
 
     @model_validator(mode="after")

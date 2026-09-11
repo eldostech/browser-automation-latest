@@ -6,6 +6,7 @@ import type {
   CredentialSummary,
   DatasetSummary,
   BatchEstimate,
+  Locator,
   Target,
   UseCase,
   UseCaseMode,
@@ -279,6 +280,54 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         await load();
       });
 
+  // A recorded ladder is what codegen happened to write; a healed one is what
+  // a model picked off the page. Both are usually right and neither is always
+  // right, and the only remedy for one wrong rung used to be re-recording the
+  // whole workflow -- which throws away every other step to fix one.
+  const editLocators =
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') =>
+    (stepId: string, locators: Locator[]) =>
+      act(async () => {
+        if (!useCase) return;
+        const patch = (step: UseCaseStep) =>
+          step.id === stepId ? { ...step, locators } : step;
+        const next =
+          phase === 'row_reset'
+            ? { ...useCase, row_reset: useCase.row_reset ? patch(useCase.row_reset) : null }
+            : { ...useCase, [phase]: useCase[phase].map(patch) };
+        await api.updateUseCase(usecaseId, next as UseCase);
+        setNotice(`Rewrote how ${stepId} finds its element. Saved as a new version.`);
+        await load();
+      });
+
+  const checkLocators = useCallback(
+    (locators: Locator[], url: string) => api.checkLocators(usecaseId, url, locators),
+    [usecaseId],
+  );
+
+  // Where a step runs, so "check on a page" has somewhere to open. The nearest
+  // preceding navigate is the honest answer: a step is reached by running the
+  // ones above it, and the last of those that named a URL is the page it acts
+  // on. Falls back to the recorded base, which is better than an empty box.
+  const pageUrlFor = useCallback(
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') => (stepId: string) => {
+      if (!useCase) return '';
+      const before: UseCaseStep[] =
+        phase === 'row_reset'
+          ? useCase.row_reset
+            ? [useCase.row_reset]
+            : []
+          : [...useCase.setup_steps, ...(phase === 'row_steps' ? useCase.row_steps : [])];
+      const index = before.findIndex((step) => step.id === stepId);
+      const searched = index < 0 ? before : before.slice(0, index + 1);
+      for (let i = searched.length - 1; i >= 0; i -= 1) {
+        if (searched[i].action === 'navigate' && searched[i].url) return searched[i].url!;
+      }
+      return useCase.base_url ?? '';
+    },
+    [useCase],
+  );
+
   // Saved on blur rather than behind a button: it is one number, and a
   // "Save" next to a single field is ceremony. A new version is written, as
   // for any other edit, so the change is versioned and auditable.
@@ -457,7 +506,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           Back
         </button>
         {error ? (
-          <div className="banner error">{error}</div>
+          <div className="banner error" style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
         ) : (
           <BrandSpinner state="working" label="Loading…" />
         )}
@@ -708,6 +757,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             steps={useCase.setup_steps}
             onRemove={removeStep('setup_steps')}
             onEditField={editStep('setup_steps')}
+            onEditLocators={editLocators('setup_steps')}
+            onCheckLocators={checkLocators}
+            pageUrlFor={pageUrlFor('setup_steps')}
           />
           {useCase.row_reset && (
             <UseCaseSteps
@@ -715,6 +767,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               hint="Puts the browser back to a known state so one row cannot inherit the last one's state."
               steps={[useCase.row_reset]}
               onEditField={editStep('row_reset')}
+              onEditLocators={editLocators('row_reset')}
+              onCheckLocators={checkLocators}
+              pageUrlFor={pageUrlFor('row_reset')}
             />
           )}
           <UseCaseSteps
@@ -722,6 +777,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             steps={useCase.row_steps}
             onRemove={removeStep('row_steps')}
             onEditField={editStep('row_steps')}
+            onEditLocators={editLocators('row_steps')}
+            onCheckLocators={checkLocators}
+            pageUrlFor={pageUrlFor('row_steps')}
           />
 
           {(useCase.dropped ?? []).length > 0 && (

@@ -36,7 +36,7 @@ from codegen import parse
 from engine import UseCaseExecutor
 from fields import FieldSet
 from routers.recordings import build_usecase
-from usecase import Locator, Step
+from usecase import InputSpec, Locator, Step
 
 pytestmark = [
     pytest.mark.anyio,
@@ -176,6 +176,128 @@ TWINS = """<!doctype html>
 """
 
 
+#: A hidden twin of a visible control -- the shape every responsive site has,
+#: where a nav is rendered twice and one copy is display:none at the current
+#: width.
+#:
+#: Which rung this breaks is worth being precise about, because the obvious
+#: guess is wrong. `get_by_role` reads the accessibility tree, and a
+#: display:none element is not in it, so a *role* rung never saw the twin. A
+#: `text` or `css` rung is matched against the DOM, and does. Those are the
+#: fallback rungs -- `_ladder` puts a text rung under every named role rung --
+#: so the twin costs nothing until the day the role rung stops matching, and
+#: then the ladder falls through to a rung that is refused as ambiguous by an
+#: element nobody can see.
+HIDDEN_TWIN = """<!doctype html>
+<html><head><title>Twin</title></head><body>
+  <div id="mobile-nav" style="display:none"><span>Continue</span></div>
+  <main>
+    <button type="button" id="real">Continue</button>
+    <p id="outcome"></p>
+  </main>
+  <script>
+    document.getElementById('real').onclick = function () {
+      document.getElementById('outcome').textContent = 'continued';
+    };
+  </script>
+</body></html>
+"""
+
+#: The same button name on every row of a table. Nothing but the row it sits
+#: in tells them apart, which is what `within` is for.
+ROWS = """<!doctype html>
+<html><head><title>Customers</title></head><body>
+  <table>
+    <tbody>
+      <tr><td>Acme Ltd</td><td><button type="button" class="edit">Edit</button></td></tr>
+      <tr><td>Globex</td><td><button type="button" class="edit">Edit</button></td></tr>
+      <tr><td>Initech</td><td><button type="button" class="edit">Edit</button></td></tr>
+    </tbody>
+  </table>
+  <p id="outcome"></p>
+  <script>
+    document.querySelectorAll('tr').forEach(function (row) {
+      row.querySelector('button').onclick = function () {
+        document.getElementById('outcome').textContent =
+          'editing ' + row.querySelector('td').textContent;
+      };
+    });
+  </script>
+</body></html>
+"""
+
+#: A form inside an iframe. Before frames were recordable this was not a hard
+#: page to automate -- it was an impossible one.
+PAYMENT_FRAME = """<!doctype html>
+<html><head><title>Card</title></head><body>
+  <label>Card number <input id="card" name="card"></label>
+</body></html>
+"""
+
+CHECKOUT = """<!doctype html>
+<html><head><title>Checkout</title></head><body>
+  <h1>Checkout</h1>
+  <iframe id="pay" src="/payment-frame.html" title="Payment"></iframe>
+</body></html>
+"""
+
+#: A link that opens a second tab. The run has to follow it, or every step
+#: after this one runs against a page nobody is looking at.
+NEW_TAB = """<!doctype html>
+<html><head><title>Reports</title></head><body>
+  <a id="open" href="/orders.html" target="_blank">Open the order form</a>
+</body></html>
+"""
+
+
+#: A search box whose dropdown shows something *other* than what was typed.
+#:
+#: Typing a customer number opens a list of customer *names*, and the name has
+#: no textual relationship to the number at all. `playwright codegen` records
+#: the click on that suggestion by its accessible name, so the recording ends
+#: up carrying row one's answer -- "Acme Ltd" -- as the thing to look for on
+#: every subsequent row.
+CUSTOMER_SEARCH = """<!doctype html>
+<html><head><title>Customer search</title></head><body>
+  <h1>Customers</h1>
+  <label for="q">Customer number</label>
+  <input id="q" role="combobox" aria-controls="results" aria-expanded="false"
+         aria-autocomplete="list" placeholder="Customer number">
+  <ul id="results" role="listbox" hidden></ul>
+  <p id="chosen"></p>
+  <script>
+    var CUSTOMERS = [
+      {number: 'C-1001', name: 'Acme Ltd'},
+      {number: 'C-1002', name: 'Globex Corporation'},
+      {number: 'C-1003', name: 'Initech'}
+    ];
+    var box = document.getElementById('q');
+    var list = document.getElementById('results');
+    box.addEventListener('input', function () {
+      var typed = box.value.trim().toUpperCase();
+      list.innerHTML = '';
+      var hits = typed ? CUSTOMERS.filter(function (c) {
+        return c.number.toUpperCase().indexOf(typed) === 0;
+      }) : [];
+      hits.forEach(function (c) {
+        var item = document.createElement('li');
+        item.setAttribute('role', 'option');
+        item.textContent = c.name;
+        item.onclick = function () {
+          document.getElementById('chosen').textContent = 'Selected ' + c.name;
+          list.hidden = true;
+          box.setAttribute('aria-expanded', 'false');
+        };
+        list.appendChild(item);
+      });
+      list.hidden = hits.length === 0;
+      box.setAttribute('aria-expanded', String(hits.length > 0));
+    });
+  </script>
+</body></html>
+"""
+
+
 @pytest.fixture(scope="module")
 def site(tmp_path_factory):
     """A two-page static site on a random port."""
@@ -190,6 +312,12 @@ def site(tmp_path_factory):
     (root / "orders.html").write_text(ORDERS, encoding="utf-8")
     (root / "invite.html").write_text(INVITE, encoding="utf-8")
     (root / "twins.html").write_text(TWINS, encoding="utf-8")
+    (root / "hidden-twin.html").write_text(HIDDEN_TWIN, encoding="utf-8")
+    (root / "rows.html").write_text(ROWS, encoding="utf-8")
+    (root / "checkout.html").write_text(CHECKOUT, encoding="utf-8")
+    (root / "payment-frame.html").write_text(PAYMENT_FRAME, encoding="utf-8")
+    (root / "new-tab.html").write_text(NEW_TAB, encoding="utf-8")
+    (root / "search.html").write_text(CUSTOMER_SEARCH, encoding="utf-8")
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -803,3 +931,435 @@ async def test_two_identical_controls_fail_as_ambiguous_rather_than_as_missing(s
     assert not result.ok
     assert "ambiguous" in result.error
     assert "matched 2" in result.error
+
+
+# ---------------------------------------------------------------------------
+# What only a real browser can show
+# ---------------------------------------------------------------------------
+#
+# Every test below covers something an accessibility-snapshot fake cannot
+# express, which is why each one had to be a real-browser test or no test at
+# all. Visibility, stacking, frame boundaries and tabs are properties of a
+# rendered document; a parsed YAML tree has none of them.
+
+
+async def test_a_hidden_twin_does_not_make_a_visible_control_ambiguous(site):
+    """The responsive-site shape: a nav rendered twice, one copy display:none.
+
+    The rung here is `text`, which is what every recorded ladder falls through
+    to once its role rung stops matching -- and text is matched against the
+    DOM, so `count()` reports the copy nobody can see. This used to be refused
+    as ambiguous, and the row failed on a page a person would call
+    unambiguous. Counting what is visible is the whole fix.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="hidden twin",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/hidden-twin.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="text", text="Continue", exact=True)],
+            ),
+            Step(
+                id="s3",
+                action="assert",
+                **{"assert": {"kind": "text_present", "value": "continued"}},
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}], step_timeout=5.0)
+    assert results[0].ok, results[0].error
+
+
+async def test_a_row_scoped_locator_clicks_the_row_it_names(site):
+    """Three "Edit" buttons, and the recording says which one by saying where.
+
+    Without `within` the only expressible answers were "an Edit button", which
+    is refused as ambiguous, and "the second Edit button", which is a claim
+    about ordering. This is the third answer, and it is the one a person means.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="scoped",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/rows.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[
+                    Locator(
+                        strategy="role",
+                        role="button",
+                        name="Edit",
+                        within=Locator(strategy="role", role="row", has_text="Globex"),
+                    )
+                ],
+            ),
+            Step(
+                id="s3",
+                action="assert",
+                **{"assert": {"kind": "text_present", "value": "editing Globex"}},
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}], step_timeout=5.0)
+    assert results[0].ok, results[0].error
+
+
+async def test_an_unscoped_locator_on_the_same_page_is_still_refused(site):
+    """The companion to the test above, and the reason it is worth having.
+
+    Scoping must be what resolves the ambiguity, not a general loosening. Three
+    identical buttons with nothing said about which one is still three.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="unscoped",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/rows.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="role", role="button", name="Edit")],
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}], step_timeout=3.0)
+    assert not results[0].ok
+    assert "3" in (results[0].error or ""), results[0].error
+
+
+async def test_a_field_inside_an_iframe_can_be_filled(site):
+    """An element in a frame is not hard to find from the page: it is absent.
+
+    Both spellings codegen writes for the hop are covered -- the recorded form
+    here, and `page.locator(...).content_frame` through the parser test.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="iframe",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/checkout.html"),
+            Step(
+                id="s2",
+                action="fill",
+                value="4242424242424242",
+                locators=[
+                    Locator(
+                        strategy="role",
+                        role="textbox",
+                        name="Card number",
+                        frames=["iframe#pay"],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    _, browser_url, results = await execute(use_case, site, [{}], step_timeout=5.0)
+    assert results[0].ok, results[0].error
+
+
+async def test_an_iframes_contents_appear_in_the_snapshot(site):
+    """The other half of the frame work, and the one healing depends on.
+
+    A repair proposed from a failure context can only name controls the
+    snapshot contains. While `aria_snapshot` was read from the main frame's
+    body alone, every control in a frame was invisible to it -- so a step that
+    broke inside a payment form could not be repaired at all.
+    """
+    config = BrowserConfig(headless=True, timeout_ms=10_000)
+    async with PlaywrightSession(config) as browser:
+        await browser.page.goto(f"{site}/checkout.html")
+        await browser.settle()
+        snapshot = await browser.snapshot()
+
+    names = [node.name for node in snapshot]
+    assert "Card number" in names, names
+
+
+async def test_a_click_that_opens_a_tab_is_followed(site):
+    """Before this, the run went on driving the page underneath the new tab.
+
+    The failure that produced was the hardest kind to read: the click
+    succeeded, and a step several later failed with "could not find" on a page
+    that had never been wrong.
+    """
+    from usecase import UseCase
+
+    use_case = UseCase(
+        name="new tab",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/new-tab.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[
+                    Locator(strategy="role", role="link", name="Open the order form")
+                ],
+            ),
+            # Only reachable on the page the link opened.
+            Step(
+                id="s3",
+                action="fill",
+                value="A-2048",
+                locators=[Locator(strategy="placeholder", text="Order reference")],
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}], step_timeout=5.0)
+    assert results[0].ok, results[0].error
+
+
+# ---------------------------------------------------------------------------
+# Checking a locator before saving it
+# ---------------------------------------------------------------------------
+
+
+async def test_the_locator_check_says_what_each_rung_actually_matches(site):
+    """The answer somebody editing a locator could not get before.
+
+    A rung reads perfectly well and matches nothing, or matches four things.
+    Without this the only way to find out was to run the use case, where an
+    ambiguous rung shows up as a thirty-second timeout on row one of a batch.
+    """
+    from engine import probe_locators
+
+    class Settings:
+        browser_engine = "chromium"
+        browser_headless = True
+        replay_step_timeout = 10.0
+
+    report = await probe_locators(
+        [
+            Locator(strategy="role", role="button", name="Edit"),
+            Locator(
+                strategy="role",
+                role="button",
+                name="Edit",
+                within=Locator(strategy="role", role="row", has_text="Globex"),
+            ),
+            Locator(strategy="role", role="button", name="Archive"),
+        ],
+        url=f"{site}/rows.html",
+        settings=Settings(),
+        timeout_ms=10_000,
+    )
+
+    ambiguous, scoped, missing = report["results"]
+
+    assert ambiguous["visible"] == 3 and not ambiguous["ok"]
+    assert "ambiguous" in ambiguous["reason"]
+
+    assert scoped["visible"] == 1 and scoped["ok"]
+    assert scoped["reason"] == ""
+
+    assert missing["total"] == 0 and not missing["ok"]
+    assert "matches nothing" in missing["reason"]
+
+
+async def test_the_locator_check_reports_both_counts(site):
+    """The gap between the two is worth showing rather than hiding.
+
+    "Matches 2, one of them visible" tells somebody their page carries a hidden
+    duplicate -- which they may want to know about their site as much as about
+    their locator, and which decides whether the rung is safe to keep.
+    """
+    from engine import probe_locators
+
+    class Settings:
+        browser_engine = "chromium"
+        browser_headless = True
+        replay_step_timeout = 10.0
+
+    report = await probe_locators(
+        [Locator(strategy="text", text="Continue", exact=True)],
+        url=f"{site}/hidden-twin.html",
+        settings=Settings(),
+        timeout_ms=10_000,
+    )
+
+    only = report["results"][0]
+    assert only["total"] == 2, "the DOM holds both copies"
+    assert only["visible"] == 1, "a person sees one"
+    assert only["ok"], "and that is not ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# A locator made of row one's data
+# ---------------------------------------------------------------------------
+
+
+def search_script(base: str) -> str:
+    """What `playwright codegen` writes for "search by number, pick the hit".
+
+    The last line is the whole problem: the suggestion is addressed by the
+    customer *name*, which is not what was typed and is not the same on the
+    next row.
+    """
+    return f'''import asyncio
+from playwright.async_api import Playwright, async_playwright, expect
+
+
+async def run(playwright: Playwright) -> None:
+    browser = await playwright.chromium.launch(headless=False)
+    context = await browser.new_context()
+    page = await context.new_page()
+    await page.goto("{base}/search.html")
+    await page.get_by_placeholder("Customer number").fill("C-1001")
+    await page.get_by_role("option", name="Acme Ltd").click()
+
+    # ---------------------
+    await context.close()
+    await browser.close()
+'''
+
+
+def searching(base: str):
+    """The recording above, parameterised on the customer number as the
+    product would parameterise it: the typed value is the input column."""
+    from usecase import UseCase
+
+    declared = FieldSet.from_payload(
+        [{"name": "customer_number", "value": "C-1001", "secret": False}]
+    )
+    use_case = build_usecase(
+        parse(search_script(base)),
+        name="Open a customer",
+        description="",
+        declared=declared,
+    )
+    use_case.status = "ready"
+    use_case.allowed_domains = ["127.0.0.1"]
+    use_case.row_reset = Step(id="reset", action="navigate", url=f"{base}/search.html")
+    return use_case
+
+
+async def test_a_suggestion_picked_by_name_replays_for_a_different_customer(site):
+    """The defect, stated as the behaviour that has to hold.
+
+    Row one searches C-1001 and picks "Acme Ltd". Row two searches C-1002,
+    whose suggestion reads "Globex Corporation" -- a name the recording has
+    never seen and cannot contain. A step that looks for "Acme Ltd" fails on
+    every row but the one it was recorded on, which makes the whole recording
+    good for exactly one customer.
+    """
+    use_case = searching(site)
+
+    _, _, results = await execute(
+        use_case,
+        site,
+        [{"customer_number": "C-1001"}, {"customer_number": "C-1002"}],
+        step_timeout=5.0,
+    )
+
+    assert results[0].ok, results[0].error
+    assert results[1].ok, f"row two must not look for row one's customer: {results[1].error}"
+
+    # Not passing by accident: the recorded name is gone from what executes,
+    # kept where a reviewer can see it, and the draft said so.
+    click = use_case.row_steps[-1]
+    assert [loc.describe() for loc in click.locators] == ["role=option"]
+    assert any("Acme Ltd" in loc.describe() for loc in click.rejected_locators)
+    assert any("row one's answer" in warning for warning in use_case.warnings)
+
+
+async def test_a_search_that_narrows_to_several_refuses_rather_than_picking_one(site):
+    """The other half, and the reason the rewrite is safe.
+
+    Searching "C-100" matches all three customers. The recording does not say
+    which one a different row should take -- it only ever saw one -- so the
+    honest answer is to stop. Clicking the first would be the same silent
+    wrong-record failure in a new costume.
+
+    This is also why the recorded name is deleted rather than demoted to a
+    fallback rung: a ladder takes the first rung that matches exactly one, so a
+    demoted "Acme Ltd" would sit unused on every row that works and fire on
+    exactly the rows that are ambiguous -- acting only when it is certainly
+    wrong.
+    """
+    use_case = searching(site)
+
+    _, _, results = await execute(
+        use_case, site, [{"customer_number": "C-100"}], step_timeout=3.0
+    )
+
+    assert not results[0].ok
+    assert "ambiguous" in (results[0].error or ""), results[0].error
+
+
+async def test_a_column_from_the_file_can_name_the_suggestion(site):
+    """The complete fix, for somebody whose file has the name as well.
+
+    "The option called {{input.customer_name}}" is the locator a person would
+    write, and the blanket ban on templating inside a locator made it
+    unexpressible -- which is why the recorded name was the only option and the
+    recorded name was wrong.
+    """
+    use_case = searching(site)
+    use_case.inputs.append(InputSpec(name="customer_name", required=True))
+    use_case.row_steps[-1].locators = [
+        Locator(strategy="role", role="option", name="{{input.customer_name}}", exact=True)
+    ]
+
+    _, _, results = await execute(
+        use_case,
+        site,
+        [
+            {"customer_number": "C-100", "customer_name": "Initech"},
+            {"customer_number": "C-100", "customer_name": "Globex Corporation"},
+        ],
+        step_timeout=5.0,
+    )
+
+    assert results[0].ok, results[0].error
+    assert results[1].ok, results[1].error
+
+
+async def test_a_failed_templated_locator_reports_what_it_looked_for(site):
+    """The standing objection to templating a locator at all: "when it stops
+    matching you cannot tell whether the site changed or the input did."
+
+    Answered by reporting both. The step is named by its definition, which is
+    the template, and what was tried is named by the rendered form -- so the
+    failure reads "looking for {{input.customer_name}}, tried 'Umbrella PLC'"
+    and the reader can see at a glance that the substitution happened and the
+    page did not have it. Either half alone leaves the question open.
+    """
+    use_case = searching(site)
+    use_case.inputs.append(InputSpec(name="customer_name", required=True))
+    use_case.row_steps[-1].locators = [
+        Locator(strategy="role", role="option", name="{{input.customer_name}}", exact=True)
+    ]
+
+    _, _, results = await execute(
+        use_case,
+        site,
+        [{"customer_number": "C-1001", "customer_name": "Umbrella PLC"}],
+        step_timeout=3.0,
+    )
+
+    error = results[0].error or ""
+    assert not results[0].ok
+    assert "Tried: role=option name=\"Umbrella PLC\"" in error, error
+    assert "{{input.customer_name}}" in error, "and which template produced it"

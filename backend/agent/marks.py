@@ -217,7 +217,47 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
     exact = _needs_exact(snapshot, node)
     matches = count_matches(snapshot, node, exact)
     ladder: list[Locator] = []
-    if node.role:
+
+    # An unnamed wrapper has nothing of its own to match on, so the rung this
+    # used to produce was `role=generic [24]` -- "the 25th anonymous div" --
+    # which cannot be replayed, and was published anyway on a draft whose own
+    # warning said so.
+    #
+    # Such a wrapper almost always *contains* something named: a profile card
+    # wraps a radio with a person's name on it, a tile wraps its own heading.
+    # That control is what the step is recorded against instead. Clicking it
+    # and clicking the wrapper around it do the same thing on any page where
+    # the wrapper is the control -- and it is the rung a repair produced by
+    # hand the last time one of these broke, on the page this was found on.
+    #
+    # Not a guess about the page: the name is read out of the element's own
+    # subtree, and it is only used when it resolves to exactly one control.
+    inside = _named_inside(snapshot, node) if _needs_a_name(node) else None
+    if inside is not None:
+        ladder.append(
+            Locator(
+                strategy="role",
+                role=inside.role,
+                name=inside.name or None,
+                exact=bool(inside.name),
+            )
+        )
+        # The wrapper, narrowed by the same text, behind it -- but only when
+        # that text tells it apart from every other wrapper of its role. A
+        # `has_text` shared with an ancestor has narrowed nothing while
+        # looking as though it has.
+        label = (inside.name or inside.text or "").strip()
+        if _narrows_by_text(snapshot, node, label):
+            ladder.append(
+                Locator(strategy="role", role=node.role, has_text=label)
+            )
+        # Counted against the rung that is actually going to be used. Left as
+        # the wrapper's count, every message below would describe an ambiguity
+        # the ladder no longer has -- "that matches 4 elements" printed under a
+        # locator that matches one, which is worse than saying nothing.
+        matches = count_matches(snapshot, inside, True)
+
+    if node.role and not ladder:
         ladder.append(
             Locator(
                 strategy="role",
@@ -246,8 +286,79 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
         # see Node.interactive. Combined with no name at all, position is the
         # *only* thing distinguishing this from its siblings, and position
         # among anonymous wrappers is not a property of the control.
-        unreliable=matches > 1 and not node.interactive and not node.name,
+        # Only when nothing inside it could name it either. With a name
+        # borrowed from its contents the rung is no longer positional, so
+        # the whole objection -- "position among anonymous wrappers is not a
+        # property of the control" -- no longer applies.
+        unreliable=(
+            matches > 1
+            and not node.interactive
+            and not node.name
+            and inside is None
+        ),
     )
+
+
+
+def _needs_a_name(node: Node) -> bool:
+    """Whether this node has nothing of its own to be found by."""
+    return not (node.name or "").strip() and not node.interactive
+
+
+def _named_inside(snapshot: Snapshot, node: Node) -> "Node | None":
+    """The nearest *uniquely* named control inside ``node``, or ``None``.
+
+    Nearest rather than best: the first named descendant in document order is
+    the one a person reading the page would use to refer to the wrapper, and
+    anything cleverer would be this code having an opinion about a page it has
+    seen once.
+
+    Unique, because the whole point is to replace a rung that cannot resolve
+    with one that can. A descendant whose own role and name match three
+    elements has swapped one ambiguity for another, so it is refused and the
+    wrapper stays flagged as unreliable -- which is the honest answer.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(node)
+    except ValueError:
+        return None
+
+    for other in nodes[start + 1 :]:
+        if other.depth <= node.depth:
+            break
+        if not (other.name or "").strip() or not other.interactive:
+            continue
+        if count_matches(snapshot, other, True) == 1:
+            return other
+    return None
+
+
+def _narrows_by_text(snapshot: Snapshot, node: Node, label: str) -> bool:
+    """Whether ``label`` tells this wrapper apart from every other of its role.
+
+    Counted over the snapshot rather than assumed. An ancestor of the wrapper
+    contains the label too -- a list containing every card contains every
+    card's text -- so a rung built on it would read precisely and resolve
+    ambiguously, which is the failure this is replacing.
+    """
+    if not label:
+        return False
+    wanted = label.casefold()
+    nodes = list(snapshot)
+    holders = 0
+    for index, other in enumerate(nodes):
+        if other.role != node.role:
+            continue
+        for inner in nodes[index + 1 :]:
+            if inner.depth <= other.depth:
+                break
+            if wanted in (inner.name or inner.text or "").casefold():
+                holders += 1
+                break
+        if holders > 1:
+            return False
+    return holders == 1
 
 
 def _needs_exact(snapshot: Snapshot, node: Node) -> bool:

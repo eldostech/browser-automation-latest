@@ -28,9 +28,19 @@ class FakeStore:
     def __init__(self) -> None:
         self.appended: list[object] = []
         self.finished: list[dict] = []
+        #: One entry per batch written, so a test can tell "four events" from
+        #: "four round trips" -- which is the whole point of batching them.
+        self.batches: list[int] = []
 
     async def append_event(self, event: object) -> None:
         self.appended.append(event)
+
+    async def append_events(self, events: list) -> None:
+        self.batches.append(len(events))
+        self.appended.extend(events)
+
+    async def record_steps(self, rows: list) -> None:
+        return None
 
     async def mark_started(self, run_id: str) -> None:
         return None

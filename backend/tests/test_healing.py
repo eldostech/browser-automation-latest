@@ -385,3 +385,84 @@ def test_no_factory_means_no_healer_even_when_enabled(tmp_path):
         EventBus(),
     )
     assert manager.make_healer() is None
+
+
+# --- what gets remembered, and when ----------------------------------------
+
+
+class RecordingMemory:
+    """A healing memory that only records what it was asked to write."""
+
+    def __init__(self) -> None:
+        self.written: list[dict] = []
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def recall(self, **_: object) -> list:
+        return []
+
+    async def remember(self, **fields: object) -> None:
+        self.written.append(dict(fields))
+
+
+async def test_proposing_a_repair_does_not_remember_it_yet():
+    """The write used to happen here, which recorded what the model *believed*
+    about a page rather than what turned out to be true of it."""
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert repair is not None
+    assert memory.written == [], "nothing is known yet about whether this worked"
+
+
+async def test_a_repair_that_worked_is_remembered():
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, True)
+
+    assert len(memory.written) == 1
+    assert memory.written[0]["new_locator"]["name"] == "Log in"
+
+
+async def test_a_repair_that_failed_is_not_remembered():
+    """The case the old write could not see, and the one that matters.
+
+    Recall puts past fixes in front of the model as context, so a confident
+    wrong answer does not merely fail to help -- it argues for repeating
+    itself, every time that site breaks again.
+    """
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, False)
+
+    assert memory.written == []
+
+
+async def test_a_repair_the_model_was_unsure_of_is_not_remembered_even_when_it_worked():
+    """A guess that happened to land is still a guess, and it is exactly the
+    answer not to offer as evidence next time."""
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+    repair.confidence = "low"
+
+    await healer.confirm(repair, True)
+
+    assert memory.written == []
+
+
+async def test_confirming_without_a_memory_is_harmless():
+    """A healer built without an embedder has no memory behind it, and the
+    executor calls `confirm` on every repair regardless."""
+    healer = StepHealer(ChoosingLLM(index=2))
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, True)

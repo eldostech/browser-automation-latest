@@ -400,3 +400,82 @@ async def test_batches_are_listed_for_a_use_case(client: TestClient):
     batches = client.get(f"/api/usecases/{usecase_id}/batches").json()["batches"]
     assert len(batches) == 1
     assert batches[0]["total"] == 3
+
+
+# --- a use case that runs one record but cannot run many -------------------
+
+
+async def test_a_row_that_signs_out_is_refused_when_a_batch_is_asked_for(
+    client: TestClient,
+):
+    """The failure behind "record one worked and everything after failed".
+
+    Refused here rather than at publish, and that placement is the whole
+    point: the use case runs a single record perfectly, so blocking it earlier
+    left somebody with a recording they could only delete. Here the person has
+    just asked for many records, which is exactly when it matters.
+    """
+    from conftest import app_workspace
+
+    data = await app_workspace(client.app)
+    signing_out = {
+        **USE_CASE,
+        "id": "uc-signs-out",
+        "session_check": None,
+        "row_steps": [
+            *USE_CASE["row_steps"],
+            {
+                "id": "s-out",
+                "action": "click",
+                "locators": [{"strategy": "role", "role": "link", "name": "Sign out"}],
+            },
+        ],
+    }
+    usecase_id, _ = await data.save_usecase(signing_out)
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/batch",
+        json={"csv": CSV, "credential_id": credential(client)},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "signs out at the end of every record" in detail
+    assert "single record runs fine" in detail, "says what does still work"
+    assert "session check" in detail, "and names a way to fix it"
+
+
+async def test_that_same_use_case_still_runs_one_record(client: TestClient):
+    """The other half of the argument for where the check lives."""
+    from conftest import app_workspace
+
+    data = await app_workspace(client.app)
+    signing_out = {
+        **USE_CASE,
+        "id": "uc-signs-out-single",
+        "session_check": None,
+        "row_steps": [
+            *USE_CASE["row_steps"],
+            {
+                "id": "s-out",
+                "action": "click",
+                "locators": [{"strategy": "role", "role": "link", "name": "Sign out"}],
+            },
+        ],
+    }
+    usecase_id, _ = await data.save_usecase(signing_out)
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/execute",
+        json={
+            "inputs": {"record_url": "https://example.com/record/1"},
+            "credential_id": credential(client),
+        },
+    )
+
+    # Accepted and run. Whether the run then succeeds is the page's business --
+    # this double has no "Sign out" link on it -- and what matters here is that
+    # the request was not refused. A single record is not the shape the batch
+    # gate is about.
+    assert response.status_code == 201, response.text
+    assert "signs out at the end of every record" not in response.text

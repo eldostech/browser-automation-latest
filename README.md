@@ -39,6 +39,7 @@ favours being obvious over being clever.
 - [The API](#the-api)
 - [Guardrails](#guardrails)
 - [Tests](#tests)
+- [When the database is somewhere else](#when-the-database-is-somewhere-else)
 - [Deployment](#deployment)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
@@ -469,17 +470,131 @@ row succeeded*. Without an assertion, a batch of a thousand rows can fail
 silently on row 12 and report success on all of them.
 
 Lines the parser could not represent are listed rather than guessed at — a
-chained locator, an iframe, a file upload. It refuses instead of approximating,
-because the alternative is a step that clicks something *adjacent* on row one.
+filter by locator, a scope deeper than the schema allows, a file upload. It
+refuses instead of approximating, because the alternative is a step that clicks
+something *adjacent* on row one.
 
 A draft can also warn that a step's locator **matched more than one element
 when it was recorded** — a "Chat" button that exists once per row of a list,
 say. The click itself always landed on the right one; what got saved is a
 description (role and name) durable enough to survive a redesign, and on a
-repeated-element page that description can fit several controls. Replay will
-refuse to guess among them rather than act on the wrong row, so this is worth
-fixing before publishing: re-record the step pointing at something that names
-the right row or card, not just the control inside it.
+repeated-element page that description can fit several controls. Replay refuses
+to guess among them rather than act on the wrong row, so this is worth fixing
+before publishing.
+
+#### Recording behind single sign-on
+
+An SSO login puts a great deal of one-off machinery in the address bar, and the
+recording captures it. Three things used to go wrong at once, and all three are
+handled now.
+
+**The use case belonged to the wrong site.** `{{env.base_url}}` was bound to
+whatever host the address bar was on when recording started — behind SSO, the
+identity provider. Promoting that use case to UAT repointed *the identity
+provider* at the UAT address. The application is now found by reading the
+recording: the first address that is not a sign-in request or its callback, or
+failing that the `redirect_uri` the sign-in request itself carries.
+
+**Single-use parameters are taken out.** `state`, `nonce`, `code`,
+`code_challenge`, `SAMLRequest`, `session_state`, `sessionDataKey` and their
+relatives exist so the identity provider can refuse a second use of them. They
+are removed from every recorded address; the rest of the address is kept byte
+for byte, including anything mapped to a column. Recognising them is reading
+OAuth, OpenID Connect and SAML, not guessing about your site — only names those
+specifications define are touched, so a parameter your own application invented
+is never removed.
+
+**The page you were redirected back to is not a step.** Nobody types
+`…/cb?code=…&state=…`; the browser was sent there. Everything in it is spent,
+and replaying it replays a consumed authorization code, so the step is dropped —
+signing in again puts the browser there by itself. A `code` on its own is left
+alone, because that is an ordinary word for a product code; it takes `code` *and*
+`state` together to mean OAuth.
+
+Every one of those edits is reported on the draft, so you can see what was taken
+out before you publish.
+
+#### A locator made of your data
+
+One warning is worth calling out because the failure it prevents is silent. If
+your workflow types something from your file into a search and clicks a
+suggestion, `playwright codegen` records that suggestion by the text it showed
+— the customer *name*, when what you typed was the customer *number*. That text
+is row one's answer, not part of the page. Replaying it looks for that one
+record on every row, so row one passes, the recording looks correct, and every
+row after it fails on a step that reads perfectly well.
+
+The draft catches this and takes the name out, leaving the step to find the
+suggestion by what it *is*. That works whenever the search narrows to a single
+hit, which is what searching by a unique identifier does, and refuses loudly
+when it does not — because at that point the recording genuinely does not say
+which one a different row should take. The text that was removed is shown on
+the step, struck through, so you can see what the recording said.
+
+Two shapes are caught: a click on a suggestion after you typed per-row data
+into a search, and any locator whose text repeats a value you declared as an
+input. A dropdown with no roles in its markup *and* no textual relationship to
+what you typed cannot be told apart from an ordinary click, so it is not
+caught — if your search works that way, check that step before publishing.
+
+If your file has the name as well as the number, say so in the locator:
+`{{input.customer_name}}` works in a name, a label, a placeholder, alt text or
+a text filter. It is still refused in a CSS selector, where a value would be
+spliced into a query language.
+
+**You can fix it here, without re-recording.** Every step's locator ladder is
+editable on the review screen: reorder the rungs, remove one, add a fallback,
+or narrow a rung by saying *where* the element is — the Invite button in the
+dialog, the Edit link in the row mentioning Acme Ltd. "Check on a page" opens
+the page and reports what each rung actually matches before anything is saved,
+so an ambiguous rung is a sentence on screen rather than a thirty-second
+timeout on row one of a batch. Saving writes a new version, like every other
+edit.
+
+#### How a step finds its element
+
+A locator is a **ladder**, tried from the top; the first rung matching exactly
+one visible element wins, and the ones below it are what the step falls back on
+when the site changes. Each rung says what to look for and, optionally, where:
+
+| Field | What it does |
+|---|---|
+| strategy | `role` + name is the durable one. `label`, `placeholder`, `alt text` and `test id` are recorded when codegen writes them. `text` and CSS are markup, and are walked last. |
+| whole name only | Playwright matches a name as a substring by default, so `Invite` also finds `+ Invite User`. |
+| inside | Search within another element, which may itself be scoped. This is the answer to almost every real ambiguity. |
+| containing | Keep only matches holding this text. How a row is picked out of a table. |
+| position | Which of several matches. `0` means none given, and a rung matching several is refused rather than guessed at. |
+| inside frames | CSS selectors for the iframes to descend through. An element inside a frame is not on the page as far as every other rung is concerned. |
+
+#### What publishing refuses
+
+Most of what a draft says is advice. Two things are refusals, because they are
+not judgements about your site — they are arithmetic, and publishing them
+produces a run that was always going to fail.
+
+**A step that can only count anonymous page wrappers.** A locator like
+`role=generic [24]` means "the 25th unnamed `div`". There is nothing to match
+on, so the step cannot work on any row however many times it is retried. Fix it
+by editing the locator on this screen, or re-record the step against something
+with a real name.
+
+That is the only thing publishing refuses. One more is refused when you ask for
+a **batch**, because it is only broken across records:
+
+**A row that signs out, when signing in is setup.** Signing in runs once for a
+whole batch, deliberately: a thousand records must not sign in a thousand times.
+A record that ends by signing out destroys that shared session, so record one
+works and every record after it fails with nothing signed in. That reads as the
+tool being unreliable and is really just this. Three ways to fix it: remove the
+sign-out step, move the sign-in into the per-record section so each record signs
+in for itself, or add a session check so the run notices it has been signed out
+and signs in again. A single record runs fine either way, which is why this is
+not checked at publish.
+
+Keyboard navigation is also left out of a recording now. Tabbing between fields
+records a keypress aimed at whichever control the tab order reached — in one real
+recording, `Shift+Tab` on a "Forgot password?" link inside a login. Those are how
+your hands moved, not part of the task.
 
 ### 4. Upload data and confirm the mapping
 
@@ -656,6 +771,8 @@ likely to touch:
 |---|---|---|
 | `REPLAY_SCREENSHOTS` | `final` | `off`, `failure`, `final`, `every_step`. |
 | `REPLAY_FAILURE_STREAK_LIMIT` | `5` | Consecutive failures before the batch stops. |
+| `EVENT_FLUSH_INTERVAL` | `0.2` | How long a run's events may wait before being written. Bounds staleness of the live view, not loss. |
+| `EVENT_FLUSH_MAX_BATCH` | `200` | Events that may pile up before a write happens regardless. |
 | `REPLAY_HEALING_ENABLED` | `false` | **Off by default: this is the one thing that spends tokens.** |
 | `HEALING_MEMORY_ENABLED` | `true` | Needs pgvector. |
 | `EMBEDDING_BACKEND` | `bedrock` | `hash` is a deterministic stand-in with no AWS. |
@@ -683,7 +800,7 @@ Bearer token on every route except `/healthz` and `/api/auth/login`.
 | **Recording — do it myself** | `POST /api/recordings`, `GET /api/recordings/{id}`, `POST /api/recordings/{id}/save`, `/cancel`, `DELETE` |
 | **Recording — describe it** | `POST /api/agent-sessions`, `GET /api/agent-sessions/{id}`, `POST /{id}/decide`, `/save`, `/cancel` (needs the agent extra installed) |
 | **Agent tool servers** | `GET/POST /api/agent-tool-servers`, `DELETE /{id}`, `POST /preview` — what an agent session may reach for beyond the browser |
-| **Use cases** | `GET/PUT/PATCH/DELETE /api/usecases/{id}`, `/publish`, `/repair`, `/scripts`, `/activity` |
+| **Use cases** | `GET/PUT/PATCH/DELETE /api/usecases/{id}`, `/publish`, `/repair`, `/scripts`, `/activity`, `/locator-check` |
 | **Data** | `POST /api/datasets` (multipart), `GET /api/datasets`, `POST /api/usecases/{id}/mapping` |
 | **Running** | `POST /api/usecases/{id}/execute`, `/batch`, `GET /api/batches/{id}`, `/resume`, `/cancel`, `/results.csv` |
 | **Watching** | `GET /api/runs/{id}`, `/events`, `/steps`, `WS /api/runs/{id}/stream`, `GET /api/artifacts/{id}` |
@@ -779,6 +896,51 @@ Frontend:
 ```bash
 cd frontend && npm run typecheck && npm run build
 ```
+
+---
+
+## When the database is somewhere else
+
+On one machine none of this matters. Move the database and the artifact store
+into another rack and the shape of the work changes: a step that spends five
+milliseconds on the page can spend most of a second waiting on a socket.
+
+So the replay path does not write as it goes. A run's events are collected and
+written **in one statement**, step rows are written **once per row**, and the
+cross-process notification is **one per batch on a connection that stays open**
+— it used to open a fresh Postgres connection, with its TCP handshake, its TLS
+handshake and its authentication, for every single event. Measured on a
+ten-step row:
+
+| | Remote round trips per row |
+|---|---|
+| Before | 94 |
+| After | 5 |
+
+The per-step cost is now essentially zero: what remains is per-row and constant,
+so a longer workflow does not cost proportionally more waiting.
+
+**None of that is traded against accuracy.** An event reaches a watcher only
+*after* it is on disk, so `seq` remains a resume token you can trust — a
+reconnecting client is never told about an event a catch-up read cannot return.
+A batch is flushed at the end of every row and again when the run ends, before
+the run is marked finished, so what a hard kill can lose is at most the row in
+flight, and the run's own status and results are written separately.
+
+**And it does not make the live view slower.** The dashboard was never reading
+the database while a run was going: the WebSocket serves each watcher from an
+in-memory queue and touches storage only to catch up after a reconnect. What
+changed is that steps stopped queueing behind writes nobody was waiting for.
+
+`EVENT_FLUSH_INTERVAL` bounds how stale the live view may be, not how much can
+be lost. Raise it for a database several hops away; set it to `0` to write every
+event as it happens.
+
+Two other reads went the same way. The visual diff uses the screenshot bytes
+already in memory instead of fetching back what it just uploaded, and a step's
+baseline image is fetched once per run rather than once per row — it is the same
+image on every row, so a thousand-row batch was fetching one object a thousand
+times.
 
 ---
 

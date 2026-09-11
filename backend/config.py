@@ -152,6 +152,24 @@ class Settings(BaseSettings):
     #: STORAGE_BACKEND on S3 before choosing it for a large batch.
     replay_screenshots: Literal["off", "failure", "final", "every_step"] = "final"
 
+    #: How long a run's events may wait before being written, in seconds.
+    #:
+    #: Events are written in batches (see `eventbuffer.py`). This is the bound
+    #: on how stale the live view may be, not a bound on loss: a batch is also
+    #: flushed at the end of every row and on the way out, and an event is
+    #: published to watchers only after it is durable.
+    #:
+    #: The default is well under the threshold where a person reads a delay as
+    #: a stall. Raise it for a database several hops away and a run with very
+    #: chatty steps; set it near zero to get the old behaviour of a write per
+    #: event, which is what you want only when debugging this machinery.
+    event_flush_interval: float = Field(default=0.2, ge=0.0, le=5.0)
+
+    #: How many events may accumulate before a flush happens regardless of the
+    #: interval. Bounds memory and keeps one batch from growing large enough
+    #: that writing it becomes its own latency problem.
+    event_flush_max_batch: int = Field(default=200, ge=1, le=5_000)
+
     #: Self-healing. OFF by default, and deliberately so: it is the best
     #: defence against a site redesign and also the easiest way to turn a free
     #: batch back into an expensive one. Only steps whose `on_failure` is

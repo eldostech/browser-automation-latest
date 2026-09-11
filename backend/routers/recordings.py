@@ -36,7 +36,18 @@ from deps import WorkspaceData, get_vault, require
 from fields import FieldSet, parameterise
 from recorder import Recorder, RecorderUnavailable
 from routers.schemas import SaveRecordingRequest, StartRecordingRequest
-from usecase import Assertion, InputSpec, Locator, SecretSpec, Step, UseCase
+from usecase import (
+    Assertion,
+    InputSpec,
+    Locator,
+    SecretSpec,
+    Step,
+    UseCase,
+    application_origin,
+    clean_recorded_urls,
+    drop_focus_keystrokes,
+    strip_data_locators,
+)
 
 log = logging.getLogger(__name__)
 
@@ -320,11 +331,29 @@ def build_usecase(
             clone.url = parameterise(clone.url, substitutions)
         steps.append(clone)
 
+    # Done here, immediately after parameterisation and nowhere later: this is
+    # the last point at which "that text came from the person's spreadsheet" is
+    # still known. See `data_derived_clicks` for the defect.
+    data_locator_notes = strip_data_locators(
+        steps, [field.value for field in declared.fields if not field.secret]
+    )
+
+    # Before the origin is chosen, because dropping a callback step changes
+    # which URLs are left to choose from. See `clean_recorded_urls`.
+    url_notes = clean_recorded_urls(steps)
+    key_notes = drop_focus_keystrokes(steps)
+
     # The recording holds the addresses of the environment it was made in. Bind
     # them to {{env.base_url}} so the same document runs in dev, UAT and
     # production, and keep the recorded origin on the use case so dev needs no
     # configuration at all. See §8.4 of the design document.
-    origin = _origin_of(recording.start_url or "")
+    #
+    # *Which* origin is not simply the first one recorded. Behind single
+    # sign-on the first URL is the identity provider, and binding the template
+    # to that means promoting the use case repoints the identity provider at
+    # the UAT address. `application_origin` reads the recording for the
+    # application instead.
+    origin = application_origin(recording.urls)
     if origin:
         for step in steps:
             if step.url:
@@ -419,7 +448,12 @@ def build_usecase(
         # Declared in the order they were pointed at, which is the order the
         # results file gets its columns in.
         outputs=list(reversed(outputs)),
-        warnings=_warnings(recording, setup),
+        warnings=[
+            *_warnings(recording, setup),
+            *url_notes,
+            *key_notes,
+            *data_locator_notes,
+        ],
         dropped=[
             f"line {item.line}: {item.source} -- {item.reason}"
             for item in recording.unsupported
@@ -463,14 +497,6 @@ def _ladder_for(locator: Locator) -> list[Locator]:
     """
     return _ladder(locator)
 
-
-
-def _origin_of(url: str) -> str:
-    """Scheme and host, which is the part that changes between environments."""
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return ""
-    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _bind_origin(url: str, origin: str) -> str:

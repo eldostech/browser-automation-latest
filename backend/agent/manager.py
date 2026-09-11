@@ -318,6 +318,14 @@ class AgentSessions:
                 ) as session:
                     record._session = session
                     result = await session.start()
+                    # Flushed *before* the status changes, not after. `_absorb`
+                    # is what makes the new status visible to a client, and
+                    # nothing may be visible before the events explaining it
+                    # are readable -- see `_flush`. Doing it the other way round
+                    # also puts an await between the status becoming
+                    # "awaiting_approval" and the decision future existing,
+                    # which is a window for an answer to arrive and be refused.
+                    await _flush(run.sink)
                     self._absorb(record, result)
 
                     # Hold the browser open while a person decides. The agent is
@@ -326,6 +334,7 @@ class AgentSessions:
                     while record.status == "awaiting_approval":
                         decision = await self._wait_for_decision(record)
                         result = await session.resume(decision)
+                        await _flush(run.sink)
                         self._absorb(record, result)
 
                 run.finish(
@@ -440,6 +449,24 @@ class AgentSessions:
         if running:
             await asyncio.gather(*running, return_exceptions=True)
         self._sessions.clear()
+
+
+async def _flush(sink: Any) -> None:
+    """Write out whatever this session's events are still buffered.
+
+    Called every time the session's *observable* status changes, and that is
+    the point: `record.status` is what a client polls, and it is set inside the
+    run's lifecycle rather than at the end of it. Without this a session could
+    report "awaiting_approval" -- or "succeeded" -- while the events explaining
+    why had not reached the database, so the approval card a person was being
+    asked to answer would not be in the run they were reading.
+
+    A status must never outrun its own events. `RunLifecycle` enforces that at
+    the end of a run; this enforces it at each of the points in between.
+    """
+    flush = getattr(sink, "flush", None)
+    if flush is not None:
+        await flush()
 
 
 def _stamped(sink: Any):

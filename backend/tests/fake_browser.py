@@ -55,6 +55,82 @@ class FakeLocator:
         chosen = self._nodes[index : index + 1] if index < len(self._nodes) else []
         return FakeLocator(self._page, chosen, f"{self._describe}[{index}]")
 
+    def filter(self, has_text: str | None = None, visible: bool | None = None) -> "FakeLocator":
+        """`visible=True` is the identity here, and that is not a shortcut.
+
+        An accessibility snapshot only contains what is in the accessibility
+        tree, so every node this fake holds is one a person could reach. The
+        engine's visible-first counting therefore behaves here exactly as it
+        does on a page with no hidden duplicates, which is the case the
+        existing tests were written against. The case it exists *for* -- a
+        hidden twin of a visible control -- cannot be expressed in a snapshot
+        at all, and is covered against a real browser in `test_e2e_engine.py`.
+        """
+        nodes = self._nodes
+        if has_text is not None:
+            wanted = has_text.casefold()
+            nodes = [
+                node
+                for node in nodes
+                if wanted in (node.name or "").casefold()
+                or wanted in (node.text or "").casefold()
+            ]
+        described = self._describe
+        if has_text is not None:
+            described = f"{described} has_text={has_text!r}"
+        return FakeLocator(self._page, nodes, described)
+
+    # -- as a scope ---------------------------------------------------------
+    #
+    # A locator is also a place to search inside. The fake resolves a scope by
+    # searching the whole snapshot and then keeping what falls under the
+    # scope's node, which is what the indentation of an accessibility tree
+    # means. Enough to tell "the button in the dialog" from "the button in the
+    # sidebar", which is the whole point of `within`.
+    def _descendants(self) -> list:
+        snapshot = self._page._snapshot()
+        nodes = list(snapshot)
+        kept: list = []
+        for scope in self._nodes:
+            start = nodes.index(scope) if scope in nodes else -1
+            if start < 0:
+                continue
+            for node in nodes[start + 1 :]:
+                if node.depth <= scope.depth:
+                    break
+                kept.append(node)
+        return kept
+
+    def _scoped(self, produce) -> "FakeLocator":
+        allowed = self._descendants()
+        found = produce(self._page)
+        return FakeLocator(
+            self._page,
+            [node for node in found._nodes if node in allowed],
+            f"{found._describe} in {self._describe}",
+        )
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        return self._scoped(lambda page: page.get_by_role(role, name, exact))
+
+    def get_by_label(self, text: str, exact: bool = False, **_: Any):
+        return self._scoped(lambda page: page.get_by_label(text, exact))
+
+    def get_by_placeholder(self, text: str, exact: bool = False, **_: Any):
+        return self._scoped(lambda page: page.get_by_placeholder(text, exact))
+
+    def get_by_alt_text(self, text: str, exact: bool = False, **_: Any):
+        return self._scoped(lambda page: page.get_by_alt_text(text, exact))
+
+    def get_by_test_id(self, text: str):
+        return self._scoped(lambda page: page.get_by_test_id(text))
+
+    def get_by_text(self, text: str, exact: bool = False, **_: Any):
+        return self._scoped(lambda page: page.get_by_text(text, exact))
+
+    def locator(self, selector: str):
+        return self._scoped(lambda page: page.locator(selector))
+
     def _require(self):
         if not self._nodes:
             raise FakeTimeout(f"Timeout: no element matches {self._describe}")
@@ -180,6 +256,28 @@ class FakePage:
     async def screenshot(self, **_: Any) -> bytes:
         return PNG
 
+    def is_closed(self) -> bool:
+        return False
+
+    async def bring_to_front(self) -> None:
+        return None
+
+    @property
+    def frames(self) -> list:
+        """No child frames. A fake that invented one would let a frame rung
+        pass here and fail against a real page."""
+        return []
+
+    def frame_locator(self, selector: str) -> FakeLocator:
+        """Matches nothing, for the same reason `locator` does for CSS.
+
+        A frame cannot be resolved against an accessibility snapshot, so
+        pretending otherwise would let a test pass on a rung the real engine
+        would have to fall through. Frames are covered against a real browser
+        in `test_e2e_engine.py`.
+        """
+        return FakeLocator(self, [], f"frame={selector!r}")
+
     # -- locators -----------------------------------------------------------
     def get_by_role(
         self, role: str, name: str | None = None, exact: bool = False
@@ -289,6 +387,14 @@ class FakeBrowserSession:
     @property
     def url(self) -> str:
         return self._page.url
+
+    async def settle(self, timeout_ms: int | None = None) -> None:
+        """Already settled. The fake serves whole pages, never half of one."""
+        return None
+
+    async def adopt_new_page(self) -> str:
+        """No popups. A fake that opened tabs would be testing itself."""
+        return ""
 
     async def snapshot(self):
         snap = parse_snapshot(self._page.text)

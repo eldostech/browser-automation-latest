@@ -554,6 +554,45 @@ class WorkspaceStore:
             await session.execute(stmt)
             await session.commit()
 
+    async def append_events(self, events: "list[AgentEvent]") -> None:
+        """Insert many events in one statement, one transaction, one round trip.
+
+        The reason this exists rather than a loop over :meth:`append_event`:
+        against a database in another rack, a replayed step used to pay three
+        round trips per event -- the pool's pre-ping, the INSERT and the COMMIT
+        -- four or five times over. None of that latency is on the path of
+        anything a person is waiting for. An event is a record *about* work
+        that already happened.
+
+        **Duplicate seqs inside one batch are collapsed, keeping the last.**
+        Not an optimisation: ``thinking`` events deliberately reuse a seq while
+        the model streams, and Postgres refuses an ``ON CONFLICT DO UPDATE``
+        that would touch the same row twice in a single statement. Keeping the
+        last is also exactly the semantics the single-row path had -- the final
+        text wins.
+        """
+        if not events:
+            return
+        latest: dict[tuple[str, int], dict[str, Any]] = {}
+        for event in events:
+            payload = dump_event(event)
+            latest[(event.run_id, event.seq)] = {
+                "run_id": event.run_id,
+                "seq": event.seq,
+                "ts": utcnow(),
+                "type": payload["type"],
+                "payload": payload,
+            }
+
+        stmt = pg_insert(Event).values(list(latest.values()))
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Event.run_id, Event.seq],
+            set_={"ts": stmt.excluded.ts, "payload": stmt.excluded.payload},
+        )
+        async with self._sessions() as session:
+            await session.execute(stmt)
+            await session.commit()
+
     async def get_events(
         self, run_id: str, after_seq: int = 0, limit: int = 5000
     ) -> list[AgentEvent]:
@@ -1353,6 +1392,27 @@ class WorkspaceStore:
             log.error(
                 "failed to record a step",
                 extra={"run_id": fields.get("run_id"), "error": str(exc)},
+            )
+
+    async def record_steps(self, rows: "list[dict[str, Any]]") -> None:
+        """Write many step rows in one transaction.
+
+        Never raises, for the reason :meth:`record_step` gives: a step row is a
+        record about work that already happened, and losing one must not fail
+        the row it describes. Written as a batch because a remote database
+        charges for the round trip, not for the rows.
+        """
+        if not rows:
+            return
+        try:
+            async with self._sessions() as session:
+                session.add_all([RunStep(workspace_id=self._ws, **row) for row in rows])
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "failed to record %d step(s)",
+                len(rows),
+                extra={"run_id": rows[0].get("run_id"), "error": str(exc)},
             )
 
     async def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:

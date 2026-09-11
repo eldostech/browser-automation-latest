@@ -480,3 +480,139 @@ def test_importing_is_recorded_against_whoever_did_it(client: TestClient):
     ).json()
     actions = [entry["action"] for entry in activity["entries"]]
     assert "usecase.import" in actions
+
+
+# ---------------------------------------------------------------------------
+# Editing a locator, and checking it before saving
+# ---------------------------------------------------------------------------
+
+
+def editable(**overrides: Any) -> dict[str, Any]:
+    """A use case whose locators a reviewer would want to change."""
+    definition = {
+        "id": "1a2b3c4d5e6f70819a2b3c4d5e6f7081",
+        "name": "Edit a customer",
+        "status": "draft",
+        "base_url": "https://example.com",
+        "allowed_domains": ["example.com"],
+        "row_steps": [
+            {"id": "s1", "action": "navigate", "url": "https://example.com/customers"},
+            {
+                "id": "s2",
+                "action": "click",
+                "locators": [{"strategy": "role", "role": "button", "name": "Edit"}],
+            },
+        ],
+    }
+    return {**definition, **overrides}
+
+
+def test_a_locator_can_be_rewritten_as_a_scope_and_saved(client: TestClient):
+    """The edit this whole surface exists for.
+
+    A recorded ladder is what codegen happened to write and a healed one is
+    what a model picked off the page. Both are usually right and neither is
+    always right, and until this existed the only remedy for one wrong rung
+    was re-recording the workflow -- throwing away every other step to fix one.
+    """
+    created = client.post("/api/usecases/import", json=editable())
+    assert created.status_code == 201, created.text
+    usecase_id = created.json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["row_steps"][1]["locators"] = [
+        {
+            "strategy": "role",
+            "role": "button",
+            "name": "Edit",
+            "exact": True,
+            "within": {"strategy": "role", "role": "row", "has_text": "Acme Ltd"},
+        }
+    ]
+
+    saved = client.put(f"/api/usecases/{usecase_id}", json=definition)
+    assert saved.status_code == 201, saved.text
+
+    after = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    rung = after["row_steps"][1]["locators"][0]
+    assert rung["within"]["has_text"] == "Acme Ltd"
+    assert rung["exact"] is True
+
+
+def test_editing_a_locator_writes_a_new_version_rather_than_changing_the_old_one(
+    client: TestClient,
+):
+    """A batch already running is reading from a specific version, and must not
+    have it changed underneath it."""
+    created = client.post("/api/usecases/import", json=editable())
+    usecase_id = created.json()["usecase_id"]
+    first = created.json()["version"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["row_steps"][1]["locators"] = [
+        {"strategy": "css", "selector": "tr.acme button"}
+    ]
+    saved = client.put(f"/api/usecases/{usecase_id}", json=definition)
+
+    assert saved.json()["version"] > first
+
+
+def test_a_locator_check_outside_the_allowlist_is_refused_before_a_browser_opens(
+    client: TestClient,
+):
+    """The same gate a run passes, for the same reason: this endpoint opens a
+    browser and visits a URL somebody typed into a form."""
+    created = client.post("/api/usecases/import", json=editable())
+    usecase_id = created.json()["usecase_id"]
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/locator-check",
+        json={
+            "url": "https://somewhere-else.test/page",
+            "locators": [{"strategy": "role", "role": "button", "name": "Edit"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "somewhere-else.test" in response.text
+
+
+def test_a_malformed_locator_is_named_rather_than_rejected_wholesale(
+    client: TestClient,
+):
+    """The editor has to map the complaint back to a field, so the reply says
+    which rung -- not "422" against a body it cannot read."""
+    created = client.post("/api/usecases/import", json=editable())
+    usecase_id = created.json()["usecase_id"]
+
+    response = client.post(
+        f"/api/usecases/{usecase_id}/locator-check",
+        json={
+            "url": "https://example.com/customers",
+            "locators": [
+                {"strategy": "role", "role": "button", "name": "Edit"},
+                {"strategy": "css"},
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "locator 1" in response.text
+
+
+def test_a_scope_deeper_than_the_schema_allows_is_refused_on_save(client: TestClient):
+    """The depth bound is on the model, so it holds for a hand-edited document
+    exactly as it does for a recorded one."""
+    created = client.post("/api/usecases/import", json=editable())
+    usecase_id = created.json()["usecase_id"]
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    scope: dict[str, Any] = {"strategy": "role", "role": "main"}
+    for _ in range(4):
+        scope = {"strategy": "role", "role": "group", "within": scope}
+    definition["row_steps"][1]["locators"] = [
+        {"strategy": "role", "role": "button", "name": "Edit", "within": scope}
+    ]
+
+    response = client.put(f"/api/usecases/{usecase_id}", json=definition)
+    assert response.status_code == 422

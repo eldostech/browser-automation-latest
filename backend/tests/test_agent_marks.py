@@ -412,3 +412,103 @@ async def test_a_credential_may_be_marked_during_setup():
         result = await tools.call("mark_as_secret", {"ref": "e9", "slot": "vendor"})
 
     assert not result.is_error, result.text
+
+
+# ---------------------------------------------------------------------------
+# An unnamed wrapper, which used to become a locator that could not work
+# ---------------------------------------------------------------------------
+#
+# Found on a real page: IXL's profile picker, where each learner is an
+# anonymous `generic` card wrapping a radio with their name on it. The agent
+# clicked the card, and the step was recorded as `role=generic [24]` -- "the
+# 25th anonymous div" -- which was published and then failed, twice, on a draft
+# whose own warning said it would.
+
+PROFILES = """### Page
+- Page URL: https://example.com/profiles
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - radio "Nayra Asati" [ref=e3]
+    - text: Grade 5
+  - generic [ref=e4]:
+    - radio "Vihaan Asati" [ref=e5]
+    - text: Grade 2
+  - generic [ref=e6]:
+    - radio "Aarav Asati" [ref=e7]
+    - text: Grade 8
+```"""
+
+
+def test_an_unnamed_wrapper_is_recorded_by_the_control_inside_it():
+    """The wrapper has nothing of its own to match on, and the thing inside it
+    has a person's name. Clicking either does the same thing on a page where
+    the card *is* the control, and only one of them can be replayed."""
+    described = describe_element(parse_snapshot(PROFILES), "e2")
+
+    assert [loc.describe() for loc in described.ladder] == [
+        'role=radio name="Nayra Asati" exact'
+    ]
+
+
+def test_the_wrapper_is_no_longer_called_unreliable():
+    """The objection was that position among anonymous wrappers is not a
+    property of the control. With a name it is not a position any more."""
+    described = describe_element(parse_snapshot(PROFILES), "e2")
+
+    assert not described.unreliable
+    assert described.matches == 1, "counted against the rung that will be used"
+    assert "WARNING" not in described.as_text()
+
+
+def test_a_wrapper_with_nothing_nameable_inside_is_still_refused():
+    """The honest answer where there is genuinely nothing to say. Borrowing a
+    name has to fail loudly rather than invent one."""
+    bare = """### Page
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]
+  - generic [ref=e3]
+```"""
+
+    described = describe_element(parse_snapshot(bare), "e2")
+
+    assert described.unreliable
+    assert "generic wrapper, not a real control" in described.as_text()
+
+
+def test_a_name_that_is_not_unique_is_not_borrowed():
+    """Swapping one ambiguity for another is not a fix. Two cards holding the
+    same control name leave the wrapper exactly as unnameable as it was."""
+    twins = """### Page
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - radio "Choose" [ref=e3]
+  - generic [ref=e4]:
+    - radio "Choose" [ref=e5]
+```"""
+
+    described = describe_element(parse_snapshot(twins), "e2")
+
+    assert described.unreliable
+    assert all(loc.role == "generic" for loc in described.ladder)
+
+
+def test_a_named_element_is_recorded_exactly_as_before():
+    """Nothing about this changes a step the recorder already handled well."""
+    page = """### Page
+### Snapshot
+```yaml
+- button "Save" [ref=e1]
+```"""
+
+    described = describe_element(parse_snapshot(page), "e1")
+
+    assert [loc.describe() for loc in described.ladder] == [
+        'role=button name="Save"',
+        "text='Save'",
+    ]

@@ -812,3 +812,110 @@ async def test_closing_the_session_closes_every_extra_provider_too():
         pass
 
     assert extra.closed
+
+
+# --- looping on a call that is allowed but is not working ------------------
+
+
+async def test_the_same_click_three_times_is_refused_as_a_loop():
+    """The stale-ref rule covers a *dead* reference retried. This is the other
+    loop, and until now only the budget stopped it: a live reference clicked
+    over and over because the click is not having the effect expected.
+
+    The budget is a bad backstop for this. It stops the agent eventually, after
+    the session has spent everything it had on one button.
+    """
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        first = await tools.call("browser_click", {"target": "e3"})
+        second = await tools.call("browser_click", {"target": "e3"})
+        third = await tools.call("browser_click", {"target": "e3"})
+
+    assert not first.is_error and not second.is_error
+    assert third.is_error
+    assert "already been called" in third.text
+    assert "browser_snapshot" in third.text, "says what to do instead"
+
+
+async def test_acting_on_a_different_element_is_never_a_repeat():
+    """Counted per (tool, arguments). Clicking two things is doing two things,
+    however many times the page has been clicked overall."""
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        for _ in range(3):
+            assert not (await tools.call("browser_click", {"target": "e3"})).is_error or True
+        result = await tools.call("browser_type", {"target": "e4", "text": "a@b.test"})
+
+    assert not result.is_error
+
+
+async def test_taking_the_same_snapshot_repeatedly_is_not_a_loop():
+    """Re-reading the page after every change is exactly what the ref
+    discipline asks for. Refusing the third would break the loop this rule
+    exists to protect."""
+    async with await session() as tools:
+        results = [await tools.call("browser_snapshot", {}) for _ in range(5)]
+
+    assert not any(result.is_error for result in results)
+
+
+# --- saying what you expect, as a schema rather than a request -------------
+
+
+async def test_every_offered_tool_requires_an_observation():
+    """The prompts already ask for this in prose, and a prompt cannot make it
+    happen: a model under pressure drops the sentence and calls the tool, and
+    nothing notices. As a required argument it cannot be dropped."""
+    from agent.session import OBSERVATION
+
+    async with await session() as tools:
+        specs = tools.tools
+
+    assert specs, "the fake advertises tools"
+    for spec in specs:
+        assert OBSERVATION in spec.input_schema["properties"], spec.name
+        assert OBSERVATION in spec.input_schema["required"], spec.name
+
+
+async def test_the_observation_never_reaches_the_browser():
+    """It is a note for the trail, not an argument. A server told about it
+    would refuse the call for a parameter it has never heard of."""
+    fake = FakeMCP()
+    tools = AgentToolSession(fake, allowed_domains=("vendor.test",), may_write=True)
+    async with tools:
+        await tools.call("browser_snapshot", {"observation": "reading the page"})
+        await tools.call(
+            "browser_click",
+            {"target": "e3", "observation": "the Invite dialog should open"},
+        )
+
+    for _, arguments in fake.calls:
+        assert "observation" not in arguments
+
+
+async def test_the_observation_is_kept_beside_the_call_it_describes():
+    """In the trail rather than in loose prose above it, which is what makes a
+    trail read afterwards say what was intended as well as what happened."""
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call(
+            "browser_click",
+            {"target": "e3", "observation": "the Invite dialog should open"},
+        )
+
+    click = next(record for record in tools.calls if record.name == "browser_click")
+    assert click.observation == "the Invite dialog should open"
+
+
+async def test_a_call_with_no_observation_is_still_dispatched():
+    """The schema asks; this does not add a second refusal on top of it.
+
+    A model that omits a required argument has already been told so by its own
+    provider, and turning that into a browser-level refusal would spend a turn
+    on bookkeeping instead of on the page.
+    """
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e3"})
+
+    assert not result.is_error

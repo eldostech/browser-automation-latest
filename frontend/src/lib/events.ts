@@ -247,13 +247,48 @@ export interface ServerConfig {
 export type UseCaseStatus = 'draft' | 'ready' | 'archived';
 
 /** One rung of the locator ladder, most durable first. */
+export type LocatorStrategy =
+  | 'role'
+  | 'label'
+  | 'placeholder'
+  | 'test_id'
+  | 'alt_text'
+  | 'css'
+  | 'text'
+  | 'nth';
+
 export interface Locator {
-  strategy: 'role' | 'css' | 'text' | 'nth';
+  strategy: LocatorStrategy;
   role?: string | null;
   name?: string | null;
   selector?: string | null;
   text?: string | null;
   nth?: number;
+  /** Whether the name must be the element's whole accessible name. Playwright
+   *  matches a substring by default, so "Invite" also finds "+ Invite User". */
+  exact?: boolean;
+  /** Search inside this element rather than the whole page. Recursive. */
+  within?: Locator | null;
+  /** Keep only matches whose text contains this. */
+  has_text?: string | null;
+  /** iframes to descend through, outermost first, as CSS selectors. */
+  frames?: string[];
+}
+
+/** One rung's verdict from the locator check, against a live page. */
+export interface LocatorCheckResult {
+  describe: string;
+  total: number;
+  visible: number;
+  matches: string[];
+  ok: boolean;
+  reason: string;
+}
+
+export interface LocatorCheckReport {
+  page_url: string;
+  page_title: string;
+  results: LocatorCheckResult[];
 }
 
 export interface Assertion {

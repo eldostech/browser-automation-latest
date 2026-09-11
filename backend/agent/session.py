@@ -19,6 +19,7 @@ Three responsibilities, in the order a call meets them:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -39,6 +40,35 @@ log = logging.getLogger(__name__)
 #: How many recently-failed targets `AgentToolSession` remembers, per session.
 #: Small on purpose -- see `_failed_targets`'s own comment for what this is for.
 FAILED_TARGET_MEMORY = 8
+
+#: The argument every offered tool gains: what the model expects this call to
+#: do, in a sentence, written before it makes the call.
+#:
+#: The prompts already ask for this -- `recover.md` and `explore.md` both say
+#: "before every tool call, say in a sentence what you see and what you expect
+#: this call to do". A prompt cannot make it happen. A model under pressure
+#: drops the sentence and calls the tool, and nothing notices. As a required
+#: argument it cannot be dropped, and it lands in the audit trail attached to
+#: the call it describes rather than in loose prose above it -- which is what
+#: makes a trail somebody reads afterwards worth reading.
+OBSERVATION = "observation"
+
+OBSERVATION_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Before you call this: what you see on the page now, what you expect "
+        "this call to do, and how you will know it worked. One sentence."
+    ),
+}
+
+#: How many times the same acting call may be made before it is refused.
+#:
+#: The stale-ref rule above covers the loop where a *dead* reference is
+#: retried. This covers the other one, which the budget used to be the only
+#: thing that stopped: a live reference clicked over and over because the click
+#: is not having the effect the model expected. Two attempts is a fair reading
+#: of "it might not have registered"; a third is a loop.
+MAX_IDENTICAL_CALLS = 2
 
 
 @dataclass(slots=True)
@@ -63,6 +93,10 @@ class ToolCallRecord:
     duration_ms: int = 0
     #: Which ``Step.action`` this would distil into, or "" for perception.
     action: str = ""
+    #: What the model said it expected this call to do, before making it. Kept
+    #: beside the call rather than in the prose above it, so a trail read
+    #: afterwards says what was intended as well as what happened.
+    observation: str = ""
     #: The durable locator ladder for whatever this call acted on, resolved
     #: **before** it ran. That timing is the whole point: a ref is an index
     #: into the snapshot it came from, and by the time the call returns the
@@ -194,6 +228,11 @@ class AgentToolSession:
         #: a much later snapshot generation happens to reuse must not be
         #: refused for a mistake an earlier, unrelated snapshot made.
         self._failed_targets: dict[str, str] = {}
+        #: How many times each acting call has already been made, keyed by the
+        #: call and its arguments. Only calls that *act* are counted: a repeated
+        #: `browser_snapshot` is how an agent is supposed to work, and refusing
+        #: one would break the very loop the ref discipline asks for.
+        self._attempts: dict[tuple[str, str], int] = {}
 
     # -- lifecycle ----------------------------------------------------------
     async def __aenter__(self) -> "AgentToolSession":
@@ -240,7 +279,10 @@ class AgentToolSession:
             for t in TOOLS.values()
             if t.handler is not None  # `finish` is answered elsewhere; see tools/finish.py
         ]
-        return [*self._specs, *self._extra_specs.values(), *ours]
+        return [
+            _with_observation(spec)
+            for spec in [*self._specs, *self._extra_specs.values(), *ours]
+        ]
 
     @property
     def snapshot(self) -> Snapshot | None:
@@ -310,6 +352,10 @@ class AgentToolSession:
         it retries the same call until its budget is gone.
         """
         arguments = dict(arguments or {})
+        # Taken off before anything else looks at the call. It is a note for
+        # the trail, not an argument, and a browser told about it would refuse
+        # the call for a parameter it has never heard of.
+        observation = str(arguments.pop(OBSERVATION, "") or "").strip()
         self._seq += 1
         started = time.monotonic()
 
@@ -317,7 +363,7 @@ class AgentToolSession:
         if not verdict.allowed:
             return await self._finish(
                 name, arguments, ToolResult.failed(verdict.reason), verdict,
-                started, refused=True,
+                started, refused=True, observation=observation,
             )
 
         # Ours are answered here and never reach the browser. They still pass
@@ -327,7 +373,9 @@ class AgentToolSession:
         tool = TOOLS.get(name)
         if tool is not None and tool.handler is not None:
             result = self._mark(tool, arguments)
-            return await self._finish(name, arguments, result, verdict, started)
+            return await self._finish(
+                name, arguments, result, verdict, started, observation=observation
+            )
 
         if name in self._extra_owner:
             # A tool from a registered server rather than the browser: same
@@ -336,7 +384,7 @@ class AgentToolSession:
             # against a page. `_finish` below leaves `action`/`locators` at
             # their defaults for exactly that reason, which is also what
             # keeps a call like this out of a distilled use case.
-            return await self._call_extra(name, arguments, verdict, started)
+            return await self._call_extra(name, arguments, verdict, started, observation)
 
         if self._session is None:
             raise RuntimeError(
@@ -368,6 +416,15 @@ class AgentToolSession:
                     "lists."
                 ),
                 verdict, started, refused=True, described=described,
+                observation=observation,
+            )
+
+        repeated = self._too_many_attempts(name, arguments)
+        if repeated:
+            return await self._finish(
+                name, arguments, ToolResult.failed(repeated),
+                verdict, started, refused=True, described=described,
+                observation=observation,
             )
 
         # `arguments` -- the placeholder-bearing version -- is what gets
@@ -388,7 +445,7 @@ class AgentToolSession:
                     f"Bound slots: {known}. Use one of those, exactly as "
                     "{{secret.slot}} -- do not type a guessed value."
                 ),
-                verdict, started, refused=True,
+                verdict, started, refused=True, observation=observation,
             )
 
         try:
@@ -411,11 +468,17 @@ class AgentToolSession:
             self._snapshot = parse_snapshot(result.text)
 
         return await self._finish(
-            name, arguments, result, verdict, started, described=described
+            name, arguments, result, verdict, started,
+            described=described, observation=observation,
         )
 
     async def _call_extra(
-        self, name: str, arguments: dict[str, Any], verdict: Any, started: float
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        verdict: Any,
+        started: float,
+        observation: str = "",
     ) -> ToolResult:
         """Dispatch to a registered server rather than the browser.
 
@@ -440,7 +503,7 @@ class AgentToolSession:
                     f"Bound slots: {known}. Use one of those, exactly as "
                     "{{secret.slot}} -- do not type a guessed value."
                 ),
-                verdict, started, refused=True,
+                verdict, started, refused=True, observation=observation,
             )
 
         try:
@@ -449,7 +512,9 @@ class AgentToolSession:
             log.warning("tool call raised", extra={"tool": name, "error": str(exc)})
             result = ToolResult.failed(f"{name} failed: {exc}")
 
-        return await self._finish(name, arguments, result, verdict, started)
+        return await self._finish(
+            name, arguments, result, verdict, started, observation=observation
+        )
 
     # -- our own tools ------------------------------------------------------
     def _mark(self, tool: ToolDef, arguments: dict[str, Any]) -> ToolResult:
@@ -467,6 +532,32 @@ class AgentToolSession:
         if self._snapshot is None:
             return Described(ref=ref, role="", name="", matches=0)
         return describe_element(self._snapshot, ref)
+
+    def _too_many_attempts(self, name: str, arguments: dict[str, Any]) -> str:
+        """Why this exact call may not be made again, or "".
+
+        Counted per (tool, arguments), so acting on a *different* element, or
+        typing different text into the same one, is never a repeat. The count
+        is kept even for a call that succeeded: an agent that clicks the same
+        live button five times is looping whether or not the clicks worked,
+        and the page it is looking at is not the one it thinks it is.
+
+        Snapshots and other perception calls are exempt. Re-reading the page
+        after every change is exactly what the ref discipline asks for, and
+        refusing the third one would break the loop this is meant to protect.
+        """
+        if name in PERCEPTION:
+            return ""
+        key = (name, json.dumps(arguments, sort_keys=True, default=str))
+        self._attempts[key] = self._attempts.get(key, 0) + 1
+        if self._attempts[key] <= MAX_IDENTICAL_CALLS:
+            return ""
+        return (
+            f"{name} has already been called {MAX_IDENTICAL_CALLS} times with exactly "
+            "these arguments on this session, and doing it again will not produce a "
+            "different page. Take a fresh browser_snapshot, work out why it is not "
+            "having the effect you expect, and try something else."
+        )
 
     def _remember_failed_target(self, target_ref: str, reason: str) -> None:
         """Bounded: the oldest entry is dropped once the cap is reached, so a
@@ -487,6 +578,7 @@ class AgentToolSession:
         *,
         refused: bool = False,
         described: "Described | None" = None,
+        observation: str = "",
     ) -> ToolResult:
         record = ToolCallRecord(
             seq=self._seq,
@@ -502,6 +594,7 @@ class AgentToolSession:
             category=getattr(verdict, "category", "") or "",
             duration_ms=int((time.monotonic() - started) * 1000),
             action="" if name in PERCEPTION else DISTILS_TO.get(name, ""),
+            observation=self.redactor.text(observation)[:1000],
             locators=[
                 loc.model_dump(mode="json", exclude_none=True)
                 for loc in (described.ladder if described else [])
@@ -516,4 +609,26 @@ class AgentToolSession:
         return result
 
 
-__all__ = ["AgentToolSession", "Recorder", "ToolCallRecord"]
+def _with_observation(spec: ToolSpec) -> ToolSpec:
+    """``spec`` with the observation argument added, and required.
+
+    Added here rather than written into each tool's own schema because most of
+    these schemas are not ours: they come from Playwright MCP, or from a tool
+    server somebody registered. Augmenting what is *offered* applies the same
+    discipline to every one of them, and the argument is taken back off in
+    `call` before anything downstream sees it.
+    """
+    schema = dict(spec.input_schema or {})
+    properties = {**(schema.get("properties") or {}), OBSERVATION: OBSERVATION_SCHEMA}
+    required = list(schema.get("required") or [])
+    if OBSERVATION not in required:
+        required = [OBSERVATION, *required]
+    return ToolSpec(
+        name=spec.name,
+        description=spec.description,
+        input_schema={**schema, "type": "object", "properties": properties, "required": required},
+        annotations=spec.annotations,
+    )
+
+
+__all__ = ["AgentToolSession", "OBSERVATION", "Recorder", "ToolCallRecord"]

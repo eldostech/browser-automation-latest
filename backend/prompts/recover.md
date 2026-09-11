@@ -22,11 +22,13 @@ $error
 
 ## How to work
 
-Before every tool call, say in a sentence what you see and what you expect
-this call to do. Before calling `resume`, say specifically what tells you the
-page is now right for the step that failed -- "it looks fine" is not a
-reason a person reviewing this later can check; "the dialog that was covering
-the form is gone" is.
+Every browser tool takes an `observation`: what you see now, what you expect
+this call to do, and how you will know it worked. It is required, and it is
+kept beside the call in the record somebody reads afterwards, so write it for
+them. Before calling `resume`, say specifically what tells you the page is now
+right for the step that failed -- "it looks fine" is not a reason a person
+reviewing this later can check; "the dialog that was covering the form is gone"
+is.
 
 1. Look at the page with `browser_snapshot`. Every element has a reference
    like `e12`; act by reference, never by writing a selector.

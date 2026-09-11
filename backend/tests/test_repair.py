@@ -404,9 +404,14 @@ def test_the_listing_says_which_card_each_duplicate_belongs_to():
     assert 'inside "Gamma Project"' in listing
 
 
-def test_picking_one_of_a_duplicate_group_pins_its_position():
-    """The fix that would have unblocked the real incident: a repair can now
-    point at *the second* identical button, not just the first."""
+def test_picking_one_of_a_duplicate_group_names_the_card_it_sits_in():
+    """The fix that would have unblocked the real incident: a repair can point
+    at *the second* identical button.
+
+    It says so by naming the card rather than by counting, which is the
+    stronger of the two answers -- "the Chat button on Beta Project" survives a
+    fourth project being added above it, and "the second Chat button" does not.
+    """
     snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
     options = candidates(snapshot)
     beta_index = next(i for i, n in enumerate(options) if n.ref == "e7")
@@ -419,8 +424,31 @@ def test_picking_one_of_a_duplicate_group_pins_its_position():
 
     locator = patched["row_steps"][0]["locators"][0]
     assert locator["name"] == "Chat"
-    assert locator["nth"] == 1, "e7 is the second of the three Chat buttons"
-    assert "pinned to position 1" in applied[0]
+    assert locator["nth"] == 0, "scoped, so no position is needed"
+    assert locator["within"]["name"] == "Beta Project"
+    assert "Beta Project" in applied[0]
+    validate_patched(patched)
+
+
+def test_the_first_of_a_duplicate_group_can_be_repaired_once_its_card_is_named():
+    """`nth=0` means "no position given", so the first of several identical
+    controls has no positional spelling at all and used to be refused outright.
+    Naming where it sits gives it one -- and it is the answer a person would
+    have given anyway."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    alpha_index = next(i for i, n in enumerate(options) if n.ref == "e4")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": alpha_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    locator = patched["row_steps"][0]["locators"][0]
+    assert locator["name"] == "Chat"
+    assert locator["within"]["name"] == "Alpha Project"
+    assert "SKIPPED" not in applied[0]
     validate_patched(patched)
 
 
@@ -442,13 +470,33 @@ def test_without_the_full_snapshot_ambiguity_still_degrades_safely():
     assert patched["row_steps"][0]["locators"][0]["nth"] == 1
 
 
-def test_picking_the_first_of_a_duplicate_group_is_refused_not_faked():
+#: The same three cards, with nothing naming any of them. There is genuinely
+#: no way to single out the first "Chat" button here, and the point of the
+#: fixture is that this case still exists after scoping was added.
+BARE_CARDS = """### Page
+- Page URL: https://example.com/dashboard
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - button "Chat" [ref=e4]
+  - generic [ref=e5]:
+    - button "Chat" [ref=e7]
+  - generic [ref=e8]:
+    - button "Chat" [ref=e10]
+```"""
+
+
+def test_the_first_of_a_duplicate_group_is_still_refused_when_nothing_names_it():
     """`nth=0` means "no position given" as far as the executor's resolver is
     concerned -- so a "fix" that pins the first of several identical elements
     to position 0 would look applied in the diff and still be refused, for
-    the identical reason, the next time it runs. Skipping it and saying so is
-    more honest than a repair that appears to work and does not."""
-    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    the identical reason, the next time it runs.
+
+    Scoping answers this whenever something around the element has a name. When
+    nothing does, skipping and saying so is still more honest than a repair
+    that appears to work and does not."""
+    snapshot = gather_context(use_case(), execution(), failure_events(BARE_CARDS)).snapshot
     options = candidates(snapshot)
     alpha_index = next(i for i, n in enumerate(options) if n.ref == "e4")
 
@@ -460,7 +508,7 @@ def test_picking_the_first_of_a_duplicate_group_is_refused_not_faked():
 
     assert patched["row_steps"][0]["locators"][0]["name"] == "Full name", "unchanged"
     assert "SKIPPED" in applied[0]
-    assert "first of them" in applied[0]
+    assert "nothing around it is named" in applied[0]
 
 
 # --- when there is no page to look at --------------------------------------

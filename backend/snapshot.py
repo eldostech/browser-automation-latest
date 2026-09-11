@@ -383,3 +383,126 @@ def extract_ref(target: str) -> str | None:
     if match:
         return match.group(1)
     return value if BARE_REF_RE.fullmatch(value) else None
+
+
+# ---------------------------------------------------------------------------
+# Naming one element out of several that read alike
+# ---------------------------------------------------------------------------
+#
+# This lives here for the same reason `same_rung` does: healing and repair both
+# have to turn "this node" into "a locator that finds this node and no other",
+# and two implementations of that would drift apart in exactly the way that
+# produces a use case which clicks the wrong row a thousand times.
+
+#: Roles that mean "this is a place on the page", so naming one says *where* a
+#: control is. A dialog and a table row decide almost every real ambiguity.
+#:
+#: ``generic`` and ``group`` are here despite being in
+#: :data:`STRUCTURAL_ROLES`, and the two facts do not conflict. What makes a
+#: structural wrapper useless as a *target* is that it usually has no name;
+#: :func:`container_of` only ever accepts a named one, and a named wrapper is
+#: exactly the card or panel a person would point at -- "the Chat button on the
+#: Alpha Project card". Excluding them cost the commonest layout on the web.
+CONTAINER_ROLES: frozenset[str] = frozenset(
+    {
+        "dialog", "alertdialog", "row", "form", "navigation", "main", "banner",
+        "contentinfo", "complementary", "region", "search", "table", "grid",
+        "listitem", "tabpanel", "article", "menu", "toolbar", "iframe",
+        "generic", "group",
+    }
+)
+
+
+def container_of(snapshot: "Snapshot", node: Node) -> Node | None:
+    """The nearest named region, dialog or row enclosing ``node``.
+
+    An accessibility snapshot is a tree flattened into lines, so "enclosing" is
+    the nearest earlier line at a smaller indent. This is what turns "button
+    Save" into "button Save, in the Edit customer dialog" -- the difference
+    between a candidate list a person could choose from and one that reads as
+    forty identical rows.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(node)
+    except ValueError:
+        return None
+    for other in reversed(nodes[:start]):
+        if other.depth >= node.depth:
+            continue
+        if other.role in CONTAINER_ROLES and (other.name or other.text):
+            return other
+        if other.depth == 0:
+            break
+    return None
+
+
+def alone_within(snapshot: "Snapshot", node: Node, container: Node) -> bool:
+    """Whether scoping to ``container`` picks out ``node`` on its own.
+
+    Only then is the scope worth recording. A scope that still leaves three
+    matches has narrowed nothing, and would make the locator look more precise
+    than it is -- which is the failure a review screen cannot catch, because
+    the locator reads perfectly well.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(container)
+    except ValueError:
+        return False
+    inside: list[Node] = []
+    for other in nodes[start + 1 :]:
+        if other.depth <= container.depth:
+            break
+        inside.append(other)
+    return sum(1 for other in inside if same_rung(node, other, True)) == 1
+
+
+def locator_for(snapshot: "Snapshot", node: Node):
+    """The narrowest locator that finds ``node`` and nothing else, or ``None``.
+
+    Three rungs, in order of how well each survives a redesign:
+
+    1. Role and accessible name, when the page holds only one such control.
+    2. Otherwise scoped to the card, dialog or row it sits in. This is what a
+       person would say, and it keeps working when the page gains a seventh row.
+    3. Only when neither separates it, a positional index -- because an index
+       is a claim about ordering that the next release can quietly falsify.
+
+    Rung 2 is why the candidate lists above this could stop deduplicating.
+    Offering a model six "Edit" links while being able to express only "an Edit
+    link" lets it answer correctly and have the answer recorded wrongly.
+
+    ``None`` means this element cannot be named at all, and callers must
+    refuse rather than approximate. That happens for the *first* of several
+    identical controls with nothing around them to scope to: ``nth=0`` is how
+    the schema spells "no position given", deliberately, so that the resolver
+    goes on refusing an ambiguous rung instead of acting on whichever element
+    loads first. Returning that locator anyway would look like a repair in the
+    diff and fail at replay for the identical reason it already failed.
+    """
+    from usecase import Locator  # imported here: usecase is the schema, and
+    # the schema must not have to know about the parser to be defined.
+
+    # Recorded loose, and counted strict. The two are not in tension: the
+    # executor's ladder already walks a loose named rung twice, the strict
+    # reading first and the recorded one after, so writing `exact` here would
+    # only remove the second attempt. Counting, below, asks a different
+    # question -- "is this element uniquely named on the page as it stands" --
+    # and the answer to that has to be strict or a longer label containing
+    # this one would make every element look ambiguous.
+    base = Locator(strategy="role", role=node.role, name=node.name or None)
+    if count_matches(snapshot, node, True) <= 1:
+        return base
+
+    container = container_of(snapshot, node)
+    if container is not None and alone_within(snapshot, node, container):
+        return base.model_copy(
+            update={
+                "within": Locator(
+                    strategy="role", role=container.role, name=container.name or None
+                )
+            }
+        )
+    position = index_among(snapshot, node, True)
+    return base.model_copy(update={"nth": position}) if position else None
