@@ -32,9 +32,17 @@ a **ref**. That gives two lookups, and the whole replay design rests on them:
     Snapshots cost tokens only when they enter an LLM context, so a replay with
     no model in the loop can take one before every step for free.
 
-Only ref-bearing lines are indexed. That is not a limitation but a filter: it
-excludes the property lines (``- /url:``, ``- text:``) and the ``### Page``
-header, none of which describe an element you can act on.
+Refs are optional, and which source produced the tree decides whether they are
+there. Playwright MCP adds ``[ref=eN]`` to every node; Playwright's own
+``locator.aria_snapshot()`` emits the same YAML **without** them. Both are
+parsed, because both are used: MCP during the transition, and ``aria_snapshot``
+by the engine that replaced it.
+
+That is why the ref filter this parser used to apply is gone. Requiring a ref
+made every node of a real ``aria_snapshot`` invisible -- the tree parsed
+cleanly and yielded nothing, which is the most expensive kind of wrong. Lines
+that genuinely describe no element (``- /url: ...``) fail the role pattern and
+are skipped on their own merits.
 """
 
 from __future__ import annotations
@@ -70,7 +78,7 @@ _ATTR_RE = re.compile(r"\[(?P<key>[A-Za-z][A-Za-z0-9_-]*)(?:=(?P<value>[^\]]*))?
 
 #: Roles that never describe something a person interacts with. Kept out of
 #: `locate` results so a wrapper `generic` never shadows the real control.
-_STRUCTURAL_ROLES: frozenset[str] = frozenset({"generic", "group", "none", "presentation"})
+STRUCTURAL_ROLES: frozenset[str] = frozenset({"generic", "group", "none", "presentation"})
 
 
 @dataclass(slots=True)
@@ -87,11 +95,59 @@ class Node:
 
     @property
     def interactive(self) -> bool:
-        return self.role not in _STRUCTURAL_ROLES
+        return self.role not in STRUCTURAL_ROLES
 
     def describe(self) -> str:
         """Human-readable identity, for review UIs and failure messages."""
         return f'{self.role} "{self.name}"' if self.name else self.role
+
+
+def ordinal_suffix(n: int) -> str:
+    """'st'/'nd'/'rd'/'th', for a message a person actually reads."""
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def same_rung(node: Node, other: Node, exact: bool) -> bool:
+    """Whether ``other`` is one of the elements a role[+name] rung for
+    ``node`` would match -- the same test the executor's own ladder resolver
+    applies at replay time (role equal; name equal if ``exact``, a substring
+    otherwise; unnamed matches by role alone).
+
+    The one predicate both :func:`count_matches` and :func:`index_among`
+    filter by, so "how many match" and "which position a specific one holds
+    among them" cannot drift apart from being written twice -- and the one
+    place both `agent/marks.py`'s recording/recovery path and `repair.py`'s
+    post-mortem path share, so they cannot drift from *each other* either.
+    """
+    if other.role != node.role:
+        return False
+    if not node.name:
+        return True
+    wanted = node.name.casefold()
+    other_name = (other.name or "").casefold()
+    return other_name == wanted if exact else wanted in other_name
+
+
+def count_matches(snapshot: "Snapshot", node: Node, exact: bool) -> int:
+    """How many elements a role[+name] rung for ``node`` would match."""
+    return sum(1 for other in snapshot if same_rung(node, other, exact))
+
+
+def index_among(snapshot: "Snapshot", node: Node, exact: bool) -> int:
+    """Where ``node`` sits among the elements a role[+name] rung would match.
+
+    Document order -- the order refs are numbered in, and the order
+    Playwright's own ``.nth()`` walks. 0 if something has gone wrong (the
+    node's own rung does not match itself), which ``Locator``'s ``nth=0``
+    reads as "no index needed" rather than raising past a caller that just
+    wanted a ladder.
+    """
+    for index, other in enumerate(o for o in snapshot if same_rung(node, o, exact)):
+        if other.ref == node.ref:
+            return index
+    return 0
 
 
 def _unescape(value: str) -> str:
@@ -115,14 +171,33 @@ class Snapshot:
     nodes: list[Node] = field(default_factory=list)
     page_url: str | None = None
     page_title: str | None = None
+    #: The text this was parsed from.
+    #:
+    #: Kept because a repair proposed later reads the page *as text* and parses
+    #: it again -- rebuilding it from the nodes loses the shape the parser
+    #: expects, and the repair then has nothing to match against.
+    raw: str = ""
 
     # -- lookups ------------------------------------------------------------
     @property
     def by_ref(self) -> dict[str, Node]:
-        return {node.ref: node for node in self.nodes}
+        """Ref-bearing nodes only.
+
+        Playwright's own ``aria_snapshot()`` emits no refs, so on that input
+        this is empty and every ref-based lookup correctly finds nothing --
+        rather than collecting the whole tree under the empty string.
+        """
+        return {node.ref: node for node in self.nodes if node.ref}
 
     def get(self, ref: str) -> Node | None:
-        """The node a ref points at, or ``None`` if this snapshot has no such ref."""
+        """The node a ref points at, or ``None`` if this snapshot has no such ref.
+
+        An empty ref matches nothing. Nodes parsed from an aria snapshot carry
+        no ref at all, and without this guard ``get("")`` would return the
+        first of them -- an arbitrary element, confidently.
+        """
+        if not ref:
+            return None
         for node in self.nodes:
             if node.ref == ref:
                 return node
@@ -166,13 +241,40 @@ class Snapshot:
         distillation warns about those steps so a reviewer sees it before a
         batch does.
         """
-        if role in _STRUCTURAL_ROLES and not name:
+        if role in STRUCTURAL_ROLES and not name:
             return None
         matches = self.find(role, name)
         interactive = [n for n in matches if n.interactive]
         pool = interactive or matches
         if not pool:
             return None
+        if nth < 0 or nth >= len(pool):
+            return None
+        return pool[nth]
+
+    def by_name(self, name: str, nth: int = 0) -> "Node | None":
+        """The ``nth`` node whose accessible name matches, whatever its role.
+
+        A label, a placeholder and an image's alt text are all the same thing
+        once a page is rendered: they become the control's accessible name. So
+        a recorded ``get_by_label("Password")`` is answered here rather than by
+        guessing which ARIA role the control turned out to have -- guessing
+        wrong means falling through to a weaker rung for no reason.
+
+        Interactive nodes win over structural ones for the same reason
+        :meth:`locate` prefers them: a ``generic`` wrapper carrying the same
+        name as the input inside it must not shadow the input.
+        """
+        wanted = _normalise(name)
+        if not wanted:
+            return None
+
+        exact = [n for n in self.nodes if n.name == name]
+        loose = [n for n in self.nodes if _normalise(n.name) == wanted]
+        partial = [n for n in self.nodes if wanted in _normalise(n.name)]
+        pool = exact or loose or partial
+        interactive = [n for n in pool if n.interactive]
+        pool = interactive or pool
         if nth < 0 or nth >= len(pool):
             return None
         return pool[nth]
@@ -199,7 +301,7 @@ def parse(text: str) -> Snapshot:
     to the next locator strategy, which is a far better failure than an
     exception taking down a 1,000-row batch.
     """
-    snapshot = Snapshot()
+    snapshot = Snapshot(raw=text or "")
     if not text:
         return snapshot
 
@@ -225,9 +327,6 @@ def parse(text: str) -> Snapshot:
             for m in _ATTR_RE.finditer(match.group("attrs") or "")
         }
         ref = attrs.pop("ref", "")
-        if not ref:
-            # Property lines and unreferenced decoration. Nothing to act on.
-            continue
 
         indent = match.group("indent") or ""
         snapshot.nodes.append(
@@ -245,10 +344,17 @@ def parse(text: str) -> Snapshot:
     return snapshot
 
 
-#: A ref with no ``ref=`` prefix, which is the spelling Playwright MCP's own
-#: tools use for their ``ref`` argument -- and which the model therefore copies
-#: into ``target`` as well.
-BARE_REF_RE = re.compile(r"e\d+")
+#: The shape of a ref, bare -- no ``ref=`` prefix, which is the spelling
+#: Playwright MCP's own tools use for their ``ref`` argument, and which the
+#: model therefore copies into ``target`` as well.
+#:
+#: An element inside an iframe gets one ``f<N>`` segment per level of frame
+#: nesting before its own ``e<N>`` -- ``f10e107`` for the 108th element of the
+#: 11th frame, ``f10e107`` still if that frame is itself nested one level
+#: deeper... this was ``e\\d+`` alone, which rejected every such ref outright
+#: as not a ref at all, regardless of whether it was ever valid. Found for
+#: real, against a page whose interactive widget happened to live in one.
+BARE_REF_RE = re.compile(r"(?:f\d+)*e\d+")
 
 
 def is_ref(target: str) -> bool:
@@ -277,3 +383,164 @@ def extract_ref(target: str) -> str | None:
     if match:
         return match.group(1)
     return value if BARE_REF_RE.fullmatch(value) else None
+
+
+# ---------------------------------------------------------------------------
+# Naming one element out of several that read alike
+# ---------------------------------------------------------------------------
+#
+# This lives here for the same reason `same_rung` does: healing and repair both
+# have to turn "this node" into "a locator that finds this node and no other",
+# and two implementations of that would drift apart in exactly the way that
+# produces a use case which clicks the wrong row a thousand times.
+
+#: Roles that mean "this is a place on the page", so naming one says *where* a
+#: control is. A dialog and a table row decide almost every real ambiguity.
+#:
+#: ``generic`` and ``group`` are here despite being in
+#: :data:`STRUCTURAL_ROLES`, and the two facts do not conflict. What makes a
+#: structural wrapper useless as a *target* is that it usually has no name;
+#: :func:`container_of` only ever accepts a named one, and a named wrapper is
+#: exactly the card or panel a person would point at -- "the Chat button on the
+#: Alpha Project card". Excluding them cost the commonest layout on the web.
+CONTAINER_ROLES: frozenset[str] = frozenset(
+    {
+        "dialog", "alertdialog", "row", "form", "navigation", "main", "banner",
+        "contentinfo", "complementary", "region", "search", "table", "grid",
+        "listitem", "tabpanel", "article", "menu", "toolbar", "iframe",
+        "generic", "group",
+    }
+)
+
+
+def container_of(snapshot: "Snapshot", node: Node) -> Node | None:
+    """The nearest named region, dialog or row enclosing ``node``.
+
+    An accessibility snapshot is a tree flattened into lines, so "enclosing" is
+    the nearest earlier line at a smaller indent. This is what turns "button
+    Save" into "button Save, in the Edit customer dialog" -- the difference
+    between a candidate list a person could choose from and one that reads as
+    forty identical rows.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(node)
+    except ValueError:
+        return None
+    for other in reversed(nodes[:start]):
+        if other.depth >= node.depth:
+            continue
+        if other.role in CONTAINER_ROLES and (other.name or other.text):
+            return other
+        if other.depth == 0:
+            break
+    return None
+
+
+def alone_within(snapshot: "Snapshot", node: Node, container: Node) -> bool:
+    """Whether scoping to ``container`` picks out ``node`` on its own.
+
+    Only then is the scope worth recording. A scope that still leaves three
+    matches has narrowed nothing, and would make the locator look more precise
+    than it is -- which is the failure a review screen cannot catch, because
+    the locator reads perfectly well.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(container)
+    except ValueError:
+        return False
+    inside: list[Node] = []
+    for other in nodes[start + 1 :]:
+        if other.depth <= container.depth:
+            break
+        inside.append(other)
+    return sum(1 for other in inside if same_rung(node, other, True)) == 1
+
+
+def locator_for(snapshot: "Snapshot", node: Node):
+    """The narrowest locator that finds ``node`` and nothing else, or ``None``.
+
+    Three rungs, in order of how well each survives a redesign:
+
+    1. Role and accessible name, when the page holds only one such control.
+    2. Otherwise scoped to the card, dialog or row it sits in. This is what a
+       person would say, and it keeps working when the page gains a seventh row.
+    3. Only when neither separates it, a positional index -- because an index
+       is a claim about ordering that the next release can quietly falsify.
+
+    Rung 2 is why the candidate lists above this could stop deduplicating.
+    Offering a model six "Edit" links while being able to express only "an Edit
+    link" lets it answer correctly and have the answer recorded wrongly.
+
+    ``None`` means this element cannot be named at all, and callers must
+    refuse rather than approximate. That happens for the *first* of several
+    identical controls with nothing around them to scope to: ``nth=0`` is how
+    the schema spells "no position given", deliberately, so that the resolver
+    goes on refusing an ambiguous rung instead of acting on whichever element
+    loads first. Returning that locator anyway would look like a repair in the
+    diff and fail at replay for the identical reason it already failed.
+    """
+    from usecase import Locator  # imported here: usecase is the schema, and
+    # the schema must not have to know about the parser to be defined.
+
+    # Recorded loose, and counted strict. The two are not in tension: the
+    # executor's ladder already walks a loose named rung twice, the strict
+    # reading first and the recorded one after, so writing `exact` here would
+    # only remove the second attempt. Counting, below, asks a different
+    # question -- "is this element uniquely named on the page as it stands" --
+    # and the answer to that has to be strict or a longer label containing
+    # this one would make every element look ambiguous.
+    base = Locator(strategy="role", role=node.role, name=node.name or None)
+    if count_matches(snapshot, node, True) <= 1:
+        return base
+
+    container = container_of(snapshot, node)
+    if container is not None and alone_within(snapshot, node, container):
+        return base.model_copy(
+            update={
+                "within": Locator(
+                    strategy="role", role=container.role, name=container.name or None
+                )
+            }
+        )
+    position = index_among(snapshot, node, True)
+    return base.model_copy(update={"nth": position}) if position else None
+
+
+def named_controls(page: str, roles: "frozenset[str]", limit: int) -> list[str]:
+    """The named controls in a snapshot, one per line, deduplicated.
+
+    Both the healer and the repair doctor show a diagnosis the page as it was
+    when the step last worked, beside the page as it is now. This is that
+    listing, and it lives here rather than in either of them because two copies
+    of it drifted once already: the field it reads (`Step.recorded_page`) was
+    wired into healing and reported as wired into repair when it was not.
+
+    Deliberately *not* the same as either module's candidate list. Those are
+    numbered, because a model answers them with an index; this has no numbers,
+    because nothing in it is selectable -- none of it is on the page any more.
+    """
+    if not page:
+        return []
+    try:
+        before = parse(page)
+    except Exception:  # noqa: BLE001 - context is a bonus, never a requirement
+        return []
+
+    seen: set[str] = set()
+    lines: list[str] = []
+    for node in before:
+        if node.role not in roles:
+            continue
+        label = node.name or node.text
+        if not label:
+            continue
+        entry = f'- {node.role} "{label}"'
+        if entry in seen:
+            continue
+        seen.add(entry)
+        lines.append(entry)
+        if len(lines) >= limit:
+            break
+    return lines

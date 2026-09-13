@@ -3,25 +3,31 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from agent.brief import apply_walkthrough, write_walkthrough
 from auth.rbac import Permission
 from auth.service import Principal
+from browser import BrowserError
 from credentials import NO_KEY_MESSAGE, Vault, new_credential_id
 from deps import (
     WorkspaceData,
-    get_manager,
     get_replays,
     get_vault,
     require,
     run_or_404,
     usecase_or_404,
 )
-from distill import DistillationError, distill
+from engine import probe_locators
+from export import as_playwright_python, suggested_filename
+from llm import ModelChoice
+from policy import check_navigation
 from repair import (
+    locator_changes,
     RepairError,
     UseCaseDoctor,
     apply_fixes,
@@ -30,186 +36,23 @@ from repair import (
     is_unchanged,
     validate_patched,
 )
-from routers.schemas import DistillRequest, RenameRequest, RepairRequest, ScriptsRequest
-from runner import ReplayManager, RunManager
+from routers.schemas import (
+    DescribeRequest,
+    DistillRequest,
+    LocatorCheckRequest,
+    RenameRequest,
+    RepairRequest,
+    ScriptsRequest,
+)
+from runner import ReplayManager
 from services import find_failed_execution
-from usecase import UseCase
+from usecase import Locator, Step, UseCase
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["usecases"])
 
-Manager = Annotated[RunManager, Depends(get_manager)]
 Replays = Annotated[ReplayManager, Depends(get_replays)]
-
-
-@router.post("/runs/{run_id}/distill", status_code=201)
-async def distill_run(
-    run_id: str,
-    request: Request,
-    data: WorkspaceData,
-    manager: Manager,
-    vault: Annotated[Vault, Depends(get_vault)],
-    principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
-    body: DistillRequest | None = None,
-) -> dict[str, Any]:
-    """Promote a successful run into a reusable use case.
-
-    This is the one LLM call in the whole replay feature. Everything the use
-    case is later executed with costs nothing.
-    """
-    run = await run_or_404(run_id, data)
-    if run.status != "succeeded":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Only a succeeded run can be recorded as a use case; this one is "
-                f"{run.status!r}. A failed run has no reliable sequence of working "
-                "steps to learn from."
-            ),
-        )
-
-    # A replay is a use case being *executed*. Distilling one would spend an
-    # LLM call to derive a use case from a use case -- a copy of the original
-    # with its parameters already substituted into the steps, so the "inputs"
-    # would be whichever row happened to run. The button that offered this is
-    # gone from the UI, but the guard belongs here: the API is the contract.
-    options = run.options or {}
-    if options.get("replay"):
-        source = options.get("usecase_id")
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This run executed an existing use case rather than recording a new "
-                "one, so there is nothing here to distil"
-                + (f" -- it ran use case {source}." if source else ".")
-                + " To change that use case, edit it or use Fix with AI on a failure."
-            ),
-        )
-
-    events = await data.get_events(run_id)
-    # What the user named before recording. Present, parameterisation is a
-    # lookup rather than a judgement -- see fields.py.
-    declared = (run.options or {}).get("declared") or {}
-
-    try:
-        use_case = await distill(
-            events,
-            task=run.task,
-            llm=manager.distill_llm,
-            source_run_id=run_id,
-            declared=declared,
-        )
-    except DistillationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ValidationError as exc:
-        # A recording the schema cannot express is the user's problem to see,
-        # not a server fault. Name the step rather than returning a 500.
-        raise HTTPException(
-            status_code=422,
-            detail=f"This run could not be turned into a use case: {exc}",
-        ) from exc
-
-    body = body or DistillRequest()
-    if body.name:
-        use_case.name = body.name.strip() or use_case.name
-
-    definition = use_case.model_dump(mode="json", by_alias=True)
-    usecase_id, version = await data.save_usecase(
-        definition,
-        created_by="distilled",
-        created_by_id=principal.user_id,
-        owner_id=principal.user_id,
-    )
-
-    # The credentials the recording used have been sitting in memory since it
-    # started. This is the moment they are either kept or forgotten -- there is
-    # no third state, and doing nothing means forgetting.
-    credential = await _resolve_recorded_credential(
-        request.app.state.stash, run_id, body, data, vault, principal
-    )
-
-    await data.audit(
-        "usecase.distill",
-        actor_id=principal.user_id,
-        actor_email=principal.email,
-        resource_type="usecase",
-        resource_id=usecase_id,
-        detail={"run_id": run_id, "version": version},
-    )
-    log.info(
-        "distilled a run into a use case",
-        extra={"run_id": run_id, "usecase_id": usecase_id, "version": version},
-    )
-    return {
-        "usecase_id": usecase_id,
-        "version": version,
-        # A suggestion. The caller is expected to confirm or replace it via
-        # PATCH before moving on.
-        "name": use_case.name,
-        "suggested_name": use_case.name,
-        "status": use_case.status,
-        "warnings": use_case.warnings,
-        "setup_steps": len(use_case.setup_steps),
-        "row_steps": len(use_case.row_steps),
-        "inputs": [spec.name for spec in use_case.inputs],
-        "secrets": [spec.name for spec in use_case.secrets],
-        "blocked_scripts": use_case.blocked_scripts,
-        "credential": credential,
-    }
-
-
-async def _resolve_recorded_credential(
-    stash, run_id: str, body: DistillRequest, data, vault: Vault, principal: Principal
-) -> dict[str, Any] | None:
-    """Save the recording's credentials, or discard them. Never neither.
-
-    ``take`` removes them from memory whichever way this goes, so an aborted
-    save does not leave a password sitting in the process.
-    """
-    values = stash.take(run_id, workspace_id=principal.workspace_id)
-    if not values:
-        return None
-
-    if not body.save_credential_as:
-        log.info(
-            "discarded the credentials a recording used",
-            extra={"run_id": run_id, "slots": len(values)},
-        )
-        return {"saved": False, "slots": sorted(values)}
-
-    if not vault.available:
-        # Refusing beats pretending: the user asked for them to be kept and
-        # they cannot be, so say so rather than silently dropping them.
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                NO_KEY_MESSAGE + " The credentials from this recording have been "
-                "discarded; set the key and re-record, or add them by hand later."
-            ),
-        )
-
-    credential_id = await data.save_credential(
-        new_credential_id(),
-        body.save_credential_as.strip(),
-        Vault.slots_of(values),
-        vault.seal(values),
-        owner_id=principal.user_id,
-    )
-    await data.audit(
-        "credential.save",
-        actor_id=principal.user_id,
-        actor_email=principal.email,
-        resource_type="credential",
-        resource_id=credential_id,
-        detail={"name": body.save_credential_as, "from_run": run_id},
-    )
-    return {
-        "saved": True,
-        "id": credential_id,
-        "name": body.save_credential_as.strip(),
-        "slots": Vault.slots_of(values),
-    }
 
 
 @router.get("/usecases")
@@ -222,6 +65,155 @@ async def list_usecases(
 ) -> dict[str, Any]:
     rows = await data.list_usecases(status=status, limit=limit, offset=offset)
     return {"usecases": rows, "limit": limit, "offset": offset}
+
+
+@router.post("/usecases/import", status_code=201)
+async def import_usecase(
+    body: dict[str, Any],
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+) -> dict[str, Any]:
+    """Take a definition exported from another environment and land it here.
+
+    This is how a use case reaches UAT and production: it is recorded once,
+    against dev, and the document moves. Re-recording in each environment would
+    produce three different documents that drift apart, which is the thing this
+    exists to prevent.
+
+    Nothing sensitive travels. Secrets are *slots* in a definition -- names,
+    never values -- so each environment supplies its own under its own
+    ``CREDENTIALS_KEY``, and the addresses are bound to ``{{env.base_url}}``,
+    which this deployment answers for itself. See section 8.4 of the design
+    document.
+
+    Two things are deliberately not carried across, both for the same reason:
+    an approval given in one environment is not an approval in another.
+
+    ``status`` always lands at ``draft``. Publishing is per-environment, and it
+    re-validates; arriving as a draft is what forces UAT to look at this rather
+    than inherit dev's decision.
+
+    ``allow_scripts`` always lands false. It is the flag that lets a use case
+    run arbitrary JavaScript against a live page, and it is granted by a person
+    who has read the code. Carrying it across would let code approved against
+    dev's data execute against production's, which nobody would have agreed to.
+
+    The id *is* preserved, so one use case is the same use case everywhere and
+    a run in UAT can be lined up against the run in dev it came from.
+    Re-importing appends a version rather than duplicating, which makes
+    promoting a revision the same gesture as promoting it the first time.
+    """
+    # Either shape: the envelope `GET /usecases/{id}/export` produces, or a
+    # bare definition. The bare form is what this endpoint took before an
+    # export existed, and a document somebody assembled by hand is a bare
+    # definition too.
+    envelope = body if isinstance(body.get("definition"), dict) else {}
+    if envelope and int(envelope.get("trace_export") or 1) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This export was written by a newer version of TRACE "
+                f"(envelope {envelope.get('trace_export')}). Upgrade this "
+                "deployment, or export again from a matching one."
+            ),
+        )
+    incoming = {**(envelope.get("definition") if envelope else body)}
+    incoming["status"] = "draft"
+    incoming["allow_scripts"] = False
+    # A run id from the source environment names a run that does not exist in
+    # this database. Keeping it would be a reference that resolves to nothing,
+    # or worse, to something unrelated.
+    incoming.pop("source_run_id", None)
+    # An absent id is a definition built by hand rather than exported; the
+    # model mints one.
+
+    try:
+        use_case = UseCase.model_validate(incoming)
+    except ValidationError as exc:
+        # Surfaced verbatim: a definition that will not validate here is the
+        # most useful thing to show whoever is doing the promotion.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        usecase_id, version = await data.save_usecase(
+            use_case.model_dump(mode="json", by_alias=True),
+            created_by=f"imported by {principal.email}",
+            created_by_id=principal.user_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    warnings = await _promotion_gaps(use_case, data)
+
+    await data.audit(
+        "usecase.import",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="usecase",
+        resource_id=usecase_id,
+        detail={
+            "version": version,
+            "name": use_case.name,
+            "from": (envelope.get("source") or {}).get("environment") or None,
+            "gaps": len(warnings),
+        },
+    )
+    log.info(
+        "use case imported",
+        extra={"usecase_id": usecase_id, "version": version, "gaps": len(warnings)},
+    )
+    return {
+        "usecase_id": usecase_id,
+        "version": version,
+        "status": use_case.status,
+        "imported_by": principal.email,
+        "from": (envelope.get("source") or {}).get("environment") or "",
+        # What this environment still has to supply. Warnings rather than
+        # refusals: an import is how a document *arrives*, and refusing it
+        # would leave somebody with nowhere to fix the gap from.
+        "warnings": warnings,
+    }
+
+
+async def _promotion_gaps(use_case: UseCase, data: WorkspaceData) -> list[str]:
+    """What this environment still needs before the import can run.
+
+    The reason this is worth doing at all: a definition carries `base_url`, the
+    address it was recorded against, as the fallback for `{{env.base_url}}`
+    when no target answers. So a use case promoted from dev into UAT *runs*,
+    and runs against dev -- silently, correctly by its own lights, and wrongly
+    by every other measure. Nothing warned about that before.
+    """
+    gaps: list[str] = []
+
+    targets = {row.get("name") for row in await data.list_targets()}
+    if use_case.target and use_case.target not in targets:
+        gaps.append(
+            f"This use case runs against the target named {use_case.target!r}, and this "
+            "environment has no target by that name. Until you add one, it will fall "
+            f"back to the address it was recorded against ({use_case.base_url or 'none'}) "
+            "-- which is very likely the wrong environment. Add the target under "
+            "Targets, or pick a different one on this use case."
+        )
+    elif not use_case.target and use_case.base_url:
+        gaps.append(
+            f"No target is named, so this will run against {use_case.base_url}, the "
+            "address it was recorded against. If that is another environment, choose a "
+            "target for it before running anything."
+        )
+
+    if use_case.secrets:
+        slots = {slot for row in await data.list_credentials() for slot in (row.get("slots") or [])}
+        missing = sorted(spec.name for spec in use_case.secrets if spec.name not in slots)
+        if missing:
+            gaps.append(
+                "No credential here has "
+                + ", ".join(repr(name) for name in missing)
+                + ". Credentials never travel with a use case -- each environment keeps "
+                "its own -- so save one under Credentials before running this."
+            )
+
+    return gaps
 
 
 @router.get("/usecases/{usecase_id}")
@@ -320,6 +312,16 @@ async def rename_usecase(
     return {"usecase_id": usecase_id, "name": body.name.strip()}
 
 
+def _refusal(exc: ValidationError) -> str:
+    """Every reason a publish was refused, as prose somebody can act on."""
+    messages = [
+        str(error.get("msg", "")).removeprefix("Value error, ").strip()
+        for error in exc.errors()
+    ]
+    found = [message for message in messages if message]
+    return "\n\n".join(found) or "This use case cannot be published as it stands."
+
+
 @router.post("/usecases/{usecase_id}/publish")
 async def publish_usecase(
     usecase_id: str,
@@ -336,6 +338,12 @@ async def publish_usecase(
 
     try:
         UseCase.model_validate({**definition, "status": "ready"})
+    except ValidationError as exc:
+        # The message, not the report. A publish refusal is read by whoever
+        # recorded the workflow, and it is the one place the product gets to
+        # explain why their use case would have failed -- burying that in a
+        # pydantic dump wastes the only chance to say it.
+        raise HTTPException(status_code=422, detail=_refusal(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -389,6 +397,232 @@ async def set_scripts(
     return {"usecase_id": usecase_id, "scripts_enabled": body.enabled, "by": principal.email}
 
 
+@router.get("/usecases/{usecase_id}/export")
+async def export_usecase(
+    usecase_id: str,
+    request: Request,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USECASE_READ))],
+    version: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    """One use case as a document that can be imported somewhere else.
+
+    The other half of `POST /usecases/import`, which existed on its own: a
+    definition could arrive from another environment but there was no way to
+    get one out except reading the API by hand.
+
+    A wrapper around the definition rather than the bare definition, because a
+    person doing a promotion needs to know what they are holding -- which
+    environment it came from, which version, and when. The definition itself is
+    `extra="forbid"`, so provenance cannot live inside it without becoming part
+    of what a replay validates.
+
+    Nothing sensitive travels, and that is a property of the document rather
+    than of this endpoint: secrets in a definition are *slots* -- names, never
+    values -- and each environment supplies its own. The addresses are bound to
+    `{{env.base_url}}`, which the receiving deployment answers for itself.
+    """
+    definition = await data.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="No such use case.")
+
+    settings = request.app.state.settings
+    return {
+        # Version of the *envelope*, not of the use case. An importer that
+        # meets a number it does not know can say so instead of guessing.
+        "trace_export": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_by": principal.email,
+        "source": {
+            "environment": getattr(settings, "environment", "") or "unnamed",
+            "usecase_id": usecase_id,
+            "version": int(definition.get("version") or version or 1),
+            "name": definition.get("name") or "",
+        },
+        "definition": definition,
+    }
+
+
+@router.get("/usecases/{usecase_id}/export/python")
+async def export_python(
+    usecase_id: str,
+    data: WorkspaceData,
+    _: Annotated[Principal, Depends(require(Permission.USECASE_READ))],
+    version: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    """This use case as a Playwright script, for somebody to read and run.
+
+    A one-way export, and the docstring in `export.py` says why that is the
+    whole design rather than a limitation: the document is what TRACE runs and
+    what healing and repair edit, so a source file the platform depended on
+    would be a second source of truth that drifts.
+
+    Read-only. No version is written, nothing is executed, and the reply is
+    text -- this endpoint is the only one in this router that changes nothing.
+    """
+    definition = await data.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="No such use case.")
+    try:
+        use_case = UseCase.model_validate(definition)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"The stored use case is invalid: {exc}"
+        ) from exc
+
+    return {
+        "usecase_id": usecase_id,
+        "filename": suggested_filename(use_case),
+        "script": as_playwright_python(use_case, version=version or use_case.version),
+    }
+
+
+@router.post("/usecases/{usecase_id}/describe", status_code=201)
+async def describe_usecase(
+    usecase_id: str,
+    body: DescribeRequest,
+    request: Request,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+) -> dict[str, Any]:
+    """Write down what this use case does, in plain language. One LLM call.
+
+    An agent recording gets this automatically at the end of its session. This
+    is the same pass, on demand, and it exists for the two cases that one does
+    not cover: a workflow recorded with codegen, which has no model in it and
+    therefore no account of itself at all, and a use case recorded before any
+    of this existed.
+
+    **Saved at the status it already had**, unlike a repair. A repair changes
+    what runs and so must land as a draft for somebody to approve; this writes
+    prose that nothing on the replay path reads. Forcing a published use case
+    back to draft to gain a description would mean nobody ever described a
+    published one, which is most of them.
+    """
+    definition = await usecase_or_404(usecase_id, data)
+    try:
+        use_case = UseCase.model_validate(definition)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"The stored use case is invalid: {exc}"
+        ) from exc
+
+    if not use_case.all_steps:
+        raise HTTPException(
+            status_code=422,
+            detail="This use case has no steps, so there is nothing to describe.",
+        )
+
+    try:
+        choice = ModelChoice.resolve(request.app.state.settings, body.provider, body.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    walkthrough = await write_walkthrough(
+        request.app.state.repair_model.for_choice(choice),
+        use_case,
+        task=use_case.description,
+    )
+    if walkthrough is None:
+        # `write_walkthrough` swallows its own failures by design -- a session
+        # must not be lost to one. Here there is no session to lose, so the
+        # person pressing the button is told rather than left looking at an
+        # unchanged screen.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The model did not describe this use case. Nothing was changed. "
+                "Trying again, or with a different model, is safe."
+            ),
+        )
+
+    warnings = apply_walkthrough(use_case, walkthrough)
+    described = use_case.model_dump(mode="json", by_alias=True)
+    _, version = await data.save_usecase(
+        described, created_by="describe", created_by_id=principal.user_id
+    )
+    await data.audit(
+        "usecase.describe",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="usecase",
+        resource_id=usecase_id,
+        detail={
+            "version": version,
+            "purposes": len(walkthrough.purposes),
+            "tokens": walkthrough.tokens,
+        },
+    )
+    log.info(
+        "described a use case",
+        extra={"usecase_id": usecase_id, "version": version},
+    )
+    return {
+        "usecase_id": usecase_id,
+        "version": version,
+        "status": use_case.status,
+        "instructions": use_case.instructions,
+        "steps_described": len(walkthrough.purposes),
+        "warnings": warnings,
+        "llm_tokens": walkthrough.tokens,
+    }
+
+
+@router.post("/usecases/{usecase_id}/locator-check")
+async def check_locators(
+    usecase_id: str,
+    body: LocatorCheckRequest,
+    data: WorkspaceData,
+    request: Request,
+    _: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+) -> dict[str, Any]:
+    """Open a page and report what each of these locators actually matches.
+
+    This exists because editing a locator without it is editing a string. A
+    rung reads perfectly well and still matches nothing, or matches four
+    things; before this, the only way to find out was to run the use case, and
+    for an ambiguous rung the symptom was a thirty-second timeout on row one of
+    a batch.
+
+    It resolves through ``engine.build_locator`` -- the executor's own
+    composer, not a second implementation of it. A check that answered a
+    slightly different question than the run would is worse than no check, on a
+    screen whose entire purpose is to say whether an edit will work.
+
+    Nothing is saved. The reply describes the page as it is right now, and a
+    person decides what to do about it.
+    """
+    definition = await usecase_or_404(usecase_id, data)
+    use_case = UseCase.model_validate(definition)
+
+    # The same gate a run passes, for the same reason: this opens a browser and
+    # visits a URL somebody typed into a form.
+    check = check_navigation("locator_check", {"url": body.url}, use_case.allowed_domains)
+    if not check.allowed:
+        raise HTTPException(status_code=400, detail=check.reason)
+
+    parsed: list[Locator] = []
+    for index, raw in enumerate(body.locators):
+        try:
+            parsed.append(Locator.model_validate(raw))
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"locator {index} is not valid: {exc.errors()[0].get('msg', exc)}",
+            ) from exc
+
+    settings = request.app.state.settings
+    try:
+        return await probe_locators(
+            parsed, url=body.url, settings=settings, timeout_ms=body.timeout_ms
+        )
+    except BrowserError as exc:
+        # A browser that will not start is a deployment problem, not a bad
+        # locator, and saying so is the difference between fixing the
+        # environment and rewriting a rung that was always correct.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @router.delete("/usecases/{usecase_id}")
 async def archive_usecase(
     usecase_id: str,
@@ -439,19 +673,89 @@ async def archive_usecase(
     return {"usecase_id": usecase_id, "status": "archived"}
 
 
+async def _remember_repair(
+    request: Request,
+    principal: Principal,
+    *,
+    usecase_id: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    context: Any,
+    proposal: Any,
+) -> int:
+    """Write each landed locator change to healing memory. Returns how many.
+
+    Never raises into the repair. A use case that was successfully mended must
+    not be reported as failed because the thing that remembers it is switched
+    off, unreachable, or out of embedding quota -- the repair is the point and
+    the memory is the bonus.
+    """
+    try:
+        memory = request.app.state.replays.make_memory(principal.workspace_id)
+        if memory is None or not memory.available:
+            return 0
+
+        page = "\n".join(
+            f'{index}. {node.role} "{node.name or node.text}"'
+            for index, node in enumerate(candidates(context.snapshot))
+        )
+        written = 0
+        for change in locator_changes(before, after):
+            await memory.remember(
+                usecase_id=usecase_id,
+                step_id=change.step_id,
+                page_url=context.page_url or "",
+                page=page,
+                step_summary=_summarise_step(after, change.step_id),
+                wanted=change.field_name or _wanted_from(change.old_locator),
+                old_locator=change.old_locator,
+                new_locator=change.new_locator,
+                explanation=proposal.diagnosis,
+                confirmed_by=principal.email,
+            )
+            written += 1
+        return written
+    except Exception:  # noqa: BLE001 - see the docstring
+        log.warning(
+            "the repair was saved but could not be remembered",
+            extra={"usecase_id": usecase_id},
+            exc_info=True,
+        )
+        return 0
+
+
+def _summarise_step(definition: dict[str, Any], step_id: str) -> str:
+    """How the step reads, for the text a recall is matched against."""
+    for phase in ("setup_steps", "row_steps", "teardown_steps"):
+        for step in definition.get(phase) or []:
+            if step.get("id") == step_id:
+                try:
+                    return Step.model_validate(step).summary()
+                except ValidationError:
+                    return f"{step.get('action', 'step')} {step_id}"
+    return step_id
+
+
+def _wanted_from(locator: dict[str, Any] | None) -> str:
+    """What the step was looking for before the repair, in words."""
+    if not locator:
+        return ""
+    return str(locator.get("name") or locator.get("text") or locator.get("selector") or "")
+
+
 @router.post("/usecases/{usecase_id}/repair", status_code=201)
 async def repair_usecase(
     usecase_id: str,
     body: RepairRequest,
+    request: Request,
     data: WorkspaceData,
-    manager: Manager,
     principal: Annotated[Principal, Depends(require(Permission.USECASE_REPAIR))],
 ) -> dict[str, Any]:
     """Mend a use case that failed, using the page as it was when it broke.
 
     One LLM call. The result is saved as a new **draft** version -- existing
     versions are untouched and a person publishes it, which is the same gate a
-    freshly distilled use case passes through.
+    recorded use case passes through.
     """
     definition = await usecase_or_404(usecase_id, data)
 
@@ -490,7 +794,26 @@ async def repair_usecase(
         }
 
     context = gather_context(use_case, execution, events)
-    doctor = UseCaseDoctor(manager.repair_llm)
+    # Handed the memory so the button reads what it has already learned, not
+    # only writes to it. Built the same way the healer's is, and None when
+    # healing memory is switched off.
+    try:
+        recall = request.app.state.replays.make_memory(principal.workspace_id)
+    except Exception:  # noqa: BLE001 - a repair must not fail for want of recall
+        log.warning("healing memory is unavailable to this repair", exc_info=True)
+        recall = None
+    # The model this browser asked for, if it asked. Repair is a single
+    # judgement call written back into the use case, so which model made it is
+    # exactly the thing somebody comparing models wants to control.
+    try:
+        choice = ModelChoice.resolve(
+            request.app.state.settings, body.provider, body.model
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    doctor = UseCaseDoctor(
+        request.app.state.repair_model.for_choice(choice), memory=recall
+    )
     try:
         proposal = await doctor.diagnose(context)
     except RepairError as exc:
@@ -507,7 +830,9 @@ async def repair_usecase(
             "llm_tokens": proposal.tokens,
         }
 
-    patched, applied = apply_fixes(definition, proposal, candidates(context.snapshot))
+    patched, applied = apply_fixes(
+        definition, proposal, candidates(context.snapshot), context.snapshot
+    )
 
     # A repair that changes nothing must not be reported as one, and must not
     # leave a version behind. Otherwise pressing the button appears to work
@@ -555,13 +880,37 @@ async def repair_usecase(
     )
     await data.set_usecase_status(usecase_id, "draft")
 
+    # Learn from it. Without this the button mends one use case and teaches the
+    # system nothing: the in-run healer wrote every high-confidence fix to
+    # healing memory, and this path -- the one a person actually presses -- did
+    # not, so the same page change was diagnosed from scratch every time, at the
+    # cost of an LLM call each.
+    #
+    # Stamped with the person's email rather than "model". They chose to repair
+    # this, looked at the result and published it, which is a stronger signal
+    # than an unattended heal, and `as_prompt` sorts on exactly that.
+    remembered = await _remember_repair(
+        request,
+        principal,
+        usecase_id=usecase_id,
+        before=definition,
+        after=patched,
+        context=context,
+        proposal=proposal,
+    )
+
     await data.audit(
         "usecase.repair",
         actor_id=principal.user_id,
         actor_email=principal.email,
         resource_type="usecase",
         resource_id=usecase_id,
-        detail={"version": version, "fixes": len(applied), "tokens": proposal.tokens},
+        detail={
+            "version": version,
+            "fixes": len(applied),
+            "tokens": proposal.tokens,
+            "remembered": remembered,
+        },
     )
     log.info(
         "repaired a use case",
@@ -574,5 +923,6 @@ async def repair_usecase(
         "diagnosis": proposal.diagnosis,
         "confidence": proposal.confidence,
         "applied": applied,
+        "remembered": remembered,
         "llm_tokens": proposal.tokens,
     }

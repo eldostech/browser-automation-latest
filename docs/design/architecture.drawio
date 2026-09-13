@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  System architecture, as two draw.io pages: a simplified view for
+  leadership and a detailed view for engineering. Generated from the
+  actual backend/frontend code paths in this repository; protocol labels
+  and the deterministic/agent split reflect what the code does, not an
+  aspirational design. See README.md's "Architecture" section and
+  docs/design/agent-and-deterministic.md for the prose version.
+
+  Open with app.diagrams.net (draw.io): File > Open From > Device, or
+  drag this file onto the app. Both pages are editable; source/target
+  edges are attached to their nodes, so moving a box keeps its arrows.
+-->
+<mxfile host="app.diagrams.net" agent="trace-docs" version="24.7.5" type="device">
+  <diagram name="Leadership View" id="leadership-view">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1280" pageHeight="720" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ================= nodes ================= -->
+        <mxCell id="L-you" value="&lt;b&gt;You&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;the operator&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=12;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.5;fontFamily=Helvetica;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="190" height="86" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-web" value="&lt;b&gt;Web Dashboard&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;record &amp;middot; review &amp;middot; run&lt;br&gt;watch results live&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.5;fontFamily=Helvetica;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="300" y="30" width="240" height="106" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-service" value="&lt;b&gt;TRACE Service&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;the engine that runs every workflow&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270;font-style:italic&quot;&gt;a person approves every workflow before it runs at scale&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#EEF0F4;strokeColor=#171A21;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontStyle=1;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="642" y="14" width="270" height="138" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-db" value="&lt;b&gt;Your Database&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;every workflow, every run, every result &amp;mdash; kept safely, on infrastructure you own&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#E3F5EE;strokeColor=#047A55;strokeWidth=1.8;fontFamily=Helvetica;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="330" y="302" width="300" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-ai" value="&lt;b&gt;AI Assistant&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;Claude, via AWS Bedrock&lt;br&gt;helps set a workflow up, or fixes one when a site changes&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.8;dashed=1;fontFamily=Helvetica;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="627" y="302" width="300" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-site" value="&lt;b&gt;Target Website&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px;color:#5B6270&quot;&gt;does the actual clicking, typing and reading &amp;mdash; thousands of times over&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;fillColor=#E6ECFB;strokeColor=#2451C9;strokeWidth=1.8;fontFamily=Helvetica;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="924" y="302" width="300" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="L-why" value="&lt;b&gt;Why this shape matters&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:12px;color:#5B6270&quot;&gt;1. Set up once &amp;mdash; with or without AI help, your choice.&lt;br&gt;2. A person reviews and approves it before it ever runs at scale.&lt;br&gt;3. Every run after that is mechanical &amp;mdash; same steps, zero AI spend, predictable cost.&lt;br&gt;4. The AI only comes back if the target site changes and a step breaks.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=13;fontStyle=1;align=left;verticalAlign=top;spacing=14;" vertex="1" parent="1">
+          <mxGeometry x="300" y="470" width="680" height="150" as="geometry" />
+        </mxCell>
+
+        <!-- ================= edges ================= -->
+        <mxCell id="Le-you-web" value="records / reviews / watches" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#5B6270;strokeColor=#171A21;strokeWidth=1.5;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="L-you" target="L-web">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Le-web-service" value="secure connection (dashboard &amp;#8644; service)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#5B6270;strokeColor=#171A21;strokeWidth=1.5;startArrow=block;startFill=1;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="L-web" target="L-service">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Le-service-db" value="always" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=11;fontStyle=1;fontColor=#047A55;strokeColor=#047A55;strokeWidth=1.8;endArrow=block;endFill=1;exitX=0.35;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="L-service" target="L-db">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Le-service-ai" value="sometimes &amp;mdash; never for the repeat work" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=11;fontStyle=1;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.8;dashed=1;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="L-service" target="L-ai">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Le-service-site" value="every run &amp;mdash; no extra AI cost" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=11;fontStyle=1;fontColor=#2451C9;strokeColor=#2451C9;strokeWidth=1.8;endArrow=block;endFill=1;exitX=0.65;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="L-service" target="L-site">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <diagram name="Technical View" id="technical-view">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1720" pageHeight="1180" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ================= top: user + web app ================= -->
+        <mxCell id="T-user" value="&lt;b&gt;User's browser&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10.5px;color:#5B6270&quot;&gt;operator &amp;mdash; chrome/edge/etc.&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.4;fontFamily=Helvetica;fontSize=13;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="30" width="230" height="72" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-webapp" value="&lt;b&gt;Web App&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10.5px;color:#5B6270&quot;&gt;React 18 + Vite + TS&lt;br&gt;:5173 dev / static in prod&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.5;fontFamily=Helvetica;fontSize=13;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="148" width="230" height="88" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Te-user-web" value="HTTPS &amp;mdash; loads app" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#5B6270;strokeColor=#171A21;strokeWidth=1.4;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="T-user" target="T-webapp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ================= API outer container ================= -->
+        <mxCell id="T-api" value="API &amp;mdash; FastAPI  ::8000  &amp;middot;  routers/ &amp;rarr; services.py &amp;rarr; store.py (tenancy-scoped)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#171A21;strokeWidth=1.6;verticalAlign=top;align=left;spacing=10;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="288" width="1240" height="590" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Te-web-rest" value="REST /api/* (JSON)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#5B6270;strokeColor=#171A21;strokeWidth=1.4;endArrow=block;endFill=1;exitX=0.75;exitY=1;entryX=0.15;entryY=0;" edge="1" parent="1" source="T-webapp" target="T-api">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-web-wss" value="WSS /runs/{id}/stream &amp;mdash; live events, resumable by seq" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#5B6270;strokeColor=#171A21;strokeWidth=1.4;dashed=1;startArrow=block;startFill=1;endArrow=block;endFill=1;exitX=0.25;exitY=1;entryX=0.05;entryY=0;" edge="1" parent="1" source="T-webapp" target="T-api">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ================= Lane A: deterministic ================= -->
+        <mxCell id="T-laneA" value="DETERMINISTIC REPLAY &amp;mdash; no LLM, ever" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#2451C9;strokeWidth=1.6;dashed=1;verticalAlign=top;align=center;spacing=10;fontFamily=Helvetica;fontSize=12.5;fontStyle=1;fontColor=#2451C9;" vertex="1" parent="1">
+          <mxGeometry x="66" y="332" width="588" height="470" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-recorder" value="&lt;b&gt;Recorder&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;recorder.py &amp;rarr; codegen.py&lt;br&gt;ast-parsed, never exec'd&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="90" y="372" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-mapping" value="&lt;b&gt;Mapping&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;ingest.py &amp;rarr; mapping.py&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:9.5px;color:#B45309&quot;&gt;heuristics first, Bedrock fallback&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.2;dashed=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="368" y="372" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-engine" value="&lt;b&gt;Engine&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;engine.py &amp;mdash; UseCaseExecutor&lt;br&gt;imports no llm &amp;mdash; a test asserts it&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="90" y="464" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-batch" value="&lt;b&gt;Batch + Queue&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;batch.py &amp;middot; jobs.py &amp;middot; worker.py&lt;br&gt;Postgres queue, SKIP LOCKED&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="368" y="464" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-healing" value="&lt;b&gt;Healing&lt;/b&gt;  &amp;mdash;  &lt;font style=&quot;color:#B45309&quot;&gt;healing.py &amp;mdash; one budgeted Bedrock call, off by default, only when a locator breaks&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.2;dashed=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="90" y="556" width="534" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-guardshared" value="&lt;b&gt;guardrails shared with the agent path&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;policy.py &amp;mdash; domain allowlist, enforced on every navigation&lt;br&gt;redaction.py &amp;mdash; secrets never reach the event log&lt;br&gt;memory.py &amp;mdash; pgvector recall of past fixes (healing only)&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:9.5px;color:#5B6270;font-style:italic&quot;&gt;&amp;quot;the model can never invent a locator&amp;quot; &amp;mdash; enforced here, not requested&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF0F4;strokeColor=#171A21;strokeWidth=1.1;fontFamily=Helvetica;fontSize=11.5;fontStyle=1;align=center;verticalAlign=middle;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="90" y="654" width="534" height="128" as="geometry" />
+        </mxCell>
+
+        <!-- ================= Lane B: agent ================= -->
+        <mxCell id="T-laneB" value="AI AGENT &amp;mdash; create_agent (LangGraph)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#B45309;strokeWidth=1.8;verticalAlign=top;align=center;spacing=10;fontFamily=Helvetica;fontSize=12.5;fontStyle=1;fontColor=#B45309;" vertex="1" parent="1">
+          <mxGeometry x="670" y="332" width="588" height="470" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-manager" value="&lt;b&gt;Session manager&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;agent/manager.py&lt;br&gt;HTTP-facing lifecycle, in memory&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="694" y="372" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-toolsguard" value="&lt;b&gt;Tools + guardrails&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;agent/tools/ &amp;middot; agent/guardrails/&lt;br&gt;what's offered, what needs a person&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="972" y="372" width="262" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-graph" value="&lt;b&gt;Graph + middleware&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;agent/graph.py&lt;br&gt;Budget &amp;middot; Finish &amp;middot; HumanInTheLoop&lt;br&gt;interrupt survives a restart&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="694" y="464" width="256" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-distil" value="&lt;b&gt;Distil + verify&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;distil.py &amp;middot; verify.py&lt;br&gt;session &amp;rarr; UseCase, cold-replayed first&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="972" y="464" width="262" height="76" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-toolsession" value="&lt;b&gt;AgentToolSession &amp;mdash; the one dispatch point&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#B45309&quot;&gt;session.py &amp;mdash; guard() &amp;rarr; secret substitution &amp;rarr; dispatch &amp;rarr; redact &amp;rarr; audit&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.4;fontFamily=Helvetica;fontSize=12.5;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="694" y="556" width="540" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ================= subprocess row ================= -->
+        <mxCell id="T-chrome-replay" value="&lt;b&gt;Chromium &amp;mdash; replay&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;CDP, direct control&lt;br&gt;no accessibility-tree hop&lt;br&gt;1 browser, 1 context, 1 page&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6ECFB;strokeColor=#2451C9;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="66" y="878" width="228" height="112" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-mcp-pw" value="&lt;b&gt;Playwright MCP&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;npx @playwright/mcp&lt;br&gt;local subprocess, pinned version&lt;br&gt;--isolated profile per session&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="708" y="878" width="228" height="112" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-chrome-agent" value="&lt;b&gt;Chromium &amp;mdash; agent&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;driven via MCP &amp;rarr; CDP&lt;br&gt;or an in-process adapter over&lt;br&gt;the replay's own browser (recovery)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="960" y="878" width="228" height="112" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-mcp-other" value="&lt;b&gt;Other MCP servers&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;workspace-registered&lt;br&gt;e.g. an internal CRM lookup&lt;br&gt;never becomes a replay step&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FAF0E0;strokeColor=#B45309;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="878" width="230" height="112" as="geometry" />
+        </mxCell>
+
+        <!-- ================= Postgres ================= -->
+        <mxCell id="T-pg" value="&lt;b&gt;PostgreSQL + pgvector&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10.5px;color:#5B6270&quot;&gt;app data &amp;middot; job queue (SKIP LOCKED) &amp;middot; event bus (LISTEN/NOTIFY) &amp;middot; embeddings&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;workspace-scoped by construction &amp;mdash; no query can forget the tenant filter&lt;br&gt;every event carries run_id:seq:origin &amp;mdash; the client's resume token&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F5EE;strokeColor=#047A55;strokeWidth=1.7;fontFamily=Helvetica;fontSize=13.5;fontStyle=1;align=center;verticalAlign=middle;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="380" y="1024" width="600" height="112" as="geometry" />
+        </mxCell>
+
+        <!-- ================= Bedrock ================= -->
+        <mxCell id="T-bedrock" value="AWS Bedrock  &amp;middot;  HTTPS + AWS SigV4" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEF0F4;strokeColor=#B45309;strokeWidth=1.8;verticalAlign=top;align=center;spacing=10;fontFamily=Helvetica;fontSize=14.5;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1350" y="332" width="330" height="470" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-claude" value="&lt;b&gt;Claude &amp;mdash; Converse API&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;agent authoring, mapping, repair&lt;br&gt;prompt-cached&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=11.5;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1372" y="410" width="286" height="78" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-titan" value="&lt;b&gt;Titan Embeddings&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;healing memory recall (pgvector)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=11.5;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="1372" y="502" width="286" height="66" as="geometry" />
+        </mxCell>
+
+        <mxCell id="T-callsites" value="&lt;b&gt;three call sites, by policy&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px;color:#5B6270&quot;&gt;&amp;bull; mapping &amp;mdash; fallback only, when heuristics can't tell&lt;br&gt;&amp;bull; healing &amp;mdash; one budgeted call, off by default&lt;br&gt;&amp;bull; agent authoring &amp;mdash; every turn, system prompt + tools cached&lt;/font&gt;&lt;br&gt;&lt;font style=&quot;font-size:9.5px;color:#5B6270;font-style:italic&quot;&gt;replay itself never calls this box &amp;mdash; engine.py has no parameter that could&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#171A21;strokeWidth=1.2;fontFamily=Helvetica;fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1372" y="584" width="286" height="196" as="geometry" />
+        </mxCell>
+
+        <!-- ================= edges: dispatch -> MCP / CDP ================= -->
+        <mxCell id="Te-tools-mcppw" value="MCP protocol &amp;mdash; JSON-RPC 2.0 / stdio" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.6;endArrow=block;endFill=1;exitX=0.15;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="T-toolsession" target="T-mcp-pw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-mcppw-chromeagent" value="CDP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.6;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="T-mcp-pw" target="T-chrome-agent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-tools-mcpother" value="MCP protocol &amp;mdash; JSON-RPC 2.0 / stdio (one subprocess per server)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.6;endArrow=block;endFill=1;exitX=0.85;exitY=1;entryX=0.4;entryY=0;" edge="1" parent="1" source="T-toolsession" target="T-mcp-other">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="Te-engine-chromereplay" value="Playwright / CDP &amp;mdash; direct, no MCP hop" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#2451C9;strokeColor=#2451C9;strokeWidth=1.6;endArrow=block;endFill=1;exitX=0.3;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="T-engine" target="T-chrome-replay">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ================= edges: -> Postgres ================= -->
+        <mxCell id="Te-batch-pg" value="SQL (asyncpg)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#047A55;strokeColor=#047A55;strokeWidth=1.5;endArrow=block;endFill=1;exitX=0.5;exitY=1;entryX=0.15;entryY=0;" edge="1" parent="1" source="T-guardshared" target="T-pg">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-toolsession-pg" value="SQL (asyncpg)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#047A55;strokeColor=#047A55;strokeWidth=1.5;dashed=1;endArrow=block;endFill=1;exitX=0.3;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="T-toolsession" target="T-pg">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- ================= edges: -> Bedrock ================= -->
+        <mxCell id="Te-mapping-bedrock" value="HTTPS + SigV4 &amp;mdash; mapping fallback" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.4;dashed=1;endArrow=block;endFill=1;exitX=1;exitY=0.3;entryX=0;entryY=0.15;" edge="1" parent="1" source="T-mapping" target="T-bedrock">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-healing-bedrock" value="HTTPS + SigV4 &amp;mdash; 1 call, off by default" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.4;dashed=1;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.35;" edge="1" parent="1" source="T-healing" target="T-bedrock">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Te-graph-bedrock" value="HTTPS + SigV4 &amp;mdash; every turn, prompt-cached" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontFamily=Helvetica;fontSize=10.5;fontStyle=1;fontColor=#B45309;strokeColor=#B45309;strokeWidth=1.8;endArrow=block;endFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.55;" edge="1" parent="1" source="T-graph" target="T-bedrock">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

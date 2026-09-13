@@ -47,6 +47,20 @@ class Terminal:
     summary: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    #: What this run spent. On the terminal rather than only in ``result`` so
+    #: it lands in columns that can be summed: "what has this workspace spent
+    #: this month" is a question with a JSONB answer otherwise, which is a
+    #: question nobody asks twice.
+    tokens: int = 0
+    cost_usd: float = 0.0
+    #: True when the run already emitted its own `run_finished` through this
+    #: same sink before this block exited. The agent graph does exactly that
+    #: -- `author.py`'s `finish` node announces the session itself, since
+    #: `run_agent_session` is also used standalone with no lifecycle wrapping
+    #: it at all. Persisting here must not announce it a second time with a
+    #: status computed by a different rule; every other run type leaves this
+    #: False and gets the one announcement this class exists to guarantee.
+    announced: bool = False
 
 
 class RunLifecycle:
@@ -75,13 +89,30 @@ class RunLifecycle:
         redactor: Redactor | None = None,
         sink_wrapper: Any = None,
         mark_started: bool = True,
+        flush_interval: float | None = None,
+        max_batch: int | None = None,
     ) -> None:
         from runner import RunEventSink  # circular at module scope; fine here
 
         self.run_id = run_id
         self.data = data
         self.redactor = redactor or (Redactor(secrets) if secrets else NULL_REDACTOR)
-        inner = RunEventSink(run_id, data, bus, api_base=api_base, redactor=self.redactor)
+        from eventbuffer import DEFAULT_INTERVAL, DEFAULT_MAX_BATCH
+
+        inner = RunEventSink(
+            run_id,
+            data,
+            bus,
+            api_base=api_base,
+            redactor=self.redactor,
+            flush_interval=DEFAULT_INTERVAL if flush_interval is None else flush_interval,
+            max_batch=DEFAULT_MAX_BATCH if max_batch is None else max_batch,
+        )
+        #: Kept beside the wrapped one so the buffered writer can be flushed
+        #: and closed on the way out. A wrapper intercepts `emit`; it has no
+        #: reason to know that writes are batched, and no reason to forward a
+        #: method it does not use.
+        self._inner = inner
         #: The agent wraps its sink to intercept approval events; replays do
         #: not. Applying the wrapper here keeps the difference to one argument.
         self.sink = sink_wrapper(inner) if sink_wrapper else inner
@@ -128,18 +159,26 @@ class RunLifecycle:
 
     async def _persist(self) -> None:
         terminal = self._terminal
-        await self.sink.emit(
-            RunFinished(
-                run_id=self.run_id,
-                seq=self.sink.reserve_seq(),
-                status=terminal.status,
-                steps=terminal.steps,
-                duration_ms=terminal.duration_ms,
-                summary=terminal.summary,
-                result=terminal.result,
-                error=terminal.error,
+        if not terminal.announced:
+            await self.sink.emit(
+                RunFinished(
+                    run_id=self.run_id,
+                    seq=self.sink.reserve_seq(),
+                    status=terminal.status,
+                    steps=terminal.steps,
+                    duration_ms=terminal.duration_ms,
+                    summary=terminal.summary,
+                    result=terminal.result,
+                    error=terminal.error,
+                )
             )
-        )
+        # Before the run row says the run is over, and that order is the point.
+        # Events are written in batches now, so the terminal event and whatever
+        # else is still buffered have to reach the database before anything
+        # tells a client to stop watching -- otherwise a dashboard sees
+        # "succeeded" and a catch-up read that is missing the last few events.
+        await self._close_sink()
+
         await self.data.finish_run(
             self.run_id,
             terminal.status,
@@ -148,6 +187,8 @@ class RunLifecycle:
             summary=terminal.summary,
             result=terminal.result,
             error=terminal.error,
+            tokens=terminal.tokens,
+            cost_usd=terminal.cost_usd,
         )
         log.info(
             "run finished",
@@ -158,6 +199,17 @@ class RunLifecycle:
                 "duration_ms": terminal.duration_ms,
             },
         )
+
+
+    async def _close_sink(self) -> None:
+        """Flush and stop the buffered writer. Never raises into finalisation."""
+        close = getattr(self._inner, "aclose", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except Exception:  # noqa: BLE001 - finalising must not mask the real error
+            log.exception("failed to flush a run's events", extra={"run_id": self.run_id})
 
 
 __all__ = ["RunLifecycle", "Terminal"]

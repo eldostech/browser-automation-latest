@@ -1,6 +1,6 @@
-"""The HTTP + WebSocket surface, wired to a fake MCP session and a scripted LLM.
+"""The HTTP + WebSocket surface, wired to a fake browser and a scripted LLM.
 
-These run the real FastAPI app (lifespan included) but never spawn a browser
+These run the real FastAPI app (lifespan included) but never launch a browser
 and never call a model.
 """
 
@@ -12,24 +12,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import FakeMCPSession, ScriptedLLM, final_turn, tool_turn
+from conftest import ScriptedLLM, final_turn, tool_turn
+from fake_browser import SIGNED_IN, SIGNED_OUT, session_serving
 
 
-class FakeMCPBrowserSession:
-    """Drop-in replacement for the real session's async context manager."""
-
-    def __init__(self, config: Any) -> None:
-        self.config = config
-
-    async def __aenter__(self) -> FakeMCPSession:
-        return FakeMCPSession()
-
-    async def __aexit__(self, *exc_info: Any) -> bool:
-        return False
-
-
-async def _fake_probe(config: Any, timeout: float = 20.0) -> dict[str, Any]:
-    return {"ok": True, "transport": "stdio", "tool_count": 5, "tools": ["browser_snapshot"]}
+#: The browser these tests replay against. Named for what it stands in for
+#: rather than for MCP, which no longer exists here.
+FakeBrowser = session_serving([SIGNED_OUT, SIGNED_IN], {"/signin": SIGNED_OUT})
 
 
 @pytest.fixture
@@ -51,11 +40,58 @@ def app_under_test(db_settings, db_engine, tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.setattr("routers.health.probe", _fake_probe)
-    monkeypatch.setattr(runner_module, "MCPBrowserSession", FakeMCPBrowserSession)
-    monkeypatch.setattr(main, "probe", _fake_probe)
+    monkeypatch.setattr(runner_module, "PlaywrightSession", FakeBrowser)
 
     return main.create_app(api_settings(db_settings, tmp_path))
+
+
+async def seed_run(client, *, status: str = "succeeded", events: int = 3) -> str:
+    """A finished run with a few events, written straight into the store.
+
+    Runs are created by executing a use case now, not by asking a model to go
+    and do something. These tests are about reading one back -- its events, its
+    artifacts, the WebSocket -- so they seed one directly rather than driving
+    an execution to produce it.
+    """
+    from conftest import app_workspace
+    from events import RunFinished, RunStarted, StepFinished, StepStarted
+
+    store = await app_workspace(client.app)
+    run_id = "run-seed"
+    await store.create_run(run_id, "Replay: sign in and open a record", None, {"replay": True})
+
+    # Bracketed by run_started/run_finished exactly as an execution writes it:
+    # the WebSocket replays what is in the table, and a client reads until the
+    # terminal event tells it to stop.
+    seq = 1
+    await store.append_event(
+        RunStarted(run_id=run_id, seq=seq, task="Replay: sign in and open a record", options={})
+    )
+    for step in range(1, events + 1):
+        seq += 1
+        await store.append_event(
+            StepStarted(
+                run_id=run_id, seq=seq, step=step, step_id=f"s{step}",
+                action="click", description="click Sign in", phase="row",
+            )
+        )
+        seq += 1
+        await store.append_event(
+            StepFinished(
+                run_id=run_id, seq=seq, step=step, step_id=f"s{step}",
+                ok=True, duration_ms=5,
+            )
+        )
+
+    seq += 1
+    await store.append_event(
+        RunFinished(
+            run_id=run_id, seq=seq, status=status, steps=events,
+            duration_ms=100, summary="done",
+        )
+    )
+    await store.finish_run(run_id, status, steps=events, duration_ms=100, summary="done")
+    return run_id
 
 
 @pytest.fixture
@@ -81,7 +117,7 @@ def client(app_under_test):
 
 def use_llm(client: TestClient, *turns) -> ScriptedLLM:
     llm = ScriptedLLM(list(turns), repeat_last=False)
-    client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
+    client.app.state.repair_model._client = llm  # noqa: SLF001 - test seam
     return llm
 
 
@@ -115,12 +151,15 @@ def test_healthz_reports_dependencies(client):
     assert body["status"] == "ok"
     assert body["database"]["ok"] is True
     assert body["llm"]["configured"] is True
-    assert body["mcp"]["ok"] is True
+    # No browser probe: Playwright is a library in this process, not a server
+    # that can be down while everything else is up.
+    assert body["browser"]["engine"] == "chromium"
 
 
 def test_config_endpoint_exposes_defaults_and_no_secrets(client):
     body = client.get("/api/config").json()
-    assert body["defaults"]["allowed_domains"] == ["example.com"]
+    assert body["defaults"]["browser"] == "chromium"
+    assert body["recorder"]["enabled"] in (True, False)
     assert "key" not in str(body).lower() or "api_key" not in str(body).lower()
     assert "test-key-not-used" not in str(body)
 
@@ -129,51 +168,9 @@ def test_unknown_run_is_404(client):
     assert client.get("/api/runs/nope").status_code == 404
 
 
-def test_task_is_required(client):
-    assert client.post("/api/runs", json={"task": ""}).status_code == 422
-
-
-def test_start_url_must_be_http(client):
-    response = client.post("/api/runs", json={"task": "x", "start_url": "file:///etc/passwd"})
-    assert response.status_code == 422
-
-
-# --- run lifecycle ---------------------------------------------------------
-
-
-def test_run_completes_and_is_persisted(client):
-    use_llm(
-        client,
-        tool_turn("browser_snapshot", {}, text="Looking at the page."),
-        final_turn('All done.\n```json\n{"items": 3}\n```'),
-    )
-
-    created = client.post("/api/runs", json={"task": "count the items"})
-    assert created.status_code == 201
-    run_id = created.json()["run_id"]
-
-    body = wait_for_status(client, run_id)
-    assert body["status"] == "succeeded"
-    assert body["result"]["data"] == {"items": 3}
-    assert body["steps"] >= 1
-
-    listed = client.get("/api/runs").json()
-    assert any(run["id"] == run_id for run in listed["runs"])
-    assert client.get("/api/runs?status=succeeded").json()["total"] == 1
-
-    events = client.get(f"/api/runs/{run_id}/events").json()["events"]
-    types = [event["type"] for event in events]
-    assert types[0] == "run_started"
-    assert types[-1] == "run_finished"
-    assert "tool_call" in types and "tool_result" in types
-
-    seqs = [event["seq"] for event in events]
-    assert seqs == sorted(seqs) == list(dict.fromkeys(seqs))
-
-
-def test_events_can_be_replayed_from_a_sequence_number(client):
+async def test_events_can_be_replayed_from_a_sequence_number(client):
     use_llm(client, final_turn("done"))
-    run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
+    run_id = await seed_run(client)
     wait_for_status(client, run_id)
 
     everything = client.get(f"/api/runs/{run_id}/events").json()["events"]
@@ -182,9 +179,8 @@ def test_events_can_be_replayed_from_a_sequence_number(client):
     assert tail[0]["seq"] == 2
 
 
-def test_websocket_replays_a_finished_run_then_closes(client):
-    use_llm(client, tool_turn("browser_snapshot", {}), final_turn("done"))
-    run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
+async def test_websocket_replays_a_finished_run_then_closes(client):
+    run_id = await seed_run(client)
     wait_for_status(client, run_id)
 
     received = []
@@ -205,9 +201,8 @@ def test_websocket_replays_a_finished_run_then_closes(client):
     assert received[-1]["status"] == "succeeded"
 
 
-def test_websocket_resume_skips_already_seen_events(client):
-    use_llm(client, tool_turn("browser_snapshot", {}), final_turn("done"))
-    run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
+async def test_websocket_resume_skips_already_seen_events(client):
+    run_id = await seed_run(client)
     wait_for_status(client, run_id)
 
     with client.websocket_connect(ws_url(client, f"/api/runs/{run_id}/stream?after_seq=2")) as socket:
@@ -224,143 +219,36 @@ def test_websocket_rejects_an_unknown_run(client):
 # --- approvals -------------------------------------------------------------
 
 
-def test_approval_pauses_the_run_until_a_human_answers(client):
-    use_llm(
-        client,
-        tool_turn("browser_click", {"element": "Place order"}),
-        final_turn("ordered"),
-    )
-    run_id = client.post(
-        "/api/runs", json={"task": "buy it", "require_approval": True}
-    ).json()["run_id"]
-
-    # Wait for the loop to block on the approval.
-    pending = None
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        body = client.get(f"/api/runs/{run_id}").json()
-        if body.get("pending_approval"):
-            pending = body["pending_approval"]
-            break
-        time.sleep(0.05)
-
-    assert pending is not None, "the run should have paused for approval"
-    assert pending["name"] == "browser_click"
-    assert "payment" in pending["categories"]
-
-    approved = client.post(
-        f"/api/runs/{run_id}/approve",
-        json={"decision": "approve", "approval_id": pending["approval_id"]},
-    )
-    assert approved.status_code == 200
-
-    body = wait_for_status(client, run_id)
-    assert body["status"] == "succeeded"
-
-    types = [event["type"] for event in client.get(f"/api/runs/{run_id}/events").json()["events"]]
-    assert "approval_required" in types and "approval_resolved" in types
-
-
-def test_rejecting_an_approval_blocks_the_action(client):
-    use_llm(
-        client,
-        tool_turn("browser_click", {"element": "Delete account"}),
-        final_turn("I stopped."),
-    )
-    run_id = client.post("/api/runs", json={"task": "delete it"}).json()["run_id"]
-
-    pending = None
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        body = client.get(f"/api/runs/{run_id}").json()
-        if body.get("pending_approval"):
-            pending = body["pending_approval"]
-            break
-        time.sleep(0.05)
-    assert pending is not None
-
-    client.post(
-        f"/api/runs/{run_id}/approve",
-        json={"decision": "reject", "approval_id": pending["approval_id"], "note": "not today"},
-    )
-
-    body = wait_for_status(client, run_id)
-    assert body["status"] == "succeeded"
-
-    events = client.get(f"/api/runs/{run_id}/events").json()["events"]
-    resolved = [e for e in events if e["type"] == "approval_resolved"]
-    assert resolved[0]["decision"] == "rejected"
-    assert resolved[0]["note"] == "not today"
-
-
-def test_approving_when_nothing_is_pending_is_a_conflict(client):
+async def test_cancelling_a_finished_run_is_a_no_op(client):
     use_llm(client, final_turn("done"))
-    run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
-    wait_for_status(client, run_id)
-
-    response = client.post(f"/api/runs/{run_id}/approve", json={"decision": "approve"})
-    assert response.status_code == 409
-
-
-# --- cancellation ----------------------------------------------------------
-
-
-def test_cancelling_a_finished_run_is_a_no_op(client):
-    use_llm(client, final_turn("done"))
-    run_id = client.post("/api/runs", json={"task": "t"}).json()["run_id"]
+    run_id = await seed_run(client)
     wait_for_status(client, run_id)
 
     body = client.post(f"/api/runs/{run_id}/cancel").json()
     assert body["cancelled"] is False
 
 
-def test_cancelling_an_in_flight_run_marks_it_cancelled(client):
-    # A run that pauses for approval is a convenient way to hold it open.
-    use_llm(client, tool_turn("browser_click", {"element": "Submit payment"}), final_turn("x"))
-    run_id = client.post("/api/runs", json={"task": "pay"}).json()["run_id"]
+async def test_screenshots_are_served_as_artifacts(client):
+    """A screenshot is stored once and served by id.
 
-    deadline = time.time() + 10
-    paused = False
-    while time.time() < deadline:
-        if client.get(f"/api/runs/{run_id}").json().get("pending_approval"):
-            paused = True
-            break
-        time.sleep(0.05)
+    Seeded rather than produced by a run: what is under test is the artifact
+    endpoint -- that it finds the bytes, sets the type, and refuses an id from
+    another tenant -- not that an execution takes pictures, which
+    ``test_e2e_engine.py`` covers against a real browser.
+    """
+    from conftest import app_workspace
 
-    # Falling out of the loop without pausing used to leave the test cancelling
-    # a run that was already finishing, which is a different scenario wearing
-    # this test's name.
-    assert paused, "the run never paused for approval, so there was nothing to cancel"
-    assert client.post(f"/api/runs/{run_id}/cancel").json()["cancelled"] is True
+    run_id = await seed_run(client)
+    store = await app_workspace(client.app)
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+    await store.save_artifact(run_id, png, kind="screenshot", mime="image/png", seq=1)
 
-    body = wait_for_status(client, run_id)
-    assert body["status"] == "cancelled"
+    detail = client.get(f"/api/runs/{run_id}").json()
+    assert detail["artifacts"], "expected at least one screenshot artifact"
 
-    # A cancelled run must still emit its terminal event, or watchers hang.
-    types = [e["type"] for e in client.get(f"/api/runs/{run_id}/events").json()["events"]]
-    assert types[-1] == "run_finished"
-
-
-# --- artifacts -------------------------------------------------------------
-
-
-def test_screenshots_are_served_as_artifacts(client):
-    client.app.state.settings.agent_screenshot_every_step = True
-    try:
-        use_llm(client, tool_turn("browser_snapshot", {}), final_turn("done"))
-        run_id = client.post(
-            "/api/runs", json={"task": "t", "screenshot_every_step": True}
-        ).json()["run_id"]
-        wait_for_status(client, run_id)
-
-        detail = client.get(f"/api/runs/{run_id}").json()
-        assert detail["artifacts"], "expected at least one screenshot artifact"
-
-        image = client.get(detail["artifacts"][0]["url"])
-        assert image.status_code == 200
-        assert image.content.startswith(b"\x89PNG")
-    finally:
-        client.app.state.settings.agent_screenshot_every_step = False
+    image = client.get(detail["artifacts"][0]["url"])
+    assert image.status_code == 200
+    assert image.content.startswith(b"\x89PNG")
 
 
 def test_unknown_artifact_is_404(client):
@@ -369,155 +257,3 @@ def test_unknown_artifact_is_404(client):
 
 # --- declared fields and credential handling --------------------------------
 
-
-def test_a_declared_credential_never_reaches_storage(client):
-    """End to end: the value goes to the browser and nowhere else.
-
-    The strongest form of this assertion is a search of everything that was
-    persisted -- the run row, every event, the task text -- for the literal
-    password. Anything weaker tests the mechanism rather than the guarantee.
-    """
-    use_llm(
-        client,
-        tool_turn(
-            "browser_type",
-            {"text": "«secret:password»", "element": "Password"},
-            text="Filling the password in.",
-        ),
-        final_turn("Signed in."),
-    )
-
-    created = client.post(
-        "/api/runs",
-        json={
-            # Typing into a password field is a sensitive action, so the
-            # default policy would pause for approval. This test is about where
-            # the value ends up, not about the approval gate.
-            "require_approval": False,
-            "task": "Sign in with the credentials provided.",
-            "fields": [
-                {"name": "work_email", "value": "nitin@example.com"},
-                {"name": "password", "value": "s3cret-Example-Pw!", "secret": True},
-            ],
-        },
-    )
-    assert created.status_code == 201, created.text
-    run_id = created.json()["run_id"]
-    wait_for_status(client, run_id)
-
-    everything = client.get(f"/api/runs/{run_id}").text
-    everything += client.get(f"/api/runs/{run_id}/events").text
-
-    assert "s3cret-Example-Pw!" not in everything
-    # The declared *input* is ordinary data and is supposed to survive: it is
-    # what makes the recording parameterisable.
-    assert "nitin@example.com" in everything
-
-
-def test_the_run_records_its_declared_fields(client):
-    use_llm(client, final_turn("done"))
-    run_id = client.post(
-        "/api/runs",
-        json={
-            "task": "Fill the form in.",
-            "fields": [
-                {"name": "full_name", "value": "Nitin Asati", "description": "Contact name"},
-                {"name": "password", "value": "s3cret-Example-Pw!", "secret": True},
-            ],
-        },
-    ).json()["run_id"]
-    wait_for_status(client, run_id)
-
-    options = client.get(f"/api/runs/{run_id}").json()["options"]
-    declared = options["declared"]
-    assert declared["inputs"] == {"full_name": "Nitin Asati"}
-    assert declared["secret_slots"] == ["password"]
-    assert "s3cret-Example-Pw!" not in str(options)
-
-
-def test_held_credential_slots_are_reported_by_name_only(client):
-    use_llm(client, final_turn("done"))
-    run_id = client.post(
-        "/api/runs",
-        json={
-            "task": "Sign in.",
-            "fields": [{"name": "password", "value": "s3cret-Example-Pw!", "secret": True}],
-        },
-    ).json()["run_id"]
-    wait_for_status(client, run_id)
-
-    body = client.get(f"/api/runs/{run_id}/credential-slots").json()
-    assert body["slots"] == ["password"]
-    assert "s3cret-Example-Pw!" not in str(body)
-
-
-def test_a_run_with_no_credentials_holds_nothing(client):
-    use_llm(client, final_turn("done"))
-    run_id = client.post(
-        "/api/runs",
-        json={"task": "Read the page.", "fields": [{"name": "city", "value": "Manchester"}]},
-    ).json()["run_id"]
-    wait_for_status(client, run_id)
-
-    assert client.get(f"/api/runs/{run_id}/credential-slots").json()["slots"] == []
-
-
-def test_an_unusable_field_name_is_refused(client):
-    response = client.post(
-        "/api/runs",
-        json={"task": "x", "fields": [{"name": "full name", "value": "Nitin"}]},
-    )
-    assert response.status_code == 422
-    assert "field name" in response.text
-
-
-def test_a_cancelled_run_is_recorded_cancelled_even_if_the_agent_finishes_first(client):
-    """Intent beats timing.
-
-    `task.cancel()` only requests cancellation; it is delivered when the loop
-    next schedules that task. Meanwhile the pending approval must be resolved
-    or the run sits blocked -- and "rejected" is an answer the agent acts on,
-    declining that one call and carrying on to finish. Which side wins depends
-    on the machine and on the Python version, since asyncio.wait_for was
-    reimplemented in 3.12: this recorded 'succeeded' on 3.11 and 'cancelled'
-    on 3.13 from identical code.
-
-    Rather than test whichever way the race happens to fall, this forces the
-    losing side -- cancellation is never delivered at all -- and asserts the
-    run is still recorded as cancelled, because that is what was asked for.
-    """
-    use_llm(client, tool_turn("browser_click", {"element": "Submit payment"}), final_turn("x"))
-    manager = client.app.state.manager
-
-    # Cancellation requested but never delivered. The agent will therefore run
-    # to completion and produce a 'succeeded' outcome.
-    original = manager.cancel_run
-
-    async def cancel_without_delivering(run_id: str) -> bool:
-        task = manager._tasks.get(run_id)  # noqa: SLF001 - forcing a race outcome
-        if task is None or task.done():
-            return False
-        manager._cancel_requested.add(run_id)  # noqa: SLF001
-        for pending in list(manager._approvals.get(run_id, {}).values()):  # noqa: SLF001
-            if not pending.future.done():
-                pending.future.set_result(("rejected", "run cancelled"))
-        return True
-
-    manager.cancel_run = cancel_without_delivering
-    try:
-        run_id = client.post("/api/runs", json={"task": "pay"}).json()["run_id"]
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if client.get(f"/api/runs/{run_id}").json().get("pending_approval"):
-                break
-            time.sleep(0.05)
-
-        assert client.post(f"/api/runs/{run_id}/cancel").json()["cancelled"] is True
-        body = wait_for_status(client, run_id)
-    finally:
-        manager.cancel_run = original
-
-    assert body["status"] == "cancelled", (
-        "the agent finished before the cancellation landed, and the run was "
-        "recorded as succeeded -- the operator asked for it to stop"
-    )

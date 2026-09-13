@@ -20,6 +20,7 @@
 import { useEffect, useState } from 'react';
 
 import { session } from '../lib/session';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   src: string;
@@ -73,7 +74,7 @@ export function AuthedImage({ src, alt, className }: Props) {
   }, [src]);
 
   if (state.status === 'loading') {
-    return <span className="empty">Loading screenshot…</span>;
+    return <BrandSpinner state="working" label="Loading screenshot…" />;
   }
   if (state.status === 'error') {
     return <span className="empty">{state.message}</span>;

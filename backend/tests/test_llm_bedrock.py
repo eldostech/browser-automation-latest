@@ -64,7 +64,7 @@ def settings(**overrides) -> Settings:
 # --- defaults --------------------------------------------------------------
 
 
-@pytest.mark.parametrize("field", ["llm_model", "llm_repair_model"])
+@pytest.mark.parametrize("field", ["llm_repair_model"])
 def test_default_models_are_inference_profiles_not_bare_model_ids(field):
     """Current Claude models on Bedrock are cross-region-profile only.
 
@@ -75,15 +75,20 @@ def test_default_models_are_inference_profiles_not_bare_model_ids(field):
     assert model.startswith(("us.", "eu.", "apac.", "global.")), model
 
 
-def test_no_api_key_setting_exists_at_all():
+def test_bedrock_needs_no_api_key_setting():
     """Bedrock authenticates with AWS credentials, so there is nothing to set.
 
-    An unused ANTHROPIC_API_KEY in .env is now ignored rather than quietly
-    looking like configuration that matters.
+    An unused ANTHROPIC_API_KEY in .env is ignored rather than quietly looking
+    like configuration that matters. `OPENROUTER_API_KEY` is a real setting
+    now, and only the second provider reads it.
     """
     assert not hasattr(Settings(_env_file=None), "anthropic_api_key")
-    assert not hasattr(Settings(_env_file=None), "llm_provider")
     assert build_llm(settings()).provider == "bedrock"
+
+
+def test_bedrock_is_still_what_a_deployment_gets_by_default():
+    """Adding a second provider must not move an existing installation onto it."""
+    assert Settings(_env_file=None).llm_provider == "bedrock"
 
 
 # --- construction ----------------------------------------------------------
@@ -101,6 +106,41 @@ def test_a_named_profile_is_passed_through():
     with pytest.raises(Exception) as excinfo:
         chat_model(settings(aws_profile="no-such-profile"), "us.anthropic.claude-sonnet-4-6")
     assert "no-such-profile" in str(excinfo.value)
+
+
+# --- extended thinking -------------------------------------------------------
+
+
+def test_thinking_is_off_by_default_setting_value():
+    model = chat_model(settings(llm_thinking_budget_tokens=0))
+    assert not (model.additional_model_request_fields or {}).get("thinking")
+    assert model.temperature == 0.0, "untouched when thinking never gets involved"
+
+
+def test_thinking_is_enabled_with_the_configured_budget():
+    model = chat_model(settings(llm_thinking_budget_tokens=2048, llm_max_tokens=8192))
+    assert model.additional_model_request_fields["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 2048,
+    }
+
+
+def test_temperature_is_dropped_while_thinking_is_enabled():
+    """Confirmed against the real model, not assumed from documentation: a
+    non-default temperature alongside `thinking` is rejected outright --
+    "`temperature` may only be set to 1 when thinking is enabled" -- so this
+    is a request that must never be sent, not one worth handling by retrying."""
+    model = chat_model(settings(llm_thinking_budget_tokens=2048, llm_temperature=0.0))
+    assert model.temperature is None
+
+
+def test_a_budget_that_would_leave_no_room_for_a_reply_is_clamped():
+    model = chat_model(
+        settings(llm_thinking_budget_tokens=8192, llm_max_tokens=4096)
+    )
+    thinking = model.additional_model_request_fields["thinking"]
+    assert thinking["budget_tokens"] < 4096
+    assert thinking["budget_tokens"] >= 1024
 
 
 # --- the bearer-token / profile conflict -----------------------------------
@@ -196,69 +236,36 @@ def test_health_always_reports_bedrock():
 # --- one process, three models ---------------------------------------------
 
 
-def test_the_three_roles_have_their_own_models():
-    s = Settings(_env_file=None)
-    assert s.models_in_use == {
-        "driver": s.llm_model,
-        "distiller": s.llm_model,
-        "repair": s.llm_repair_model,
-    }
-    assert s.llm_model != s.llm_repair_model
-
-
-def test_the_distiller_follows_the_driver_unless_told_otherwise():
-    base = Settings(_env_file=None)
-    assert base.distill_model == base.llm_model
-
-    pinned = Settings(_env_file=None, llm_distill_model="us.anthropic.claude-opus-5")
-    assert pinned.distill_model == "us.anthropic.claude-opus-5"
-    assert pinned.llm_model != "us.anthropic.claude-opus-5", "the driver is unaffected"
-
-
-def test_a_blank_distill_model_falls_back_rather_than_being_used():
-    blank = Settings(_env_file=None, llm_distill_model="   ")
-    assert blank.distill_model == blank.llm_model
-
-
 def test_build_llm_takes_a_model_override():
-    assert build_llm(settings()).model == settings().llm_model
+    assert build_llm(settings()).model == settings().llm_repair_model
     assert build_llm(settings(), "us.anthropic.claude-opus-5").model == (
         "us.anthropic.claude-opus-5"
     )
 
 
-def test_health_reports_every_role():
-    health = llm_health(settings())
-    assert health["model"] == settings().llm_model, "unchanged for old consumers"
-    assert health["models"]["repair"] == settings().llm_repair_model
+def test_one_model_is_built_and_cached():
+    """There used to be three roles. Two of them went with the agent.
+
+    A workflow is recorded by watching someone do it, and a codegen script is
+    parsed rather than interpreted -- so neither the driver nor the distiller
+    has anything left to do. What remains is the model that looks at a page
+    when a step breaks.
+    """
+    from llm import RepairModel
+
+    model = RepairModel(settings())
+    assert model.client.model == settings().llm_repair_model
+    assert model.client is model.client, "built once and cached"
 
 
-def test_the_manager_builds_a_different_client_per_role(tmp_path):
-    from runner import EventBus, RunManager
-    from store import Store
-
-    config = settings()
-    manager = RunManager(Store(tmp_path / "x.db", tmp_path / "a"), config, EventBus())
-
-    assert manager.llm.model == config.llm_model
-    assert manager.repair_llm.model == config.llm_repair_model
-    assert manager.distill_llm.model == config.llm_model
-    assert manager.llm.model != manager.repair_llm.model
-    assert manager.repair_llm is manager.repair_llm, "built once and cached"
-
-
-def test_an_injected_client_serves_every_role(tmp_path):
-    """So a scripted model in a test still covers all three."""
-    from runner import EventBus, RunManager
-    from store import Store
+def test_an_injected_client_is_used_as_is():
+    """So a scripted model in a test is the one that gets called."""
+    from llm import RepairModel
 
     scripted = object()
-    manager = RunManager(
-        Store(tmp_path / "x.db", tmp_path / "a"), settings(), EventBus(), llm=scripted
-    )
-    assert manager.llm is scripted
-    assert manager.repair_llm is scripted
-    assert manager.distill_llm is scripted
+    model = RepairModel(settings(), client=scripted)
+    assert model.client is scripted
+    assert model() is scripted, "and it works as a zero-argument factory"
 
 
 # --- a model the account cannot use ----------------------------------------
@@ -277,7 +284,7 @@ class _Boom(Exception):
 
 
 def _client(model: str = "us.anthropic.claude-sonnet-5") -> LangChainLLM:
-    return build_llm(settings(llm_model=model))
+    return build_llm(settings(llm_repair_model=model))
 
 
 @pytest.mark.parametrize(
@@ -348,28 +355,6 @@ async def test_check_access_reports_success(monkeypatch):
     assert (await client.check_access())["ok"] is True
 
 
-async def test_a_run_fails_cleanly_rather_than_crashing(spec, mcp, sink):
-    """The run must report a configuration problem, not 'agent run crashed'."""
-    from agent import BrowserAgent
-    from conftest import AutoApprovalGate
-
-    class DeniedLLM:
-        model = "us.anthropic.claude-sonnet-5"
-
-        async def run_turn(self, **kwargs):
-            raise LLMAccessError("this account cannot use 'us.anthropic.claude-sonnet-5'")
-
-    outcome = await BrowserAgent(spec, mcp, DeniedLLM(), sink, AutoApprovalGate()).run()
-
-    assert outcome.status == "failed"
-    assert "cannot use" in outcome.error
-    errors = sink.of_type("error")
-    assert errors and errors[-1].kind == "llm_unavailable", "not 'internal_error'"
-
-
-# --- the message bridge ----------------------------------------------------
-
-
 def test_history_converts_to_langchain_messages():
     """The shapes that actually occur: prose, an assistant turn, tool results."""
     converted = to_langchain(
@@ -410,3 +395,37 @@ def test_a_failed_tool_result_is_marked_as_an_error():
         ]}],
     )
     assert converted[0].status == "error"
+
+
+# --- reading a turn's reasoning back out -------------------------------------
+
+
+def test_extended_thinking_content_reaches_text_of():
+    """The block shape here -- `reasoning_content` holding `text`/`signature`
+    -- is exactly what the real model returned with thinking enabled, not a
+    guess: confirmed by calling it. Without this, a turn could reason at
+    length and `text_of` would still report nothing, because nothing else in
+    this codebase reads any block type but `text`."""
+    from langchain_core.messages import AIMessage
+
+    from chat import text_of
+
+    message = AIMessage(
+        content=[
+            {
+                "type": "reasoning_content",
+                "reasoning_content": {"text": "The button is the second match.", "signature": "abc"},
+            },
+            {"type": "text", "text": "Clicking it now."},
+        ]
+    )
+    assert text_of(message) == "The button is the second match.Clicking it now."
+
+
+def test_a_turn_with_only_a_tool_call_has_no_text():
+    from langchain_core.messages import AIMessage
+
+    from chat import text_of
+
+    message = AIMessage(content=[{"type": "tool_use", "id": "c1", "name": "browser_click", "input": {}}])
+    assert text_of(message) == ""

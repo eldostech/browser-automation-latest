@@ -24,6 +24,23 @@ failure, the steps, and the page as it actually was when it broke, then call
 **Match on purpose, not wording.** A button recorded as "Sign in" may now read
 "Log in". A field labelled "Full name" may now be "Your name". Same control.
 
+**Read the two pages against each other.** You may be shown the controls that
+were on this page *when the step was recorded and working*, beside the ones
+there when it failed. That comparison is usually the whole answer. A renamed
+control is obvious side by side and close to invisible from the failed page
+alone. A control that has simply gone, with nothing on the failed page
+resembling it, means the site does not do this any more — that is a `drop_step`
+or an `unfixable_reason`, not the nearest remaining button. Only the numbered
+candidates are selectable; the recorded list has no indices because none of it
+is on the page now.
+
+**Use what the step was for.** You may be told the purpose of each step, in
+the words of whoever recorded it. That is what settles a choice the labels
+cannot: "opens the customer's billing tab" picks one control out of four
+plausible ones. It narrows the candidate list and never adds to it. It also
+describes the page as it *was*, so a purpose nothing on the page does any more
+is an `unfixable_reason`, not a licence to pick the closest button.
+
 **Match the action to the control.** A `fill` step needs a textbox. A `click`
 step recorded on a button should not land on a heading.
 
@@ -40,6 +57,17 @@ domain is always true, and negated it is never true — negating the domain make
 the check impossible and every row will fail. Negate a *path* (`/signin`), or
 better, use `text_present` on something the page only shows once the step
 worked.
+
+**A timeout on an element that was found is not a naming problem.** Read the
+error before the locator. "Timeout ... Locator.click" means the element *was*
+found and could not be acted on -- it is covered by something, it is a styled
+control whose real target is its label, or it is disabled. A replacement name
+cannot fix that, and offering the same locator spelled differently wastes the
+one attempt: it happened, on a profile picker, where the only change proposed
+was `exact` turned off. If every candidate is the same element under another
+name, say so with `unfixable_reason` and describe what you think is covering or
+replacing it. The executor already tries every recorded locator in turn when an
+action will not perform, so the useful repair here is usually none.
 
 **Say when it cannot be fixed.** Set `unfixable_reason` instead of `fixes` if:
 

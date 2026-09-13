@@ -1,0 +1,566 @@
+"""The state that turns *doing* a task into *recording* one.
+
+Playwright MCP can drive a browser. It cannot produce a use case, and the gap
+between those two is this file: the bookkeeping the marking tools
+(`agent/tools/begin_row.py` and its siblings) read and write. Their schemas
+and dispatch live there, one file per tool; what they all share -- the row
+boundary, the entries recorded, the ref-to-locator resolution -- lives here,
+because splitting shared state across files it flows through would add
+indirection, not remove it.
+
+**`describe_element` is the bridge.** An MCP ref is an index into one snapshot
+and is meaningless in any other; a `UseCase` needs a locator that still works
+next year. Resolving one to the other is not new work here -- `snapshot.py` was
+written for exactly this and says so in its own docstring -- but two things are
+added on top, and both come from failures this codebase has already had:
+
+* **`exact` is set from what else is on the page.** Playwright matches an
+  accessible name as a case-insensitive substring, so a button named "Invite"
+  also finds "+ Invite User". A run failed on precisely that, spending its
+  whole step budget waiting for a button the dialog was covering.
+* **Ambiguity is reported at the moment of recording.** If a rung matches three
+  elements, the person watching the agent can see it now, rather than the
+  batch discovering it four thousand rows later.
+
+**The marking tools replace inference with declaration.** The design sized loop
+detection as the hard part of distillation: recognise the repeated shape across
+four hundred near-identical sub-trajectories and work out where a row begins
+and which value varies. Do not infer what the agent can declare.
+`mark_setup_complete`, `begin_row` and `end_row` turn that into bookkeeping,
+and `mark_as_input` / `mark_as_output` / `mark_as_secret` name the values while
+the page they came from is still on screen.
+
+These are ours, not the server's: they never reach the browser.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+from snapshot import Node, Snapshot, count_matches, index_among, ordinal_suffix
+
+# Imported for the shape of what we produce. `usecase` is a schema module with
+# no I/O, so this does not couple the agent to the application.
+from usecase import Locator
+
+#: What a column or slot name has to look like: an identifier, because it
+#: becomes a `{{input.x}}` template and a spreadsheet header.
+NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def as_name(value: str) -> str:
+    """Turn what a person or a model called something into a usable name.
+
+    A real model, asked to name the column for a field labelled "Account
+    number", calls it ``"Account number"`` -- which is the right answer to the
+    question and the wrong shape for a template. Before this, that arrived at
+    `InputSpec` and raised a ValidationError in the middle of distillation,
+    losing an entire session that had otherwise gone perfectly.
+
+    Rejecting it would have been worse than fixing it: the model is not wrong,
+    the constraint is ours, and telling it to try again spends another turn to
+    arrive somewhere it could have been taken directly.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip()).strip("_").lower()
+    if not cleaned:
+        return ""
+    # A name beginning with a digit is not an identifier, and "2024_total"
+    # is a name somebody will genuinely want.
+    return cleaned if NAME_PATTERN.match(cleaned) else f"_{cleaned}"
+
+
+# ---------------------------------------------------------------------------
+# ref -> a locator ladder
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Described:
+    """What an element is, durably, and how safely it can be found again."""
+
+    ref: str
+    role: str
+    name: str
+    #: What this element *says*, for a replay to check it found the same one.
+    #:
+    #: Not the same as `name`, in the one case that matters: where the rung
+    #: was borrowed from a named control inside an anonymous wrapper, this is
+    #: that control's name, because that is the text the page will still be
+    #: showing. See `Step.expect_text` for what a replay does with it.
+    text: str = ""
+    #: Ranked, semantic first. The same shape a recorded step carries.
+    ladder: list[Locator] = field(default_factory=list)
+    #: How many elements the leading rung matches. One is what you want.
+    matches: int = 1
+    #: Set when the accessible name is a substring of another element's, which
+    #: is when `exact` stops being optional.
+    shadowed_by: tuple[str, ...] = ()
+    #: Set when the element has no accessible name at all and a purely
+    #: structural role (generic/group/none/presentation -- the same set
+    #: `Node.interactive` already excludes). Found for real: a step recorded
+    #: as "the 14th of 40 `generic` elements" replayed against a page that,
+    #: minutes later, exposed *zero* generic-role elements -- the count itself
+    #: was never a property of the control, only of how that render happened
+    #: to nest anonymous wrapper divs. Position among *named* duplicates (11
+    #: identical "Chat" buttons, say) is a real, if imperfect, proxy for which
+    #: one was meant; position among anonymous structural wrappers is not --
+    #: there is no name for it to even be a fallback from.
+    unreliable: bool = False
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.matches != 1
+
+    def describe_first(self) -> str:
+        """The leading rung, as a person would read it."""
+        return self.ladder[0].describe() if self.ladder else "(nothing durable)"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "role": self.role,
+            "name": self.name,
+            "text": self.text,
+            "locators": [loc.model_dump(mode="json", exclude_none=True) for loc in self.ladder],
+            "describe": self.ladder[0].describe() if self.ladder else "",
+            "matches": self.matches,
+            "ambiguous": self.ambiguous,
+            "shadowed_by": list(self.shadowed_by),
+        }
+
+    def as_text(self) -> str:
+        """What the model is told. Short, and honest about the risk."""
+        if not self.ladder:
+            return f"{self.ref} is not on the page as it now stands."
+        lines = [f"{self.ref} is {self.describe_first()}"]
+        if self.ambiguous and self.unreliable:
+            # Worse than merely ambiguous: nothing about this element is a
+            # name to fall back to, so even a resolved position is trust
+            # placed in how many anonymous wrapper elements a render happens
+            # to produce -- which is not a property of the control. Said
+            # regardless of whether nth is 0: unlike the named-duplicate
+            # case below, there is no "safe once nth is set" here.
+            lines.append(
+                f"WARNING: {self.matches} elements share this role with no name "
+                "to tell any of them apart -- this is a generic wrapper, not a "
+                "real control. Its position among the others is not something "
+                "to rely on: it can differ the next time this page renders for "
+                "reasons that have nothing to do with which one you meant. Find "
+                "a labelled button, link or heading near it and act on that "
+                "instead, or say this step needs a person."
+            )
+        elif self.ambiguous and self.ladder[0].nth > 0:
+            position = self.ladder[0].nth + 1
+            lines.append(
+                f"NOTE: role and name alone match {self.matches} elements; this "
+                f"is specifically the {position}{ordinal_suffix(position)} of "
+                "them, by page position, which is why the locator carries "
+                "[nth]. Acting on it is fine now. Recording it that way is not: "
+                "position can change between runs, so a step that leans on this "
+                "repeatedly should be re-recorded with something that names the "
+                "element itself, not where it happens to sit."
+            )
+        elif self.ambiguous:
+            # This ref IS the first of the matches, and `nth=0` is exactly
+            # what an *unresolved* ambiguity also looks like -- the ladder
+            # format has no way to say "the first one, specifically" apart
+            # from "no position given at all", so recording this rung would
+            # still be refused at replay for the same reason it always was.
+            # A live click on this exact ref, right now, is unaffected.
+            lines.append(
+                f"WARNING: that matches {self.matches} elements, and this "
+                "happens to be the first -- which this locator format cannot "
+                "tell apart from 'no position specified'. Acting on this ref "
+                "directly is fine; recording this rung is not, it would "
+                "still be refused. Point at a later one of the matches if "
+                "the recording needs to name a position, or name the "
+                "element some other way."
+            )
+        elif self.shadowed_by:
+            others = ", ".join(repr(name) for name in self.shadowed_by)
+            lines.append(
+                f"Its name is contained in {others}, so the locator is recorded "
+                "as an exact match."
+            )
+        return "\n".join(lines)
+
+
+def describe_element(snapshot: Snapshot, ref: str) -> Described:
+    """One ref, as the locator ladder a recorded step would carry.
+
+    The ladder is built the way the codegen parser builds one: a semantic rung
+    first, and a text rung behind it that costs nothing and survives a redesign
+    keeping a control's wording while changing its role.
+
+    When the semantic rung is ambiguous -- several elements share the same
+    role and name, a repeated card or table row being the usual cause -- a ref
+    still names exactly one of them. ``nth`` carries that: the position of
+    *this* ref among the matches, so a specific choice (a person's click, a
+    model's reasoned pick) survives into the ladder instead of being thrown
+    away in favour of a rung the engine will refuse to act on. This is not a
+    guess bolted on here -- ``Locator.nth`` and its use in the executor's
+    resolver already exist for exactly this ("the recorded nth is how a
+    recording says which one it meant"); nothing upstream of this function
+    ever populated it. Positional, so it stays only as durable as the page's
+    own ordering -- honest about that in ``Described.as_text()`` below, and a
+    step that leans on it repeatedly is one to re-record rather than rescue
+    forever.
+
+    One gap this does not close: ``Locator.nth`` is a plain ``int`` defaulting
+    to 0, and ``engine.py``'s resolver reads 0 as "no position given" (deliberately --
+    an ambiguous rung with no nth must keep refusing, or every existing use
+    case with no nth chosen would start silently acting on whichever element
+    came first). So when the ref happens to be the *first* of the matches,
+    this cannot record that fact; the ladder comes back exactly as ambiguous
+    as it would have before this function existed. Real for the 2nd match
+    onward, not for the 1st -- see the corresponding branch in
+    ``Described.as_text()``.
+    """
+    node = snapshot.get(ref)
+    if node is None:
+        return Described(ref=ref, role="", name="", matches=0)
+
+    exact = _needs_exact(snapshot, node)
+    matches = count_matches(snapshot, node, exact)
+    ladder: list[Locator] = []
+
+    # An unnamed wrapper has nothing of its own to match on, so the rung this
+    # used to produce was `role=generic [24]` -- "the 25th anonymous div" --
+    # which cannot be replayed, and was published anyway on a draft whose own
+    # warning said so.
+    #
+    # Such a wrapper almost always *contains* something named: a profile card
+    # wraps a radio with a person's name on it, a tile wraps its own heading.
+    # That control is what the step is recorded against instead. Clicking it
+    # and clicking the wrapper around it do the same thing on any page where
+    # the wrapper is the control -- and it is the rung a repair produced by
+    # hand the last time one of these broke, on the page this was found on.
+    #
+    # Not a guess about the page: the name is read out of the element's own
+    # subtree, and it is only used when it resolves to exactly one control.
+    inside = _named_inside(snapshot, node) if _needs_a_name(node) else None
+    if inside is not None:
+        ladder.append(
+            Locator(
+                strategy="role",
+                role=inside.role,
+                name=inside.name or None,
+                exact=bool(inside.name),
+            )
+        )
+        # The wrapper, narrowed by the same text, behind it -- but only when
+        # that text tells it apart from every other wrapper of its role. A
+        # `has_text` shared with an ancestor has narrowed nothing while
+        # looking as though it has.
+        label = (inside.name or inside.text or "").strip()
+        if _narrows_by_text(snapshot, node, label):
+            ladder.append(
+                Locator(strategy="role", role=node.role, has_text=label)
+            )
+        # Counted against the rung that is actually going to be used. Left as
+        # the wrapper's count, every message below would describe an ambiguity
+        # the ladder no longer has -- "that matches 4 elements" printed under a
+        # locator that matches one, which is worse than saying nothing.
+        matches = count_matches(snapshot, inside, True)
+
+    if node.role and not ladder:
+        ladder.append(
+            Locator(
+                strategy="role",
+                role=node.role,
+                name=node.name or None,
+                exact=exact,
+                nth=index_among(snapshot, node, exact) if matches > 1 else 0,
+            )
+        )
+    if node.name:
+        ladder.append(Locator(strategy="text", text=node.name, exact=exact))
+    if not ladder:
+        # Nothing durable to say about it. Better an empty ladder the caller
+        # can refuse than a css guess nobody can review.
+        return Described(ref=ref, role=node.role, name=node.name, matches=0)
+
+    return Described(
+        ref=ref,
+        role=node.role,
+        name=node.name,
+        text=((inside.name if inside is not None else "") or node.name or node.text or "")[:200],
+        ladder=ladder,
+        matches=matches,
+        shadowed_by=_shadowing(snapshot, node),
+        # `interactive` is false for exactly the structural roles (generic,
+        # group, none, presentation) that carry no meaning of their own --
+        # see Node.interactive. Combined with no name at all, position is the
+        # *only* thing distinguishing this from its siblings, and position
+        # among anonymous wrappers is not a property of the control.
+        # Only when nothing inside it could name it either. With a name
+        # borrowed from its contents the rung is no longer positional, so
+        # the whole objection -- "position among anonymous wrappers is not a
+        # property of the control" -- no longer applies.
+        unreliable=(
+            matches > 1
+            and not node.interactive
+            and not node.name
+            and inside is None
+        ),
+    )
+
+
+
+def _needs_a_name(node: Node) -> bool:
+    """Whether this node has nothing of its own to be found by."""
+    return not (node.name or "").strip() and not node.interactive
+
+
+def _named_inside(snapshot: Snapshot, node: Node) -> "Node | None":
+    """The nearest *uniquely* named control inside ``node``, or ``None``.
+
+    Nearest rather than best: the first named descendant in document order is
+    the one a person reading the page would use to refer to the wrapper, and
+    anything cleverer would be this code having an opinion about a page it has
+    seen once.
+
+    Unique, because the whole point is to replace a rung that cannot resolve
+    with one that can. A descendant whose own role and name match three
+    elements has swapped one ambiguity for another, so it is refused and the
+    wrapper stays flagged as unreliable -- which is the honest answer.
+    """
+    nodes = list(snapshot)
+    try:
+        start = nodes.index(node)
+    except ValueError:
+        return None
+
+    for other in nodes[start + 1 :]:
+        if other.depth <= node.depth:
+            break
+        if not (other.name or "").strip() or not other.interactive:
+            continue
+        if count_matches(snapshot, other, True) == 1:
+            return other
+    return None
+
+
+def _narrows_by_text(snapshot: Snapshot, node: Node, label: str) -> bool:
+    """Whether ``label`` tells this wrapper apart from every other of its role.
+
+    Counted over the snapshot rather than assumed. An ancestor of the wrapper
+    contains the label too -- a list containing every card contains every
+    card's text -- so a rung built on it would read precisely and resolve
+    ambiguously, which is the failure this is replacing.
+    """
+    if not label:
+        return False
+    wanted = label.casefold()
+    nodes = list(snapshot)
+    holders = 0
+    for index, other in enumerate(nodes):
+        if other.role != node.role:
+            continue
+        for inner in nodes[index + 1 :]:
+            if inner.depth <= other.depth:
+                break
+            if wanted in (inner.name or inner.text or "").casefold():
+                holders += 1
+                break
+        if holders > 1:
+            return False
+    return holders == 1
+
+
+def _needs_exact(snapshot: Snapshot, node: Node) -> bool:
+    """Whether the recorded name has to be the *whole* accessible name.
+
+    A run failed on this: a page with "+ Invite User" and, in the dialog it
+    opens, "Invite". Playwright reads a name as a substring, so the dialog's
+    locator found both and acted on the one behind the dialog. Deciding it here
+    means the recording carries the answer rather than the replay discovering
+    the question.
+    """
+    return bool(node.name) and bool(_shadowing(snapshot, node))
+
+
+def _shadowing(snapshot: Snapshot, node: Node) -> tuple[str, ...]:
+    """Other elements whose accessible name *contains* this one's."""
+    if not node.name:
+        return ()
+    wanted = node.name.casefold()
+    return tuple(
+        dict.fromkeys(
+            other.name
+            for other in snapshot
+            if other.ref != node.ref
+            and other.name
+            and other.name.casefold() != wanted
+            and wanted in other.name.casefold()
+        )
+    )
+
+
+# `count_matches` / `index_among` live in `snapshot.py` now -- they operate
+# purely on `Node`/`Snapshot` and `repair.py` needs them too, without taking a
+# dependency on this (optional-extra) package. See snapshot.py.
+
+
+# ---------------------------------------------------------------------------
+# What the marks accumulate into
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Mark:
+    """One declaration, tied to the tool call it was made after.
+
+    ``after_call`` is how many calls had happened when this was made, and it is
+    correctness rather than bookkeeping: a value has to be read on the page it
+    was pointed at. Appending every reading to the end would read the first
+    page's field after the browser had already moved to the third.
+    """
+
+    kind: str
+    after_call: int
+    ref: str = ""
+    name: str = ""
+    described: Described | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "after_call": self.after_call,
+            "ref": self.ref,
+            "name": self.name,
+            "element": self.described.as_dict() if self.described else None,
+        }
+
+
+class Marks:
+    """Everything the agent declared about the shape of the use case.
+
+    Deliberately dumb: it records and refuses the obviously wrong, and it does
+    not try to make a use case. Distillation reads it in a later phase, and
+    keeping the two apart means this can be tested by asserting on a list.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[Mark] = []
+        #: Call index at which setup ended. None means it never did, which is
+        #: refused at the end -- a workflow whose sign-in runs per row would
+        #: sign in four thousand times.
+        self.setup_ended_at: int | None = None
+        self.rows: list[tuple[int, int | None, str]] = []
+        self._open_row: tuple[int, str] | None = None
+
+    # -- boundaries -------------------------------------------------------
+    def setup_complete(self, after_call: int) -> str:
+        if self.setup_ended_at is not None:
+            return "Setup was already marked complete; it can only happen once."
+        if self._open_row is not None:
+            return "A row is open. Setup cannot end in the middle of one."
+        self.setup_ended_at = after_call
+        self.entries.append(Mark("setup_complete", after_call))
+        return ""
+
+    def begin_row(self, after_call: int, key: str) -> str:
+        if self._open_row is not None:
+            return f"Row {self._open_row[1]!r} is still open. Call end_row first."
+        self._open_row = (after_call, key)
+        self.entries.append(Mark("begin_row", after_call, name=key))
+        return ""
+
+    def end_row(self, after_call: int) -> str:
+        if self._open_row is None:
+            return "No row is open, so there is nothing to end."
+        started, key = self._open_row
+        self.rows.append((started, after_call, key))
+        self._open_row = None
+        self.entries.append(Mark("end_row", after_call, name=key))
+        return ""
+
+    # -- values -----------------------------------------------------------
+    def mark_value(
+        self, kind: str, after_call: int, ref: str, name: str, described: Described
+    ) -> str:
+        """Record a value, under a name that can actually be used.
+
+        A per-row value marked outside a row is refused rather than accepted
+        and sorted out later. A real model did exactly this -- marked an input
+        and an output without ever opening a row -- and distillation then had
+        marks it could not place and a session that could not be saved. Being
+        told at the moment of the mistake costs one turn; finding out at the
+        end costs the session.
+        """
+        if kind in {"mark_as_input", "mark_as_output"} and self._open_row is None:
+            return (
+                "No row is open, and this is a per-row value -- it only means "
+                "something inside one record's work. Call begin_row first (and "
+                "mark_setup_complete before that, if the sign-in is done)."
+            )
+        name = as_name(name)
+        if not name:
+            return (
+                "That name has nothing usable in it. A column name becomes a "
+                "spreadsheet header, so it needs at least one letter or digit."
+            )
+        if described.matches == 0:
+            return (
+                f"{ref} is not on the page as it now stands, so there is nothing "
+                "to mark. Take a fresh snapshot."
+            )
+        if described.ambiguous:
+            return (
+                f"{ref} resolves to {described.describe_first()} which matches "
+                f"{described.matches} elements. Marking it would record a step "
+                "that can act on the wrong one; point at something more specific."
+            )
+        if any(
+            entry.kind == kind and entry.name == name for entry in self.entries
+        ):
+            return f"{name!r} has already been marked as {kind.replace('_', ' ')}."
+        self.entries.append(Mark(kind, after_call, ref=ref, name=name, described=described))
+        return ""
+
+    # -- what a session must have said before it can finish ---------------
+    def unfinished(self) -> str:
+        """Why this session cannot be distilled yet, or "".
+
+        Enforced by code at the point ``finish`` is called, rather than asked
+        for in a prompt. An agent that forgets is told to go back.
+        """
+        if self._open_row is not None:
+            return f"Row {self._open_row[1]!r} was never ended. Call end_row."
+        if not self.rows:
+            return (
+                "No row was recorded. Call begin_row before the work for one "
+                "record and end_row after it, so the steps that repeat can be "
+                "told apart from the sign-in that must not."
+            )
+        return ""
+
+    def as_dicts(self) -> list[dict[str, Any]]:
+        return [entry.as_dict() for entry in self.entries]
+
+    def progress_summary(self) -> str:
+        """How far this session actually got, in words.
+
+        For a stop that was not the model's own choice -- a budget run out --
+        the first thing worth knowing is whether that is "ran out with three
+        rows banked" or "ran out having recorded nothing at all". Both show up
+        identically as a token count; they are not identical.
+        """
+        done = len(self.rows)
+        if self._open_row is not None:
+            return f"{done} row(s) completed; {self._open_row[1]!r} was left open, unfinished."
+        if done == 0 and self.setup_ended_at is None:
+            return "Stopped during setup, before any row began."
+        return f"{done} row(s) completed."
+
+
+__all__ = [
+    "as_name",
+    "Described",
+    "Mark",
+    "Marks",
+    "describe_element",
+]

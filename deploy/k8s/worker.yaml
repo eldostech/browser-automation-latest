@@ -1,0 +1,63 @@
+# The pods that actually drive browsers. Same image as the API, different
+# entry point: `python -m worker` claims batches from the queue and runs them.
+#
+# Scaled by KEDA, from zero. See keda.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: browser-automation
+spec:
+  # KEDA owns this number. It is 0 here so that applying this file before the
+  # ScaledObject does not start a browser nobody asked for.
+  replicas: 0
+  selector:
+    matchLabels: { app: browser-automation, component: worker }
+  template:
+    metadata:
+      labels: { app: browser-automation, component: worker }
+    spec:
+      serviceAccountName: browser-automation
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      # A batch is not interruptible without losing the row in flight. This is
+      # long enough for a slow row to finish; a worker killed anyway releases
+      # its job when the queue lease expires, so the work is recovered either
+      # way -- this only decides whether that costs a retry.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: worker
+          image: browser-automation:latest
+          command: ["python", "-m", "worker"]
+          envFrom:
+            - configMapRef: { name: browser-automation }
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: browser-automation, key: DB_PASSWORD }
+            - name: CREDENTIALS_KEY
+              valueFrom:
+                secretKeyRef: { name: browser-automation, key: CREDENTIALS_KEY }
+            # One batch at a time per workspace. Raising this lets one tenant
+            # run several at once; it does not let one tenant starve another,
+            # which the queue enforces regardless.
+            - name: WORKER_WORKSPACE_CONCURRENCY
+              value: "1"
+          resources:
+            # A Chromium is the floor here, not the Python process. Under
+            # ~1Gi it starts failing to render pages in ways that look like
+            # flaky selectors, which is a miserable thing to debug.
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 2Gi }
+          volumeMounts:
+            # Chromium wants real shared memory. The default 64Mi /dev/shm
+            # makes tabs crash under load, and the crash surfaces as a browser
+            # that closed mid-step rather than as anything mentioning memory.
+            - { name: dshm, mountPath: /dev/shm }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }

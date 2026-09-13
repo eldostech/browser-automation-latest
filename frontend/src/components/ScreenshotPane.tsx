@@ -2,6 +2,7 @@ import { artifactUrl } from '../lib/api';
 import type { ScreenshotEvent } from '../lib/events';
 import { formatTime } from '../lib/format';
 import { AuthedImage } from './AuthedImage';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   screenshot: ScreenshotEvent | null;
@@ -9,6 +10,8 @@ interface Props {
   history: ScreenshotEvent[];
   selectedIndex: number | null;
   onSelect: (index: number | null) => void;
+  /** Still going, so an empty frame means "nothing captured yet", not "over". */
+  running?: boolean;
 }
 
 /**
@@ -18,7 +21,7 @@ interface Props {
  * accessibility snapshot instead. The frame keeps a fixed aspect ratio so
  * swapping images never reflows the column.
  */
-export function ScreenshotPane({ screenshot, history, selectedIndex, onSelect }: Props) {
+export function ScreenshotPane({ screenshot, history, selectedIndex, onSelect, running }: Props) {
   const isLive = selectedIndex === null;
   const index = isLive ? history.length - 1 : selectedIndex;
   const current = isLive ? screenshot : (history[selectedIndex] ?? screenshot);
@@ -42,6 +45,12 @@ export function ScreenshotPane({ screenshot, history, selectedIndex, onSelect }:
           <AuthedImage
             src={artifactUrl(current.url)}
             alt={current.caption ?? `Page at step ${current.step}`}
+          />
+        ) : running ? (
+          <BrandSpinner
+            layout="block"
+            state="working"
+            label="Waiting for the first screenshot…"
           />
         ) : (
           <span className="empty">No screenshot yet</span>

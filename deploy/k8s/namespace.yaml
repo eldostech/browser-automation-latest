@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: browser-automation
+---
+# The pods assume this role through IRSA. It needs, and should need nothing
+# beyond: the artifact bucket, and the two Bedrock models -- one for healing a
+# broken locator, one for embedding the page it broke on.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: browser-automation
+  namespace: browser-automation
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/browser-automation

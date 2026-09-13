@@ -1,4 +1,8 @@
-"""Running a use case over a file of input rows.
+"""Running a use case over a set of input rows.
+
+Reading the file and describing its columns is ``ingest.py``. What is left here
+is the part that knows about *running*: checking rows against a use case before
+a browser opens, driving them one at a time, and writing the results back out.
 
 One shared browser session for the whole file, rows in sequence. That decision
 buys speed -- sign in once rather than a thousand times -- and costs coupling:
@@ -24,13 +28,12 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 import logging
 import uuid
-from datetime import date, datetime, time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
+from ingest import Dataset
 from usecase import UseCase
 
 log = logging.getLogger(__name__)
@@ -47,136 +50,19 @@ RESULT_COLUMNS: tuple[str, ...] = (
 )
 
 
-class BatchInputError(ValueError):
-    """The uploaded rows could not be used. Raised before any browser opens."""
-
-
-@dataclass(slots=True)
-class BatchRows:
-    rows: list[dict[str, Any]]
-    columns: list[str]
-    warnings: list[str] = field(default_factory=list)
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-
-def parse_workbook(data: bytes, sheet: str | None = None) -> BatchRows:
-    """Read input rows from an .xlsx workbook.
-
-    Spreadsheets are how people actually keep lists of records, so accepting
-    one removes an export step that is easy to get wrong -- a re-saved CSV
-    silently mangles leading zeros, dates and anything containing a comma.
-
-    ``openpyxl`` rather than pandas: this needs cell values, not a dataframe,
-    and pandas would pull in numpy for nothing.
-    """
-    from openpyxl import load_workbook
-
-    try:
-        book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except Exception as exc:  # noqa: BLE001 - surfaced to the uploader verbatim
-        raise BatchInputError(f"that file could not be read as a spreadsheet: {exc}") from exc
-
-    try:
-        worksheet = book[sheet] if sheet else book.worksheets[0]
-    except KeyError:
-        raise BatchInputError(
-            f"the workbook has no sheet named {sheet!r}. It has: "
-            + ", ".join(book.sheetnames)
-        ) from None
-
-    rows_iter = worksheet.iter_rows(values_only=True)
-    header = next(rows_iter, None)
-    if header is None:
-        raise BatchInputError("that sheet is empty")
-
-    columns = [str(cell).strip() for cell in header if cell is not None and str(cell).strip()]
-    if not columns:
-        raise BatchInputError("the first row must name each input column")
-
-    rows: list[dict[str, Any]] = []
-    for cells in rows_iter:
-        row = {
-            column: _cell_text(value)
-            for column, value in zip(columns, cells)
-        }
-        # A spreadsheet's trailing blank rows are an artefact of editing it,
-        # not data.
-        if any(value not in (None, "") for value in row.values()):
-            rows.append(row)
-
-    if not rows:
-        raise BatchInputError("that sheet has a header but no data rows")
-    return BatchRows(rows=rows, columns=columns)
-
-
-def _cell_text(value: Any) -> str:
-    """One cell as the text a form would receive.
-
-    Excel stores every number as a float, so an integer id arrives as "1234.0"
-    and would be typed into the page that way.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    if isinstance(value, datetime):
-        return value.date().isoformat() if value.time() == time.min else value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    return str(value).strip()
-
-
-def parse_csv(text: str) -> BatchRows:
-    """Parse an uploaded CSV into input rows.
-
-    Blank lines are skipped and values are stripped, because a spreadsheet
-    export reliably contains both and neither is worth failing a 1,000-row job
-    over. A missing header is not recoverable, so it raises.
-    """
-    if not text or not text.strip():
-        raise BatchInputError("the uploaded file is empty")
-
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise BatchInputError("the first line must be a header naming each input column")
-
-    columns = [name.strip() for name in reader.fieldnames if name and name.strip()]
-    if not columns:
-        raise BatchInputError("the header row has no usable column names")
-
-    rows: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for number, raw in enumerate(reader, start=2):
-        row = {
-            key.strip(): (value.strip() if isinstance(value, str) else value)
-            for key, value in raw.items()
-            if key and key.strip()
-        }
-        if not any(v not in (None, "") for v in row.values()):
-            continue
-        if None in raw:  # csv puts surplus cells under the None key
-            warnings.append(f"line {number} has more cells than the header; the extras were ignored")
-        rows.append(row)
-
-    if not rows:
-        raise BatchInputError("the file has a header but no data rows")
-    return BatchRows(rows=rows, columns=columns, warnings=warnings)
-
-
-def validate_rows(usecase: UseCase, rows: BatchRows) -> list[str]:
+def validate_rows(usecase: UseCase, rows: Dataset) -> list[str]:
     """Check every row against the input schema **before** a browser opens.
 
     A bad column should fail in a millisecond, not on record 700. Returns the
     problems found; an empty list means the file is good to run.
+
+    Reading and profiling the file is ``ingest.py``'s job; this is the part
+    that knows what a *use case* needs, which is why it stayed here.
     """
     problems: list[str] = []
 
     declared = usecase.input_names
-    unknown = [c for c in rows.columns if c not in declared]
+    unknown = [c for c in rows.column_names if c not in declared]
     if unknown:
         problems.append(
             "these columns do not match any declared input: "
@@ -271,9 +157,22 @@ class BatchRunner:
         row_delay: float = 0.0,
         on_row: Callable[[int, dict[str, Any], Any], Any] | None = None,
         sleep: Callable[[float], Any] | None = None,
+        indices: list[int] | None = None,
+        run_row: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.executor = executor
+        #: How one row is run. Defaults to the executor's own method, which is
+        #: the Strict and Guided path; a caller can supply the operate graph
+        #: instead, which replays first and asks an agent to clear the way only
+        #: when a row fails. Injected rather than branched on here so this loop
+        #: -- the failure streak, the pacing, the row indices -- has one shape
+        #: whichever is running underneath it.
+        self._run_row = run_row
         self.rows = rows
+        #: The original row numbers, when this is a resume running a subset.
+        #: Without them a resumed batch would label its rows 0..n again and the
+        #: results file would disagree with the first attempt.
+        self.indices = list(indices or [])
         self.failure_streak_limit = max(failure_streak_limit, 1)
         self.row_delay = row_delay
         self.on_row = on_row
@@ -290,7 +189,12 @@ class BatchRunner:
 
         streak = 0
         for index, row in enumerate(self.rows):
-            result = await self.executor.run_row(row)
+            # Stamped on every step row this produces, so a thousand-row batch
+            # can be read back one record at a time.
+            self.executor.row_index = self.indices[index] if self.indices else index
+            result = await (
+                self._run_row(row) if self._run_row else self.executor.run_row(row)
+            )
             self.results.append(result)
 
             self.progress.attempted += 1
@@ -304,6 +208,19 @@ class BatchRunner:
 
             if self.on_row is not None:
                 await self.on_row(index, row, result)
+
+            # A row is the unit somebody resumes, retries and reads results by,
+            # so it is the point at which what happened has to be on disk
+            # rather than in this process. Events are written in batches now
+            # (see `eventbuffer.py`), which makes that a decision rather than a
+            # side effect of writing each one as it happened -- and it bounds
+            # what a hard kill can lose to the row in flight.
+            # Both getattrs matter: a test injects its own `_run_row` with a
+            # stand-in executor, and a sink built for a run with no database
+            # behind it has nothing to flush.
+            flush = getattr(getattr(self.executor, "sink", None), "flush", None)
+            if flush is not None:
+                await flush()
 
             if streak >= self.failure_streak_limit:
                 self.progress.stopped_reason = (
@@ -347,20 +264,6 @@ def new_batch_id() -> str:
     return uuid.uuid4().hex
 
 
-def rows_from_json(payload: Any) -> BatchRows:
-    """Accept a JSON array of objects as an alternative to a CSV upload."""
-    if not isinstance(payload, list) or not payload:
-        raise BatchInputError("rows must be a non-empty JSON array of objects")
-    if not all(isinstance(item, dict) for item in payload):
-        raise BatchInputError("every row must be a JSON object")
-
-    columns: list[str] = []
-    for row in payload:
-        for key in row:
-            if key not in columns:
-                columns.append(str(key))
-    return BatchRows(rows=[dict(row) for row in payload], columns=columns)
-
 
 def summarise(progress: BatchProgress) -> str:
     parts = [
@@ -371,7 +274,3 @@ def summarise(progress: BatchProgress) -> str:
     if progress.relogins:
         parts.append(f"{progress.relogins} re-login(s)")
     return ", ".join(parts)
-
-
-def json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False)

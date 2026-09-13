@@ -5,7 +5,6 @@
 SHELL := /bin/bash
 PY          ?= python
 VENV        ?= .venv
-MCP_PACKAGE ?= @playwright/mcp@latest
 
 ifeq ($(OS),Windows_NT)
   VENV_BIN := $(VENV)/Scripts
@@ -34,17 +33,13 @@ setup-frontend: ## Install frontend dependencies
 	cd frontend && npm install
 
 .PHONY: browsers
-browsers: ## Download the Chromium build the MCP server drives
-	# The browser revision must match the Playwright version bundled *inside*
-	# @playwright/mcp, which is not necessarily `playwright@latest`. Installing
-	# the MCP package first makes `npx playwright` resolve to that exact
-	# version, so it downloads the revision the server will actually look for.
-	@mkdir -p .tools
-	# `npm init -y` cannot name a dot-directory, and without a package.json
-	# `npm install` silently no-ops -- so write the manifest directly.
-	cd .tools && echo '{ "name": "playwright-tools", "private": true }' > package.json
-	cd .tools && npm install --no-audit --no-fund $(MCP_PACKAGE)
-	cd .tools && npx playwright install chromium
+browsers: playwright-browser ## Download the Chromium the engine and recorder drive
+
+.PHONY: playwright-browser
+playwright-browser: ## Chromium for the replay engine and the recorder
+	# One browser for both. Recording shells out to this same Playwright, so
+	# there is no second install and no version to keep in step.
+	$(VENV_BIN)/python -m playwright install chromium
 
 # --- database --------------------------------------------------------------
 
@@ -67,22 +62,22 @@ db-history: ## Show the migration history and where this database sits
 
 .PHONY: backend
 backend: db-upgrade ## Run the FastAPI backend (http://localhost:8000)
-	cd backend && ../$(VENV_BIN)/uvicorn main:app --reload --host 0.0.0.0 --port 8000
+	cd backend && HOST=0.0.0.0 ../$(VENV_BIN)/python serve.py
+
+.PHONY: worker
+worker: ## Run a batch worker on its own (set WORKER_ENABLED=false on the API)
+	cd backend && ../$(VENV_BIN)/python -m worker
 
 .PHONY: frontend
 frontend: ## Run the Vite dev server (http://localhost:5173)
 	cd frontend && npm run dev
-
-.PHONY: mcp-server
-mcp-server: ## Run Playwright MCP standalone over HTTP (for MCP_TRANSPORT=http)
-	npx -y @playwright/mcp@latest --port 8931 --headless --isolated
 
 .PHONY: test
 test: ## Run the backend test suite (needs Postgres; uses its own schema)
 	cd backend && ../$(VENV_BIN)/python -m pytest -q
 
 .PHONY: test-e2e
-test-e2e: ## Run tests including the real-browser end-to-end test
+test-e2e: ## Run the real-browser tests (record -> replay against a local site)
 	cd backend && RUN_E2E=1 ../$(VENV_BIN)/python -m pytest -q -m e2e
 
 .PHONY: lint

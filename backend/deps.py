@@ -60,10 +60,6 @@ def get_vault(request: Request) -> Vault:
     return request.app.state.vault
 
 
-def get_manager(request: Request):
-    return request.app.state.manager
-
-
 def get_replays(request: Request):
     return request.app.state.replays
 
@@ -227,7 +223,6 @@ __all__ = [
     "get_auth",
     "get_bus",
     "get_config",
-    "get_manager",
     "get_queue",
     "get_replays",
     "get_store",

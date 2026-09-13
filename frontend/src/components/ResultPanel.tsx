@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { RunFinishedEvent } from '../lib/events';
 import { formatDuration, prettyJson } from '../lib/format';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   finished: RunFinishedEvent | null;
@@ -32,9 +33,7 @@ export function ResultPanel({ finished, running }: Props) {
       </header>
       <div className="body">
         {!finished && running && (
-          <div style={{ color: 'var(--text-faint)', fontSize: 13 }}>
-            The result appears here when the agent finishes.
-          </div>
+          <BrandSpinner state="working" label="The result appears here when it finishes." />
         )}
 
         {!finished && !running && (

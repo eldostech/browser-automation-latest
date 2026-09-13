@@ -10,16 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-from batch import (
-    BatchInputError,
-    BatchRunner,
-    parse_csv,
-    results_csv,
-    rows_from_json,
-    summarise,
-    validate_rows,
-)
-from replay import RowResult
+from batch import BatchRunner, results_csv, summarise, validate_rows
+from ingest import read_csv_text
+from engine import RowResult
 from usecase import InputSpec, Step, UseCase
 
 
@@ -234,51 +227,10 @@ def test_summarise_reads_clearly():
     assert text == "3 succeeded, 1 failed, 1 not attempted, 2 re-login(s)"
 
 
-# --- input parsing ---------------------------------------------------------
-
-
-def test_a_csv_is_parsed_into_rows():
-    parsed = parse_csv("record_url,answer\nhttps://a,1\nhttps://b,2\n")
-    assert parsed.columns == ["record_url", "answer"]
-    assert parsed.rows == [
-        {"record_url": "https://a", "answer": "1"},
-        {"record_url": "https://b", "answer": "2"},
-    ]
-
-
-def test_blank_lines_and_padding_are_tolerated():
-    """A spreadsheet export reliably contains both."""
-    parsed = parse_csv("record_url , answer\n  https://a , 1 \n\n\nhttps://b,2\n")
-    assert len(parsed) == 2
-    assert parsed.rows[0] == {"record_url": "https://a", "answer": "1"}
-
-
-@pytest.mark.parametrize(
-    ("text", "message"),
-    [
-        ("", "empty"),
-        ("   ", "empty"),
-        ("record_url,answer\n", "no data rows"),
-    ],
-)
-def test_unusable_files_are_refused_with_a_reason(text: str, message: str):
-    with pytest.raises(BatchInputError, match=message):
-        parse_csv(text)
-
-
-def test_json_rows_are_accepted_too():
-    parsed = rows_from_json([{"a": 1}, {"a": 2, "b": 3}])
-    assert parsed.columns == ["a", "b"]
-    assert len(parsed) == 2
-
-
-@pytest.mark.parametrize("payload", [[], {}, "nope", [1, 2]])
-def test_bad_json_rows_are_refused(payload):
-    with pytest.raises(BatchInputError):
-        rows_from_json(payload)
-
-
 # --- validation before the browser opens -----------------------------------
+#
+# Reading a file is ``ingest.py`` now, and tested in ``test_ingest.py``. What
+# is checked here is the part that knows what a *use case* needs.
 
 
 def use_case() -> UseCase:
@@ -298,22 +250,22 @@ def use_case() -> UseCase:
 
 
 def test_a_good_file_validates_clean():
-    assert validate_rows(use_case(), parse_csv("record_url,answer\nhttps://a,1\n")) == []
+    assert validate_rows(use_case(), read_csv_text("record_url,answer\nhttps://a,1\n")) == []
 
 
 def test_an_unknown_column_is_reported_with_what_was_expected():
-    problems = validate_rows(use_case(), parse_csv("record_url,nonsense\nhttps://a,1\n"))
+    problems = validate_rows(use_case(), read_csv_text("record_url,nonsense\nhttps://a,1\n"))
     assert any("nonsense" in p and "record_url" in p for p in problems)
 
 
 def test_a_row_missing_a_required_input_is_reported_by_number():
-    problems = validate_rows(use_case(), parse_csv("record_url,answer\nhttps://a,\n"))
+    problems = validate_rows(use_case(), read_csv_text("record_url,answer\nhttps://a,\n"))
     assert any("row 1" in p and "answer" in p for p in problems)
 
 
 def test_only_the_first_few_bad_rows_are_listed_individually():
     text = "record_url,answer\n" + "".join("https://a,\n" for _ in range(50))
-    problems = validate_rows(use_case(), parse_csv(text))
+    problems = validate_rows(use_case(), read_csv_text(text))
     assert len(problems) <= 8, "a 1,000-row file must not produce 1,000 error lines"
     assert any("missing from one or more rows" in p for p in problems)
 
@@ -363,102 +315,26 @@ def test_the_results_header_is_stable_for_an_empty_batch():
     ]
 
 
-# --- spreadsheets ----------------------------------------------------------
+# --- reading a spreadsheet -------------------------------------------------
 #
-# A re-saved CSV silently mangles leading zeros, dates and anything containing
-# a comma, so accepting .xlsx removes an export step that is easy to get wrong.
+# How a file is read is ``ingest.py``, and tested in ``test_ingest.py``. What
+# is worth asserting here is that a workbook reaches validation in the same
+# shape a CSV does, because that equivalence is the whole reason .xlsx is
+# accepted at all.
 
 
-def workbook(rows: list[list], sheet_name: str = "Sheet1") -> bytes:
+def test_a_workbook_validates_against_a_use_case_like_a_csv():
     import io as _io
 
     from openpyxl import Workbook
 
+    from ingest import read_table
+
     book = Workbook()
-    book.active.title = sheet_name
-    for row in rows:
+    for row in [["record_url", "answer"], ["https://a", "1"]]:
         book.active.append(row)
     buffer = _io.BytesIO()
     book.save(buffer)
-    return buffer.getvalue()
 
-
-def test_a_workbook_is_parsed_like_a_csv():
-    from batch import parse_workbook
-
-    parsed = parse_workbook(
-        workbook([["record_url", "answer"], ["https://a", "1"], ["https://b", "2"]])
-    )
-    assert parsed.columns == ["record_url", "answer"]
-    assert parsed.rows == [
-        {"record_url": "https://a", "answer": "1"},
-        {"record_url": "https://b", "answer": "2"},
-    ]
-
-
-def test_whole_numbers_do_not_arrive_as_floats():
-    """Excel stores every number as a float, so an id would be typed '1234.0'."""
-    from batch import parse_workbook
-
-    parsed = parse_workbook(workbook([["record_url", "answer"], ["https://a", 1234]]))
-    assert parsed.rows[0]["answer"] == "1234"
-
-
-def test_dates_arrive_as_iso_not_a_timestamp():
-    from batch import parse_workbook
-    from datetime import datetime
-
-    parsed = parse_workbook(
-        workbook([["record_url", "answer"], ["https://a", datetime(2026, 8, 24)]])
-    )
-    assert parsed.rows[0]["answer"] == "2026-08-24"
-
-
-def test_trailing_blank_rows_are_ignored():
-    """An artefact of editing a spreadsheet, not data."""
-    from batch import parse_workbook
-
-    parsed = parse_workbook(
-        workbook([["record_url"], ["https://a"], [None], [""], [None]])
-    )
-    assert len(parsed) == 1
-
-
-def test_a_named_sheet_can_be_chosen():
-    from batch import parse_workbook
-
-    data = workbook([["record_url"], ["https://a"]], sheet_name="Prospects")
-    assert parse_workbook(data, "Prospects").rows[0]["record_url"] == "https://a"
-
-
-def test_an_unknown_sheet_names_the_ones_that_exist():
-    from batch import BatchInputError, parse_workbook
-
-    data = workbook([["record_url"], ["https://a"]], sheet_name="Prospects")
-    with pytest.raises(BatchInputError, match="Prospects"):
-        parse_workbook(data, "NotThere")
-
-
-@pytest.mark.parametrize(
-    ("rows", "message"),
-    [([], "empty"), ([["record_url"]], "no data rows"), ([[None, None]], "must name")],
-)
-def test_unusable_workbooks_are_refused(rows, message):
-    from batch import BatchInputError, parse_workbook
-
-    with pytest.raises(BatchInputError, match=message):
-        parse_workbook(workbook(rows))
-
-
-def test_a_file_that_is_not_a_workbook_is_refused():
-    from batch import BatchInputError, parse_workbook
-
-    with pytest.raises(BatchInputError, match="could not be read as a spreadsheet"):
-        parse_workbook(b"record_url\nhttps://a\n")
-
-
-def test_a_workbook_validates_against_a_use_case_like_a_csv():
-    from batch import parse_workbook, validate_rows
-
-    parsed = parse_workbook(workbook([["record_url", "answer"], ["https://a", "1"]]))
+    parsed = read_table(buffer.getvalue(), "rows.xlsx")
     assert validate_rows(use_case(), parsed) == []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import quote
 from typing import Annotated, Any
 
 from fastapi import (
@@ -18,12 +19,11 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, RedirectResponse, Response
 
-from agent import RunOptions
 from auth.rbac import Permission
 from auth.service import Principal
 from deps import (
     WorkspaceData,
-    get_manager,
+    get_replays,
     get_store,
     principal_from_websocket,
     require,
@@ -31,69 +31,24 @@ from deps import (
 )
 from events import TERMINAL_STATUSES, dump_event
 from fields import FieldSet
+from imagediff import describe
 from storage import S3_SCHEME, StorageError
-from routers.schemas import ApprovalRequest, CreateRunRequest, CreateRunResponse
-from runner import RunManager, RunRequest
+from runner import ReplayManager
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["runs"])
+
+#: How much of a page has to change before it is worth pointing at. Below this
+#: is a clock, a cursor, or an animation; above it something moved.
+DIVERGENCE = 0.02
 
 #: Non-event transport frame used to keep idle proxies from closing the socket.
 #: Clients ignore any message whose ``type`` starts with ``__``.
 HEARTBEAT = {"type": "__heartbeat__"}
 HEARTBEAT_INTERVAL = 20.0
 
-Manager = Annotated[RunManager, Depends(get_manager)]
-
-
-@router.post("/runs", response_model=CreateRunResponse, status_code=201)
-async def create_run(
-    body: CreateRunRequest,
-    request: Request,
-    manager: Manager,
-    principal: Annotated[Principal, Depends(require(Permission.RUN_CREATE))],
-) -> CreateRunResponse:
-    options: RunOptions = manager.default_options()
-    if body.max_steps is not None:
-        options.max_steps = body.max_steps
-    if body.timeout_seconds is not None:
-        options.timeout_seconds = body.timeout_seconds
-    if body.allowed_domains is not None:
-        options.allowed_domains = body.allowed_domains
-    if body.require_approval is not None:
-        options.require_approval = body.require_approval
-    if body.screenshot_every_step is not None:
-        options.screenshot_every_step = body.screenshot_every_step
-
-    try:
-        fields = FieldSet.from_payload([f.model_dump() for f in body.fields])
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    run_id = await manager.start_run(
-        RunRequest(
-            task=body.task,
-            start_url=body.start_url,
-            options=options,
-            headless=body.headless,
-            browser=body.browser,
-            secrets=list(body.secrets or []),
-            fields=fields,
-            workspace_id=principal.workspace_id,
-            owner_id=principal.user_id,
-            owner_email=principal.email,
-        )
-    )
-
-    # Held in memory only, and only until the user decides whether to keep
-    # them. Nothing about this reaches disk. See stash.py.
-    if fields.secret_values:
-        request.app.state.stash.put(
-            run_id, fields.secret_values, workspace_id=principal.workspace_id
-        )
-
-    return CreateRunResponse(run_id=run_id, status="pending")
+Replays = Annotated[ReplayManager, Depends(get_replays)]
 
 
 @router.get("/runs")
@@ -117,14 +72,13 @@ async def list_runs(
 async def get_run(
     run_id: str,
     data: WorkspaceData,
-    manager: Manager,
+    replays: Replays,
     _: Annotated[Principal, Depends(require(Permission.RUN_READ))],
 ) -> dict[str, Any]:
     run = await run_or_404(run_id, data)
     return {
         **run.to_dict(),
-        "active": manager.is_active(run_id),
-        "pending_approval": manager.pending_approval(run_id),
+        "active": replays.is_active(run_id),
         "artifacts": [
             {"id": a.id, "kind": a.kind, "mime": a.mime, "url": f"/api/artifacts/{a.id}"}
             for a in await data.list_artifacts(run_id)
@@ -132,28 +86,41 @@ async def get_run(
     }
 
 
-@router.get("/runs/{run_id}/credential-slots")
-async def held_credential_slots(
+@router.get("/runs/{run_id}/steps")
+async def get_run_steps(
     run_id: str,
-    request: Request,
     data: WorkspaceData,
-    principal: Annotated[Principal, Depends(require(Permission.RUN_READ))],
+    _: Annotated[Principal, Depends(require(Permission.RUN_READ))],
 ) -> dict[str, Any]:
-    """Which credential slots this recording still has values for.
+    """Every step of this run, with its screenshot and the baseline's.
 
-    Names only -- there is no endpoint that returns a held value. The UI asks
-    this when offering "save these credentials with the use case", so that it
-    only offers when there is something to save and can say which slots.
+    The event log can answer this too, by scanning JSON and joining nothing.
+    This is the projection written alongside it, which is what makes the
+    side-by-side comparison a read rather than an image operation per render.
 
-    An empty list is the normal answer for a run that used no credentials, and
-    also for one whose values have expired. The two are deliberately not
-    distinguished: either way there is nothing to save.
+    ``pixel_diff`` is the fraction of pixels that changed. ``null`` means there
+    was no baseline -- a first run, or a step that has never succeeded before
+    -- which is a different thing from ``0.0`` meaning nothing moved.
     """
     await run_or_404(run_id, data)
-    return {
-        "run_id": run_id,
-        "slots": request.app.state.stash.slots(run_id, workspace_id=principal.workspace_id),
-    }
+    steps = await data.list_run_steps(run_id)
+    for step in steps:
+        for key, field in (("screenshot_url", "screenshot_id"), ("baseline_url", "baseline_id")):
+            artifact = step.get(field)
+            step[key] = f"/api/artifacts/{artifact}" if artifact else None
+        step["diff"] = describe(step.get("pixel_diff"))
+
+    # The first step that visibly diverged, so the UI can open there instead of
+    # asking somebody to scroll a thousand rows looking for it.
+    diverged = next(
+        (
+            s["seq"]
+            for s in steps
+            if s["status"] == "failed" or (s.get("pixel_diff") or 0) >= DIVERGENCE
+        ),
+        None,
+    )
+    return {"run_id": run_id, "steps": steps, "first_divergence": diverged}
 
 
 @router.get("/runs/{run_id}/events")
@@ -173,52 +140,44 @@ async def get_run_events(
 async def cancel_run(
     run_id: str,
     data: WorkspaceData,
-    manager: Manager,
+    replays: Replays,
     _: Annotated[Principal, Depends(require(Permission.RUN_CANCEL))],
 ) -> dict[str, Any]:
     run = await run_or_404(run_id, data)
     if run.status in TERMINAL_STATUSES:
         return {"run_id": run_id, "cancelled": False, "reason": f"run already {run.status}"}
 
-    if not await manager.cancel_run(run_id):
+    if not await replays.cancel_run(run_id):
         raise HTTPException(status_code=409, detail="That run is not active on this backend.")
     return {"run_id": run_id, "cancelled": True}
 
 
-@router.post("/runs/{run_id}/approve")
-async def approve_action(
-    run_id: str,
-    body: ApprovalRequest,
-    data: WorkspaceData,
-    manager: Manager,
-    principal: Annotated[Principal, Depends(require(Permission.RUN_APPROVE))],
-) -> dict[str, Any]:
-    """Let a paused run proceed, or refuse it.
 
-    The approval is recorded against the person who gave it. Before this, the
-    only trace an approval left was a boolean saying one had happened.
+def _artifact_headers(record) -> dict[str, str]:
+    """Caching, plus the download's own name when it has one.
+
+    A screenshot is rendered inline and needs no name -- it is identified by
+    the step it belongs to. A downloaded document does: the file is the
+    deliverable, and saving it as an opaque id is how a migration ends up with
+    a bucket nobody can join to anything. The name also travels to whatever
+    system it gets uploaded into next.
     """
-    await run_or_404(run_id, data)
+    headers = {"Cache-Control": "private, max-age=31536000, immutable"}
+    name = (getattr(record, "filename", "") or "").strip()
+    if not name:
+        return headers
 
-    decision = "approved" if body.decision == "approve" else "rejected"
-    if not manager.resolve_approval(run_id, body.approval_id, decision, body.note):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "No approval is pending for this run "
-                "(it may have timed out or already been resolved)."
-            ),
-        )
-
-    await data.audit(
-        f"run.{decision}",
-        actor_id=principal.user_id,
-        actor_email=principal.email,
-        resource_type="run",
-        resource_id=run_id,
-        detail={"approval_id": body.approval_id, "note": body.note},
+    # A quote or a newline here would let a stored filename forge extra header
+    # content, so neither survives. The RFC 5987 form carries anything
+    # non-ASCII; the plain one is the fallback for older clients.
+    strip = str.maketrans({chr(92): '_', chr(34): '_', chr(13): '', chr(10): ''})
+    safe = name.translate(strip)
+    ascii_name = safe.encode("ascii", "replace").decode("ascii")
+    headers["Content-Disposition"] = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(safe, safe='')}"
     )
-    return {"run_id": run_id, "decision": decision, "by": principal.email}
+    return headers
 
 
 @router.get("/artifacts/{artifact_id}")
@@ -253,7 +212,7 @@ async def get_artifact(
         return Response(
             payload,
             media_type=record.mime,
-            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+            headers=_artifact_headers(record),
         )
 
     if not Path(record.path).exists():
@@ -261,12 +220,12 @@ async def get_artifact(
         # or a backend switch that left the old files behind.
         raise HTTPException(
             status_code=404,
-            detail="That screenshot is recorded but its file is missing from storage.",
+            detail="That artifact is recorded but its file is missing from storage.",
         )
     return FileResponse(
         record.path,
         media_type=record.mime,
-        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+        headers=_artifact_headers(record),
     )
 
 

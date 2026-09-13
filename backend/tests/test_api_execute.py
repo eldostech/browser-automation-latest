@@ -12,11 +12,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import FakeTool
 from credentials import generate_key
-from mcp_client import ToolOutcome
-from test_api import _fake_probe  # noqa: F401
-from test_replay import SIGNED_IN, SIGNED_OUT, ScriptedMCP
+from fake_browser import SIGNED_IN, SIGNED_OUT, session_serving
 
 
 class ExplodingLLM:
@@ -26,25 +23,14 @@ class ExplodingLLM:
         raise AssertionError(f"the replay path touched the LLM client ({name!r})")
 
 
-class FakeReplaySession:
-    """Async-context wrapper around the scripted MCP session."""
-
-    #: Set by each test so assertions can inspect the calls afterwards.
-    current: ScriptedMCP | None = None
-
-    def __init__(self, config: Any) -> None:
-        self.config = config
-
-    async def __aenter__(self) -> ScriptedMCP:
-        FakeReplaySession.current = ScriptedMCP(
-            [SIGNED_OUT, SIGNED_IN],
-            routes={"/signin": SIGNED_OUT},
-            advance_on={"browser_click"},
-        )
-        return FakeReplaySession.current
-
-    async def __aexit__(self, *exc_info: Any) -> bool:
-        return False
+#: The browser these API tests replay against.
+#:
+#: Playwright-shaped now rather than MCP-shaped, because that is what the
+#: engine drives -- but serving the same two snapshots, so what every test
+#: below asserts is unchanged. A click advances the page, which is how signing
+#: in behaves, and `/signin` is pinned so navigating back to it shows the
+#: signed-out page however many times you do.
+FakeReplaySession = session_serving([SIGNED_OUT, SIGNED_IN], {"/signin": SIGNED_OUT})
 
 
 USE_CASE = {
@@ -112,7 +98,7 @@ def client(db_settings, db_engine, tmp_path, monkeypatch):
         credentials_key=generate_key(),
     )
     with TestClient(app) as test_client:
-        test_client.app.state.manager._llm = ExplodingLLM()  # noqa: SLF001 - test seam
+        test_client.app.state.repair_model._client = ExplodingLLM()  # noqa: SLF001 - test seam
         yield authenticate(test_client)
 
 
@@ -229,8 +215,10 @@ async def test_the_real_secret_still_reaches_the_page(client: TestClient):
               "credential_id": credential["id"]},
     )
 
-    filled = [args for name, args in FakeReplaySession.current.calls if name == "browser_fill_form"]
-    values = [f["value"] for f in filled[0]["fields"]]
+    # One fill per field now: there is no batched form-fill call to make, and
+    # the round trip that made batching worthwhile is gone with MCP.
+    filled = [args for name, args in FakeReplaySession.current.calls if name == "fill"]
+    values = [args["text"] for args in filled]
     assert "s3cret-Example-Pw!" in values, "redaction must not reach the browser call itself"
 
 
@@ -360,7 +348,7 @@ async def test_headless_false_reaches_the_browser_config(client: TestClient):
 
     import runner as runner_module
 
-    runner_module.MCPBrowserSession = RecordingSession
+    runner_module.PlaywrightSession = RecordingSession
     try:
         usecase_id = await seed(client)
         client.post(
@@ -371,11 +359,12 @@ async def test_headless_false_reaches_the_browser_config(client: TestClient):
                 "headless": False,
             },
         )
+        # The config the browser is launched from. There is no command line to
+        # inspect any more -- headless goes straight to `launch(headless=...)`,
+        # which is one fewer place for the toggle to be dropped.
         assert seen and seen[0].headless is False
-        # And the flag the MCP server actually receives.
-        assert "--headless" not in seen[0].command_line()
     finally:
-        runner_module.MCPBrowserSession = FakeReplaySession
+        runner_module.PlaywrightSession = FakeReplaySession
 
 
 async def test_headless_defaults_to_the_server_setting(client: TestClient):
@@ -388,7 +377,7 @@ async def test_headless_defaults_to_the_server_setting(client: TestClient):
 
     import runner as runner_module
 
-    runner_module.MCPBrowserSession = RecordingSession
+    runner_module.PlaywrightSession = RecordingSession
     try:
         usecase_id = await seed(client)
         client.post(
@@ -399,9 +388,8 @@ async def test_headless_defaults_to_the_server_setting(client: TestClient):
             },
         )
         assert seen and seen[0].headless is True
-        assert "--headless" in seen[0].command_line()
     finally:
-        runner_module.MCPBrowserSession = FakeReplaySession
+        runner_module.PlaywrightSession = FakeReplaySession
 
 
 # --- repairing a failure instead of re-recording ---------------------------
@@ -415,9 +403,13 @@ class RepairLLM:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
         self.calls = 0
+        #: Every user message sent, so a test can assert on what the model was
+        #: actually told -- notably whether past fixes reached it.
+        self.prompts: list[str] = []
 
     async def run_turn(self, *, system, messages, tools, on_text_delta=None, timeout=None):
         self.calls += 1
+        self.prompts.append(chr(10).join(str(m.get("content", "")) for m in messages))
         from llm import LLMTurn, ToolCallRequest
 
         return LLMTurn(
@@ -468,7 +460,7 @@ async def test_a_failed_run_can_be_repaired_without_re_recording(client: TestCli
             ],
         }
     )
-    client.app.state.manager._llm = llm  # noqa: SLF001 - test seam
+    client.app.state.repair_model._client = llm  # noqa: SLF001 - test seam
 
     repaired = client.post(
         f"/api/usecases/{usecase_id}/repair", json={"execution_id": failure["execution_id"]}
@@ -504,7 +496,7 @@ async def test_a_repair_the_model_declines_reports_why_and_changes_nothing(clien
               "secrets": {"username": "u", "password": "p"}},
     ).json()
 
-    client.app.state.manager._llm = RepairLLM(  # noqa: SLF001
+    client.app.state.repair_model._client = RepairLLM(  # noqa: SLF001
         {
             "diagnosis": "The per-row work needs a value worked out from the page.",
             "fixes": [],
@@ -549,7 +541,7 @@ async def test_a_repair_that_changes_nothing_is_not_reported_as_repaired(client:
     ).json()
 
     # A fix pointing at a step that does not exist: nothing can be applied.
-    client.app.state.manager._llm = RepairLLM(  # noqa: SLF001
+    client.app.state.repair_model._client = RepairLLM(  # noqa: SLF001
         {
             "diagnosis": "Something moved.",
             "confidence": "medium",

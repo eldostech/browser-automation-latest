@@ -62,6 +62,26 @@ class Permission(StrEnum):
     #: authorities.
     SCRIPT_ENABLE = "script:enable"
 
+    #: Starting an authoring session that drives a browser with a model.
+    #:
+    #: Its own permission rather than part of USECASE_CREATE, because the two
+    #: are different authorities: recording with codegen costs nothing and
+    #: touches only what the person clicks, while an agent session spends money
+    #: and decides for itself what to touch next. A workspace can reasonably
+    #: let everybody record and only some people spend.
+    AGENT_AUTHOR = "agent:author"
+
+    #: What MCP servers a workspace's agent may reach for, beside its browser.
+    #:
+    #: Split the same way credentials are: everyone who may run the agent can
+    #: see what is registered and enabled, because that shapes what a session
+    #: they start can do. Registering, changing or previewing one is not --
+    #: previewing opens whatever command a person names, and that authority
+    #: belongs with the same people who may enable script steps, not with
+    #: everyone who may author a recording.
+    AGENT_TOOLS_READ = "agent_tools:read"
+    AGENT_TOOLS_WRITE = "agent_tools:write"
+
     # -- administration -----------------------------------------------------
     USER_MANAGE = "user:manage"
     AUDIT_READ = "audit:read"
@@ -88,23 +108,27 @@ _OPERATOR: frozenset[Permission] = _VIEWER | {
     Permission.CREDENTIAL_WRITE,
 }
 
-#: Can design, publish and repair use cases.
+#: Can design, publish and repair use cases -- including with the agent, which
+#: is the same job done a different way and lands in the same review screen.
 _AUTHOR: frozenset[Permission] = _OPERATOR | {
+    Permission.AGENT_AUTHOR,
     Permission.USECASE_CREATE,
     Permission.USECASE_PUBLISH,
     Permission.USECASE_DELETE,
     Permission.USECASE_REPAIR,
     Permission.CREDENTIAL_DELETE,
+    Permission.AGENT_TOOLS_READ,
 }
 
-#: Everything, plus the two authorities nobody else gets: managing accounts,
-#: and enabling script execution.
+#: Everything, plus the authorities nobody else gets: managing accounts,
+#: enabling script execution, and choosing what the agent may connect to.
 _ADMIN: frozenset[Permission] = (
     _AUTHOR
     | {
         Permission.SCRIPT_ENABLE,
         Permission.USER_MANAGE,
         Permission.AUDIT_READ,
+        Permission.AGENT_TOOLS_WRITE,
     }
 )
 

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import type { CredentialSummary } from '../lib/events';
 import { formatRelative } from '../lib/format';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   /** Slot names the current use case needs, so the form can prefill them. */
@@ -185,7 +186,7 @@ export function CredentialsPanel({ requiredSlots = [], onChange }: Props) {
         </label>
 
         <button type="button" className="primary" onClick={save} disabled={busy || !canSave}>
-          {busy ? 'Saving...' : 'Save credential'}
+          {busy ? <BrandSpinner state="working" label="Saving…" /> : 'Save credential'}
         </button>
       </fieldset>
     </div>

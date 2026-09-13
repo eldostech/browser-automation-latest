@@ -9,52 +9,35 @@
 
 import type {
   AgentEvent,
+  BatchEstimate,
+  AgentSessionDetail,
   AuditEntry,
   BatchDetail,
   BatchSummary,
   CredentialSummary,
-  DistillResult,
+  DatasetSummary,
+  Locator,
+  ModelCatalogue,
+  LocatorCheckReport,
+  MappingResult,
+  RememberedFix,
+  RunStep,
+  RecordingDetail,
   ExecutionRecord,
   RunDetail,
   RunSummary,
   ServerConfig,
+  StartAgentSession,
+  Target,
+  WorkspaceSpend,
   UseCase,
   UseCaseSummary,
 } from './events';
+import { modelFields } from './model';
 import { session, type CurrentUser } from './session';
 
 /** Empty by default: Vite (dev) and nginx (prod) proxy /api to the backend. */
 export const API_BASE: string = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
-
-/**
- * One named value a recording will use.
- *
- * `secret: true` changes three things at once on the server: the model is
- * shown a placeholder instead of the value, the value is registered for
- * redaction, and the resulting use case gets a credential slot rather than an
- * input column. The value is write-only in both directions — no endpoint
- * returns it, and nothing here should ever put it in application state longer
- * than the form needs it.
- */
-export interface DeclaredField {
-  name: string;
-  value: string;
-  secret: boolean;
-  description?: string;
-}
-
-export interface CreateRunPayload {
-  task: string;
-  start_url?: string | null;
-  /** Values the instruction refers to, named. See DeclaredField. */
-  fields?: DeclaredField[];
-  max_steps?: number;
-  timeout_seconds?: number;
-  allowed_domains?: string[];
-  require_approval?: boolean;
-  screenshot_every_step?: boolean;
-  headless?: boolean;
-}
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -64,12 +47,17 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // A multipart body must set its own Content-Type, because only the browser
+  // knows the boundary it generated. Sending application/json over a FormData
+  // body produces a request the server cannot parse and an error that says
+  // nothing about the cause.
+  const isForm = init?.body instanceof FormData;
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     // Spread first, then set headers, so a caller passing its own headers
     // cannot accidentally drop the Authorization one.
     headers: {
-      'Content-Type': 'application/json',
+      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
       ...session.headers(),
       ...(init?.headers ?? {}),
     },
@@ -137,12 +125,6 @@ export const api = {
 
   getConfig: () => request<ServerConfig>('/api/config'),
 
-  createRun: (payload: CreateRunPayload) =>
-    request<{ run_id: string; status: string }>('/api/runs', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
-
   listRuns: (status?: string, limit = 50) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (status) params.set('status', status);
@@ -161,34 +143,11 @@ export const api = {
       method: 'POST',
     }),
 
-  resolveApproval: (runId: string, approvalId: string, decision: 'approve' | 'reject', note?: string) =>
-    request<{ run_id: string; decision: string }>(`/api/runs/${runId}/approve`, {
-      method: 'POST',
-      body: JSON.stringify({ approval_id: approvalId, decision, note }),
-    }),
-
   health: () => request<Record<string, unknown>>('/healthz'),
 
   // --- use cases ------------------------------------------------------------
 
   /** Promote a succeeded run into a reusable use case. The one LLM call. */
-  /**
-   * Turn a finished recording into a use case.
-   *
-   * `saveCredentialAs` decides what happens to the credentials the recording
-   * used: naming one keeps them, omitting it discards them. There is no third
-   * option — they are held in memory on the backend only until this call
-   * resolves, so not choosing *is* discarding.
-   */
-  distillRun: (runId: string, options?: { name?: string; saveCredentialAs?: string | null }) =>
-    request<DistillResult>(`/api/runs/${runId}/distill`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name: options?.name ?? null,
-        save_credential_as: options?.saveCredentialAs ?? null,
-      }),
-    }),
-
   /** Which credential slots this run still holds values for. Names only. */
   heldCredentialSlots: (runId: string) =>
     request<{ run_id: string; slots: string[] }>(`/api/runs/${runId}/credential-slots`),
@@ -244,6 +203,39 @@ export const api = {
       body: JSON.stringify(definition),
     }),
 
+  // -- models ---------------------------------------------------------------
+  /** Every model this deployment can reach, with prices the provider publishes.
+   *
+   * Behind `usecase:read`: choosing which model to try is ordinary work for
+   * anyone allowed to run a use case, and the reply carries no credential.
+   */
+  models: () => request<ModelCatalogue>('/api/models'),
+
+  /** Can this deployment actually call that model? One tiny request.
+   *
+   * A key without credit, a model needing its own provider agreement, an id
+   * that has been retired -- none of those are visible in a catalogue, and all
+   * of them look identical to a broken workflow three steps into a run.
+   */
+  checkModel: (provider: string, model: string) =>
+    request<{ provider: string; model: string; ok: boolean; error?: string }>(
+      '/api/models/check',
+      { method: 'POST', body: JSON.stringify({ provider, model }) },
+    ),
+
+  /** What these locators match on a real page, right now.
+   *
+   * Nothing is saved. This exists because editing a locator without it is
+   * editing a string: a rung reads perfectly well and still matches nothing,
+   * or matches four things, and the only way to find out used to be running
+   * the use case and waiting out a timeout on row one of a batch.
+   */
+  checkLocators: (id: string, url: string, locators: Locator[], timeoutMs = 10000) =>
+    request<LocatorCheckReport>(`/api/usecases/${id}/locator-check`, {
+      method: 'POST',
+      body: JSON.stringify({ url, locators, timeout_ms: timeoutMs }),
+    }),
+
   /** Change the label only. No new version — a name is not part of the recipe. */
   renameUseCase: (id: string, name: string, description?: string) =>
     request<{ usecase_id: string; name: string }>(`/api/usecases/${id}`, {
@@ -286,7 +278,10 @@ export const api = {
       error: string | null;
       llm_calls: number;
       llm_tokens: number;
-    }>(`/api/usecases/${id}/execute`, { method: 'POST', body: JSON.stringify(payload) }),
+    }>(`/api/usecases/${id}/execute`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...modelFields() }),
+    }),
 
   listExecutions: (usecaseId: string) =>
     request<{ executions: ExecutionRecord[] }>(`/api/usecases/${usecaseId}/executions`),
@@ -308,13 +303,268 @@ export const api = {
       applied?: string[];
       unfixable_reason?: string;
       llm_tokens: number;
-    }>(`/api/usecases/${id}/repair`, { method: 'POST', body: JSON.stringify(payload) }),
+    }>(`/api/usecases/${id}/repair`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...modelFields() }),
+    }),
+
+  /**
+   * This use case as a Playwright Python script, to read or run elsewhere.
+   *
+   * One way only. The document is what TRACE runs and what a repair edits, so
+   * an exported file that the platform read back would be a second source of
+   * truth that drifts from the first.
+   */
+  exportPython: (id: string, version?: number) =>
+    request<{ usecase_id: string; filename: string; script: string }>(
+      `/api/usecases/${id}/export/python` + (version ? `?version=${version}` : ''),
+    ),
+
+  /**
+   * Write down what a use case does, in plain language. One LLM call.
+   *
+   * An agent recording gets this at the end of its own session. This is the
+   * same pass on demand, for a codegen recording -- which has no model in it
+   * and so no account of itself -- and for anything recorded before this
+   * existed. Saved at the status it already had: the prose changes nothing
+   * that runs.
+   */
+  describeUseCase: (id: string) =>
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      instructions: string;
+      steps_described: number;
+      warnings: string[];
+      llm_tokens: number;
+    }>(`/api/usecases/${id}/describe`, {
+      method: 'POST',
+      body: JSON.stringify({ ...modelFields() }),
+    }),
+
+  /**
+   * The finished step trail, with each step's screenshot and the baseline's.
+   *
+   * `first_divergence` is the step to open on: the first that failed or moved
+   * more than a couple of percent. A thousand-row batch produces tens of
+   * thousands of steps, and "scroll until something looks wrong" is not a
+   * workflow.
+   */
+  getRunSteps: (runId: string) =>
+    request<{ run_id: string; steps: RunStep[]; first_divergence: number | null }>(
+      `/api/runs/${runId}/steps`,
+    ),
+
+  // --- healing memory --------------------------------------------------------
+
+  listFixes: (domain?: string) =>
+    request<{ fixes: RememberedFix[] }>(
+      `/api/memory${domain ? `?domain=${encodeURIComponent(domain)}` : ''}`,
+    ),
+
+  /**
+   * Record what a person worked out when the model was not sure enough.
+   *
+   * Attributed to them rather than to the model, which is what makes it
+   * outrank an automatic fix next time the same thing breaks.
+   */
+  rememberFix: (payload: {
+    step_id: string;
+    page_url: string;
+    page?: string;
+    step_summary?: string;
+    wanted?: string;
+    explanation: string;
+    usecase_id?: string | null;
+    old_locator?: Record<string, unknown> | null;
+    new_locator?: Record<string, unknown> | null;
+  }) =>
+    request<{ remembered: boolean; domain: string }>('/api/memory', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  forgetFix: (fixId: string) =>
+    request<{ forgotten: string }>(`/api/memory/${fixId}`, { method: 'DELETE' }),
+
+  // --- recording -------------------------------------------------------------
+
+  /**
+   * Open a browser window and record what the user does in it.
+   *
+   * No model is involved. The old recorder was an agent driving the browser to
+   * work out how to do the task, which cost ~247,000 input tokens per
+   * recording; the user already knows how, so the software watches instead.
+   */
+  startRecording: (startUrl: string, name: string) =>
+    request<RecordingDetail>('/api/recordings', {
+      method: 'POST',
+      body: JSON.stringify({ start_url: startUrl, name }),
+    }),
+
+  listRecordings: () =>
+    request<{ available: boolean; reason: string; recordings: RecordingDetail[] }>(
+      '/api/recordings',
+    ),
+
+  getRecording: (recordingId: string) =>
+    request<RecordingDetail>(`/api/recordings/${recordingId}`),
+
+  cancelRecording: (recordingId: string) =>
+    request<{ cancelled: boolean }>(`/api/recordings/${recordingId}/cancel`, { method: 'POST' }),
+
+  discardRecording: (recordingId: string) =>
+    request<{ discarded: string }>(`/api/recordings/${recordingId}`, { method: 'DELETE' }),
+
+  /**
+   * Turn a finished recording into a draft workflow.
+   *
+   * `fields` names the values that were typed and says which are credentials.
+   * That answer is what decides the setup/per-row split as well: a credential
+   * is the thing supplied once per session, so the last step that types one is
+   * where signing in ends and the row work begins.
+   */
+  /**
+   * Land a definition exported from another environment.
+   *
+   * Always arrives as a draft with `allow_scripts` off, whatever the source
+   * said: an approval given in dev is not an approval here. The id is
+   * preserved, so re-importing a revision appends a version rather than
+   * duplicating the use case.
+   */
+  importUseCase: (document: Record<string, unknown>) =>
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      imported_by: string;
+      from: string;
+      /** What this environment still has to supply before it can run. */
+      warnings: string[];
+    }>('/api/usecases/import', { method: 'POST', body: JSON.stringify(document) }),
+
+  /**
+   * One use case as a document another environment can import.
+   *
+   * A wrapper around the definition, carrying where it came from and when,
+   * because the definition itself forbids extra fields and a person doing a
+   * promotion needs to know what they are holding. Nothing sensitive is in it:
+   * secrets are slots, and each environment supplies its own values.
+   */
+  exportUseCase: (id: string, version?: number) =>
+    request<{
+      trace_export: number;
+      exported_at: string;
+      exported_by: string;
+      source: { environment: string; usecase_id: string; version: number; name: string };
+      definition: Record<string, unknown>;
+    }>(`/api/usecases/${id}/export` + (version ? `?version=${version}` : '')),
+
+  /**
+   * Turn what a discovery run extracted into a dataset the next pass can run on.
+   *
+   * The join between the two passes of a migration: the first walks the
+   * vendor's list pages, this makes those rows runnable, the second pulls the
+   * detail one row at a time.
+   */
+  datasetFromRun: (body: {
+    execution_id?: string;
+    batch_id?: string;
+    output: string;
+    name?: string;
+  }) =>
+    request<{ dataset_id: string; row_count: number; columns: { name: string }[] }>(
+      '/api/datasets/from-run',
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
+  // --- targets ---------------------------------------------------------------
+
+  listTargets: () => request<{ targets: Target[] }>('/api/targets'),
+
+  /** Create or move one target. The name is the handle a use case refers to. */
+  saveTarget: (name: string, baseUrl: string, description = '') =>
+    request<Target>(`/api/targets/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ base_url: baseUrl, description }),
+    }),
+
+  deleteTarget: (name: string) =>
+    request<{ deleted: string }>(`/api/targets/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
+
+  saveRecording: (
+    recordingId: string,
+    payload: {
+      name?: string;
+      description?: string;
+      fields: { name: string; value: string; index?: number; secret: boolean }[];
+      /** Pointed-at elements the person wants read into the results file. */
+      extractions?: { line: number; name: string }[];
+    },
+  ) =>
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      /** Whether a field marked secret was written straight to the vault --
+       *  never the value itself, just whether it happened. */
+      credential_saved: boolean;
+      credential_name: string | null;
+    }>(`/api/recordings/${recordingId}/save`, { method: 'POST', body: JSON.stringify(payload) }),
+
+  // --- datasets --------------------------------------------------------------
+
+  /**
+   * Upload a file of input rows.
+   *
+   * Sent as multipart rather than base64 in JSON: the file goes over the wire
+   * once, at its own size, and the browser never has to hold a second copy of
+   * it as a string. The server reads and profiles it before storing, so a file
+   * that cannot be parsed is refused here rather than on row 700.
+   */
+  uploadDataset: (file: File, name?: string) => {
+    const form = new FormData();
+    form.append('file', file);
+    if (name) form.append('name', name);
+    return request<DatasetSummary & { dataset_id: string }>('/api/datasets', {
+      method: 'POST',
+      body: form,
+    });
+  },
+
+  listDatasets: () => request<{ datasets: DatasetSummary[] }>('/api/datasets'),
+
+  getDataset: (datasetId: string, sample = 20) =>
+    request<DatasetSummary>(`/api/datasets/${datasetId}?sample=${sample}`),
+
+  deleteDataset: (datasetId: string) =>
+    request<{ deleted: string }>(`/api/datasets/${datasetId}`, { method: 'DELETE' }),
+
+  /**
+   * Propose a column for each declared input.
+   *
+   * Nothing is committed by asking: the response is a ranking with reasons,
+   * and the user confirms it. An automatic mapping that is wrong and
+   * unreviewed does not fail — it succeeds into the wrong fields, a thousand
+   * times, and nobody finds out from this application.
+   */
+  suggestMapping: (usecaseId: string, datasetId: string, version?: number) =>
+    request<MappingResult>(`/api/usecases/${usecaseId}/mapping`, {
+      method: 'POST',
+      body: JSON.stringify({ dataset_id: datasetId, version }),
+    }),
 
   // --- batches ---------------------------------------------------------------
 
   startBatch: (
     id: string,
     payload: {
+      /** An uploaded dataset, with the mapping the user confirmed. */
+      dataset_id?: string;
+      mapping?: Record<string, string>;
       csv?: string;
       /** A base64 .xlsx, for people who keep their records in a spreadsheet. */
       xlsx_base64?: string;
@@ -325,7 +575,7 @@ export const api = {
   ) =>
     request<{ batch_id: string; total: number; columns: string[]; warnings: string[] }>(
       `/api/usecases/${id}/batch`,
-      { method: 'POST', body: JSON.stringify(payload) },
+      { method: 'POST', body: JSON.stringify({ ...payload, ...modelFields() }) },
     ),
 
   getBatch: (batchId: string) => request<BatchDetail>(`/api/batches/${batchId}`),
@@ -357,6 +607,46 @@ export const api = {
 
   deleteCredential: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/api/credentials/${id}`, { method: 'DELETE' }),
+
+  estimateBatch: (usecaseId: string, rows: number) =>
+    request<BatchEstimate>(`/api/usecases/${usecaseId}/estimate?rows=${rows}`),
+
+  getSpend: () => request<WorkspaceSpend>('/api/admin/spend'),
+
+  setSpendLimit: (limitUsd: number | null) =>
+    request<WorkspaceSpend>('/api/admin/spend/limit', {
+      method: 'PUT',
+      body: JSON.stringify({ limit_usd: limitUsd }),
+    }),
+
+  // --- the agent -----------------------------------------------------------
+  // Deliberately the same shape as the recording endpoints: start, watch,
+  // save. Two ways of producing the same artifact should read the same way.
+  startAgentSession: (body: StartAgentSession) =>
+    request<AgentSessionDetail>('/api/agent-sessions', {
+      method: 'POST',
+      body: JSON.stringify({ ...body, ...modelFields() }),
+    }),
+
+  getAgentSession: (sessionId: string) =>
+    request<AgentSessionDetail>(`/api/agent-sessions/${sessionId}`),
+
+  decideAgentSession: (sessionId: string, decision: 'approved' | 'rejected') =>
+    request<{ decision: string }>(`/api/agent-sessions/${sessionId}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision }),
+    }),
+
+  cancelAgentSession: (sessionId: string) =>
+    request<{ status: string }>(`/api/agent-sessions/${sessionId}/cancel`, {
+      method: 'POST',
+    }),
+
+  saveAgentSession: (sessionId: string, name: string) =>
+    request<{ usecase_id: string; version: number; warnings: string[] }>(
+      `/api/agent-sessions/${sessionId}/save`,
+      { method: 'POST', body: JSON.stringify({ name }) },
+    ),
 };
 
 /** Download URL for a finished batch's results. */

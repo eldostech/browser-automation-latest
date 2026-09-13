@@ -1,11 +1,70 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, batchResultsUrl } from '../lib/api';
-import type { BatchDetail, CredentialSummary, UseCase } from '../lib/events';
+import type {
+  BatchDetail,
+  BatchSummary,
+  CredentialSummary,
+  DatasetSummary,
+  BatchEstimate,
+  Locator,
+  Target,
+  UseCase,
+  UseCaseMode,
+  UseCaseStep,
+} from '../lib/events';
+import { DatasetMapper } from './DatasetMapper';
+import {
+  DiscoveryResult,
+  Downloads,
+  downloadsIn,
+  summariseOutputs,
+} from './DiscoveryResult';
 import { formatDuration } from '../lib/format';
 import { ActivityLog } from './ActivityLog';
 import { CredentialsPanel } from './CredentialsPanel';
 import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
+import { BrandSpinner } from './BrandSpinner';
+
+/** A use case name as a file name, safe on every platform. */
+function suggestedName(name: string): string {
+  return name.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'use_case';
+}
+
+/** Actions the screen waits for, and what to say while it does. */
+const BLOCKING: Record<
+  string,
+  { state: 'working' | 'validating'; label: string; detail: string }
+> = {
+  fixIt: {
+    state: 'validating',
+    label: 'Diagnosing the failure and drafting a fix…',
+    detail:
+      'One model call: reads the page as it was when the step broke, and proposes a repair. This can take up to half a minute.',
+  },
+  run: {
+    state: 'working',
+    label: 'Running this workflow…',
+    detail:
+      "No model is involved in the replay itself. How long this takes depends on the site it drives — you'll see the full step-by-step trail once it finishes.",
+  },
+  runBatch: {
+    state: 'working',
+    label: 'Queueing the rows…',
+    detail:
+      'The batch runs on the server, so it keeps going if you close this tab. Progress appears here as soon as it starts.',
+  },
+  resume: {
+    state: 'working',
+    label: 'Re-running the rows that did not succeed…',
+    detail: 'Rows that already succeeded are left alone.',
+  },
+  describe: {
+    state: 'validating',
+    label: 'Reading the steps and writing down what this does…',
+    detail: 'One model call over the recorded steps. Nothing that runs is changed.',
+  },
+};
 
 interface Props {
   usecaseId: string;
@@ -21,6 +80,50 @@ type Mode = 'review' | 'single' | 'batch' | 'activity';
  * Review is not optional: distillation is a best guess over a noisy recording,
  * so a use case is created as a draft and only a person moves it to ready.
  */
+/**
+ * The three things a person can say, in the order of how much they permit.
+ *
+ * "Follow the deployment" is offered rather than hidden because it is what
+ * every use case recorded before this existed is doing, and a screen that
+ * showed one of the other two would be claiming a decision nobody made.
+ */
+const MODE_CHOICES: {
+  value: UseCaseMode | null;
+  label: string;
+  description: string;
+  price: string;
+}[] = [
+  {
+    value: 'strict',
+    label: 'Strict',
+    description:
+      'Follows the recorded steps. No model can run — the replay engine cannot reach one, so this is a property of the code rather than a setting.',
+    price: 'free',
+  },
+  {
+    value: 'guided',
+    label: 'Guided',
+    description:
+      'The same, until a step stops matching. Then one budgeted call re-finds the control from a list of what is actually on the page, and the run carries on.',
+    price: 'free on a good row',
+  },
+  {
+    value: 'explore',
+    label: 'Explore',
+    description:
+      'No plan at all: it works each row out from the page and the task text. For work that genuinely cannot be recorded — a page that differs per record, a next step that depends on what the last one said.',
+    price: 'costs on every row',
+  },
+  {
+    value: null,
+    label: 'Follow the deployment',
+    description:
+      'Whatever this installation allows. What every use case did before this choice existed.',
+    price: 'depends',
+  },
+];
+
+
 export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [useCase, setUseCase] = useState<UseCase | null>(null);
   const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
@@ -32,19 +135,41 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Which action is in flight, so a person sees a spinner on the one button
+  // they pressed rather than every disabled control looking identically busy.
+  const [busyAction, setBusyAction] = useState<string | null>(null);
   //: Non-null while the title is being edited in place.
   const [draftName, setDraftName] = useState<string | null>(null);
 
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [credentialId, setCredentialId] = useState<string>('');
-  const [csv, setCsv] = useState('');
-  // A spreadsheet is sent as-is rather than converted here: re-saving one as
-  // CSV in the browser mangles leading zeros, dates and embedded commas.
-  const [workbook, setWorkbook] = useState<{ name: string; base64: string } | null>(null);
   // Watching the browser work is the fastest way to understand why a step
   // fails, so this is offered on both run paths rather than buried in config.
   const [watch, setWatch] = useState(false);
   const [batch, setBatch] = useState<BatchDetail | null>(null);
+  // Batches this use case has already run. `batch` above is only ever set by
+  // starting or resuming one, so without this a batch became unreachable the
+  // moment the tab closed -- no progress, no resume, no results, on a job that
+  // can run for hours.
+  const [pastBatches, setPastBatches] = useState<BatchSummary[]>([]);
+  // A run that found rows stays on screen, because the useful thing to do next
+  // -- turn them into a dataset -- is here rather than in the run view.
+  const [lastDiscovery, setLastDiscovery] = useState<{
+    execution_id: string;
+    outputs: Record<string, unknown>;
+  } | null>(null);
+  const [rowDelay, setRowDelay] = useState('');
+  // Whether this deployment permits healing at all. The card below has to be
+  // able to say what "following the deployment" actually resolves to, and it
+  // has to grey out Guided where the installation has turned it off -- a
+  // choice the screen offers but the run would not honour is a lie.
+  const [healingAllowed, setHealingAllowed] = useState<boolean | null>(null);
+  // What a batch of the size on screen would cost. Fetched when a file is
+  // mapped rather than up front, because the row count is most of the answer.
+  const [estimate, setEstimate] = useState<BatchEstimate | null>(null);
+  // Which sites this deployment knows about, so the target can be chosen from
+  // a list rather than typed from memory.
+  const [targets, setTargets] = useState<Target[]>([]);
   const [lastFailure, setLastFailure] = useState<{ execution_id: string; error: string } | null>(
     null,
   );
@@ -56,6 +181,26 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         api.listCredentials(),
       ]);
       setUseCase(detail.definition);
+      // Best effort: a use case that has never run has none, and failing to
+      // list them must not stop the screen loading.
+      api
+        .listTargets()
+        .then((body) => setTargets(body.targets))
+        .catch(() => setTargets([]));
+      api
+        .getConfig()
+        .then((body) => setHealingAllowed(Boolean(body.defaults?.healing)))
+        .catch(() => setHealingAllowed(null));
+      api
+        .listBatches(usecaseId)
+        .then((body) => setPastBatches(body.batches))
+        .catch(() => setPastBatches([]));
+      setRowDelay(
+        detail.definition.row_delay_seconds === null ||
+          detail.definition.row_delay_seconds === undefined
+          ? ''
+          : String(detail.definition.row_delay_seconds),
+      );
       setScriptsEnabled(Boolean(detail.meta?.scripts_enabled));
       setCredentials(creds.credentials);
       setVaultAvailable(creds.vault_available);
@@ -101,8 +246,9 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   }, [useCase, credentials, credentialId]);
 
   const act = useCallback(
-    async (fn: () => Promise<void>) => {
+    async (fn: () => Promise<void>, action?: string) => {
       setBusy(true);
+      setBusyAction(action ?? null);
       setError(null);
       setNotice(null);
       try {
@@ -111,6 +257,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setBusy(false);
+        setBusyAction(null);
       }
     },
     [],
@@ -121,7 +268,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.publishUseCase(usecaseId);
       setNotice('Published. It can now be run against inputs.');
       await load();
-    });
+    }, 'publish');
 
   /** The author half: this definition is allowed to contain scripts. */
   const allowScripts = () =>
@@ -130,7 +277,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.updateUseCase(usecaseId, { ...useCase, allow_scripts: true });
       setNotice('Raw-JavaScript steps marked as reviewed in this definition.');
       await load();
-    });
+    }, 'allowScripts');
 
   /** The administrator half: this use case may actually execute them. */
   const enableScripts = (enabled: boolean) =>
@@ -142,7 +289,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           : 'Script execution disabled for this use case.',
       );
       await load();
-    });
+    }, enabled ? 'enableScripts' : 'disableScripts');
 
   const removeStep = (phase: 'setup_steps' | 'row_steps') => (stepId: string) =>
     act(async () => {
@@ -150,6 +297,130 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const next = { ...useCase, [phase]: useCase[phase].filter((s) => s.id !== stepId) };
       await api.updateUseCase(usecaseId, next as UseCase);
       setNotice(`Removed ${stepId}. Saved as a new version.`);
+      await load();
+    });
+
+  // A recorded URL or typed value is sometimes just wrong -- the browser was
+  // on the wrong tab, an env-specific address got baked in -- and until now
+  // the only fix was re-recording the whole step. Same shape as every other
+  // edit here: patch the definition, save as a new version, reload.
+  const editStep =
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') =>
+    (stepId: string, field: 'url' | 'value' | 'expect_text', value: string) =>
+      act(async () => {
+        if (!useCase) return;
+        const patch = (step: UseCaseStep) =>
+          step.id === stepId ? { ...step, [field]: value } : step;
+        const next =
+          phase === 'row_reset'
+            ? { ...useCase, row_reset: useCase.row_reset ? patch(useCase.row_reset) : null }
+            : { ...useCase, [phase]: useCase[phase].map(patch) };
+        await api.updateUseCase(usecaseId, next as UseCase);
+        setNotice(`Updated ${stepId}. Saved as a new version.`);
+        await load();
+      });
+
+  // A recorded ladder is what codegen happened to write; a healed one is what
+  // a model picked off the page. Both are usually right and neither is always
+  // right, and the only remedy for one wrong rung used to be re-recording the
+  // whole workflow -- which throws away every other step to fix one.
+  const editLocators =
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') =>
+    (stepId: string, locators: Locator[]) =>
+      act(async () => {
+        if (!useCase) return;
+        const patch = (step: UseCaseStep) =>
+          step.id === stepId ? { ...step, locators } : step;
+        const next =
+          phase === 'row_reset'
+            ? { ...useCase, row_reset: useCase.row_reset ? patch(useCase.row_reset) : null }
+            : { ...useCase, [phase]: useCase[phase].map(patch) };
+        await api.updateUseCase(usecaseId, next as UseCase);
+        setNotice(`Rewrote how ${stepId} finds its element. Saved as a new version.`);
+        await load();
+      });
+
+  const checkLocators = useCallback(
+    (locators: Locator[], url: string) => api.checkLocators(usecaseId, url, locators),
+    [usecaseId],
+  );
+
+  // Where a step runs, so "check on a page" has somewhere to open. The nearest
+  // preceding navigate is the honest answer: a step is reached by running the
+  // ones above it, and the last of those that named a URL is the page it acts
+  // on. Falls back to the recorded base, which is better than an empty box.
+  const pageUrlFor = useCallback(
+    (phase: 'setup_steps' | 'row_steps' | 'row_reset') => (stepId: string) => {
+      if (!useCase) return '';
+      const before: UseCaseStep[] =
+        phase === 'row_reset'
+          ? useCase.row_reset
+            ? [useCase.row_reset]
+            : []
+          : [...useCase.setup_steps, ...(phase === 'row_steps' ? useCase.row_steps : [])];
+      const index = before.findIndex((step) => step.id === stepId);
+      const searched = index < 0 ? before : before.slice(0, index + 1);
+      for (let i = searched.length - 1; i >= 0; i -= 1) {
+        if (searched[i].action === 'navigate' && searched[i].url) return searched[i].url!;
+      }
+      return useCase.base_url ?? '';
+    },
+    [useCase],
+  );
+
+  // Saved on blur rather than behind a button: it is one number, and a
+  // "Save" next to a single field is ceremony. A new version is written, as
+  // for any other edit, so the change is versioned and auditable.
+  const saveRowDelay = async () => {
+    if (!useCase) return;
+    const trimmed = rowDelay.trim();
+    const next = trimmed === '' ? null : Number(trimmed);
+    if (next !== null && (Number.isNaN(next) || next < 0)) {
+      setError('Seconds between rows must be a number, or empty to use the default.');
+      return;
+    }
+    if (next === (useCase.row_delay_seconds ?? null)) return;
+    await act(async () => {
+      await api.updateUseCase(usecaseId, { ...useCase, row_delay_seconds: next } as UseCase);
+      setNotice(
+        next === null
+          ? 'Pace cleared; this use case uses the deployment default.'
+          : `Pace set to ${next}s between rows. Saved as a new version.`,
+      );
+      await load();
+    });
+  };
+
+  // Like the target and the pace, the mode is part of the definition: it
+  // changes what executes, so it is versioned and audited as any other edit
+  // is. Null clears the choice and hands the decision back to the deployment.
+  const saveMode = (next: UseCaseMode | null) =>
+    act(async () => {
+      if (!useCase) return;
+      if (next === (useCase.mode ?? null)) return;
+      await api.updateUseCase(usecaseId, { ...useCase, mode: next } as UseCase);
+      setNotice(
+        next === null
+          ? 'Cleared; this use case follows the deployment. Saved as a new version.'
+          : next === 'strict'
+            ? 'Set to Strict. No model can run on this use case. Saved as a new version.'
+            : 'Set to Guided. A repair may run when a step stops matching. Saved as a new version.',
+      );
+      await load();
+    });
+
+  // The target lives in the definition, because promotion carries the document
+  // and each deployment answers the name for itself. Changing it is therefore
+  // an ordinary edit: a new version, versioned and audited like any other.
+  const saveTarget = (next: string) =>
+    act(async () => {
+      if (!useCase) return;
+      await api.updateUseCase(usecaseId, { ...useCase, target: next } as UseCase);
+      setNotice(
+        next
+          ? `This use case now runs against ${next}. Saved as a new version.`
+          : 'Cleared. It runs against the address it was recorded on.',
+      );
       await load();
     });
 
@@ -162,28 +433,43 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       });
       if (result.status === 'succeeded') {
         setLastFailure(null);
+        const outputs = (result.outputs ?? {}) as Record<string, unknown>;
+        // Stay here for anything worth acting on: rows to turn into a
+        // dataset, or files to open. Otherwise go to the run view as before.
+        const foundRows =
+          Object.values(outputs).some((v) => Array.isArray(v) && v.length > 0) ||
+          downloadsIn(outputs).length > 0;
         setNotice(
           `Succeeded using ${result.llm_tokens} LLM tokens. ` +
-            `Outputs: ${JSON.stringify(result.outputs)}`,
+            `Outputs: ${summariseOutputs(outputs) || '(none)'}`,
         );
+        // Rows are the first pass of a two-pass migration and the next step is
+        // on this screen, so stay here. Anything else goes to the run view as
+        // before.
+        if (foundRows) {
+          setLastDiscovery({ execution_id: result.execution_id, outputs });
+          return;
+        }
+        setLastDiscovery(null);
         onOpenRun(result.run_id);
         return;
       }
       // Stay on this screen when it fails: the repair button is here.
       setLastFailure({ execution_id: result.execution_id, error: result.error ?? 'it failed' });
       setError(`Failed: ${result.error}`);
-    });
+    }, 'run');
 
-  const runBatch = () =>
+  const runBatch = (dataset: DatasetSummary, mapping: Record<string, string>) =>
     act(async () => {
       const started = await api.startBatch(usecaseId, {
-        ...(workbook ? { xlsx_base64: workbook.base64 } : { csv }),
+        dataset_id: dataset.id,
+        mapping,
         credential_id: credentialId || null,
         headless: !watch,
       });
       setBatch(await api.getBatch(started.batch_id));
-      setNotice(`Started ${started.total} rows on one shared browser session.`);
-    });
+      setNotice(`Queued ${started.total} rows. They run on one shared browser session.`);
+    }, 'runBatch');
 
   const resume = () =>
     act(async () => {
@@ -191,7 +477,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       const resumed = await api.resumeBatch(batch.batch.id, credentialId || null);
       setBatch(await api.getBatch(resumed.batch_id));
       setNotice(`Re-running ${resumed.rows} row(s) that had not succeeded.`);
-    });
+    }, 'resume');
 
   const fixIt = (executionId?: string) =>
     act(async () => {
@@ -214,7 +500,61 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         ].join('\n'),
       );
       await load();
-    });
+    }, 'fixIt');
+
+  // Downloaded rather than shown in a panel: it is a file, it is long, and
+  // the thing somebody wants to do with it is put it in a repository. Built
+  // from a blob so no second endpoint has to serve it as an attachment.
+  const [script, setScript] = useState<{ filename: string; script: string } | null>(null);
+
+  const exportScript = () =>
+    act(async () => {
+      const result = await api.exportPython(usecaseId);
+      setScript({ filename: result.filename, script: result.script });
+      setNotice(
+        `Exported ${result.filename}. This is a one-way export: TRACE runs the ` +
+          `use case, not the file, so re-export after any repair.`,
+      );
+    }, 'exportScript');
+
+  // Downloaded rather than shown: it is a file whose job is to be carried to
+  // another environment. Built from a blob so no second endpoint has to serve
+  // it as an attachment.
+  const promote = () =>
+    act(async () => {
+      const document = await api.exportUseCase(usecaseId);
+      const name = `${suggestedName(document.source.name)}.trace.json`;
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' }),
+      );
+      const link = window.document.createElement('a');
+      link.href = url;
+      link.download = name;
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice(
+        `Exported ${name} (v${document.source.version} from ` +
+          `${document.source.environment}). Import it from the Use cases screen in the ` +
+          `other environment. It carries no credentials: secrets are slot names, and ` +
+          `each environment keeps its own values.`,
+      );
+    }, 'promote');
+
+  const describe = () =>
+    act(async () => {
+      const result = await api.describeUseCase(usecaseId);
+      setNotice(
+        [
+          result.instructions,
+          '',
+          `Saved as v${result.version}, still ${result.status}. ` +
+            `${result.steps_described} step(s) now say what they are for. ` +
+            `${result.llm_tokens} tokens.`,
+          ...result.warnings.map((line) => `• ${line}`),
+        ].join('\n'),
+      );
+      await load();
+    }, 'describe');
 
   const rename = (name: string) =>
     act(async () => {
@@ -225,13 +565,13 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await api.renameUseCase(usecaseId, name);
       setNotice(`Renamed to ${name}.`);
       await load();
-    });
+    }, 'rename');
 
   const archive = () =>
     act(async () => {
       await api.archiveUseCase(usecaseId);
       onBack();
-    });
+    }, 'archive');
 
   const destroy = () =>
     act(async () => {
@@ -251,7 +591,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       }
       await api.deleteUseCase(usecaseId);
       onBack();
-    });
+    }, 'destroy');
 
   if (!useCase) {
     return (
@@ -259,7 +599,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         <button type="button" onClick={onBack}>
           Back
         </button>
-        {error ? <div className="banner error">{error}</div> : <p>Loading...</p>}
+        {error ? (
+          <div className="banner error" style={{ whiteSpace: 'pre-wrap' }}>{error}</div>
+        ) : (
+          <BrandSpinner state="working" label="Loading…" />
+        )}
       </div>
     );
   }
@@ -275,8 +619,21 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // themselves code execution by editing JSON.
   const scriptsNeedAdmin = scriptSteps.length > 0 && !scriptsEnabled;
 
+  // The actions the whole screen has to wait for, each with what it is
+  // actually doing. A click that starts something slow and then shows nothing
+  // is the same to a person as a click that did nothing.
+  const blocking = busyAction ? BLOCKING[busyAction] : undefined;
+
   return (
-    <div>
+    <div className="spinner-host">
+      {blocking && (
+        <BrandSpinner
+          layout="blocking"
+          state={blocking.state}
+          label={blocking.label}
+          detail={blocking.detail}
+        />
+      )}
       <div className="run-header">
         <button type="button" onClick={onBack}>
           Back
@@ -321,7 +678,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
                 onClick={() => draftName.trim() && rename(draftName.trim())}
                 disabled={busy || !draftName.trim()}
               >
-                Save
+                {busyAction === 'rename' ? <BrandSpinner state="working" label="Saving…" /> : 'Save'}
               </button>
               <button type="button" onClick={() => setDraftName(null)} disabled={busy}>
                 Cancel
@@ -331,16 +688,16 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </div>
         {!isReady && (
           <button type="button" className="primary" onClick={publish} disabled={busy}>
-            Publish
+            {busyAction === 'publish' ? <BrandSpinner state="working" label="Publishing…" /> : 'Publish'}
           </button>
         )}
         {useCase.status !== 'archived' && (
           <button type="button" onClick={archive} disabled={busy} title="Reversible — hides it from the list">
-            Archive
+            {busyAction === 'archive' ? <BrandSpinner state="working" label="Archiving…" /> : 'Archive'}
           </button>
         )}
         <button type="button" className="danger" onClick={destroy} disabled={busy}>
-          Delete
+          {busyAction === 'destroy' ? <BrandSpinner state="working" label="Deleting…" /> : 'Delete'}
         </button>
       </div>
 
@@ -350,7 +707,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           {lastFailure && (
             <p style={{ margin: '8px 0 0' }}>
               <button type="button" onClick={() => fixIt(lastFailure.execution_id)} disabled={busy}>
-                {busy ? 'Looking at it...' : 'Fix it with AI'}
+                {busyAction === 'fixIt' ? <BrandSpinner state="validating" label="Looking at it…" /> : 'Fix it with AI'}
               </button>
               <span className="hint" style={{ display: 'inline', marginLeft: 8 }}>
                 Reads the page as it was when it broke and proposes a repair. One LLM call.
@@ -360,6 +717,89 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </div>
       )}
       {notice && <div className="banner" style={{ whiteSpace: 'pre-wrap' }}>{notice}</div>}
+
+      {/* What the workflow is for, in plain language, above the steps rather
+          than below them. A reviewer's first question is "is this the thing I
+          asked for", and the step list cannot answer it. */}
+      <section className="card">
+        <header>
+          <h2>What this does</h2>
+          <span className="hint">
+            {useCase.instructions
+              ? 'Written from the recording. Read it against the steps.'
+              : 'Nothing recorded says what this workflow is for.'}
+          </span>
+          <button
+            type="button"
+            className="ghost"
+            onClick={promote}
+            disabled={busy}
+            title="Download this use case to import into another environment"
+          >
+            {busyAction === 'promote' ? (
+              <BrandSpinner state="working" label="Packaging…" />
+            ) : (
+              'Export for another environment'
+            )}
+          </button>
+          <button type="button" className="ghost" onClick={exportScript} disabled={busy}>
+            {busyAction === 'exportScript' ? (
+              <BrandSpinner state="working" label="Writing it out…" />
+            ) : (
+              'Export as Playwright Python'
+            )}
+          </button>
+          <button type="button" className="ghost" onClick={describe} disabled={busy}>
+            {busyAction === 'describe' ? (
+              <BrandSpinner state="working" label="Reading the steps…" />
+            ) : useCase.instructions ? (
+              'Rewrite with AI'
+            ) : (
+              'Describe with AI'
+            )}
+          </button>
+        </header>
+        <div className="body">
+          {script && (
+            <details className="step-script" open>
+              <summary>{script.filename}</summary>
+              <p className="hint" style={{ margin: '6px 0' }}>
+                Only the leading locator of each step is executed here. The rest of each
+                ladder is written beside it as a comment, because a script that fell
+                through a ladder would be the engine, reimplemented.
+              </p>
+              <div className="row" style={{ marginBottom: 6 }}>
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() => void navigator.clipboard.writeText(script.script)}
+                >
+                  Copy
+                </button>
+                <a
+                  download={script.filename}
+                  href={URL.createObjectURL(
+                    new Blob([script.script], { type: 'text/x-python' }),
+                  )}
+                >
+                  Download
+                </a>
+              </div>
+              <pre>{script.script}</pre>
+            </details>
+          )}
+          {useCase.instructions ? (
+            <p className="usecase-instructions">{useCase.instructions}</p>
+          ) : (
+            <p className="hint" style={{ margin: 0 }}>
+              One LLM call reads the steps and writes what the workflow does, plus a line
+              per step saying what it is for. Repairs read those lines, which is what turns
+              "which of these controls resembles a link named Billing" into "which of these
+              opens the customer's billing tab". Nothing that runs is changed.
+            </p>
+          )}
+        </div>
+      </section>
 
       {useCase.warnings.length > 0 && (
         <div className="banner warn">
@@ -380,7 +820,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             They refuse to execute until you read the code below and enable them.
           </p>
           <button type="button" onClick={allowScripts} disabled={busy}>
-            I have read the code — enable scripts
+            {busyAction === 'allowScripts' ? (
+              <BrandSpinner state="working" label="Saving…" />
+            ) : (
+              'I have read the code — enable scripts'
+            )}
           </button>
         </div>
       )}
@@ -396,7 +840,11 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           </p>
           {session.can('script:enable') ? (
             <button type="button" onClick={() => enableScripts(true)} disabled={busy}>
-              I have read the code — allow this use case to run it
+              {busyAction === 'enableScripts' ? (
+                <BrandSpinner state="working" label="Saving…" />
+              ) : (
+                'I have read the code — allow this use case to run it'
+              )}
             </button>
           ) : (
             <p style={{ margin: 0 }}>
@@ -415,7 +863,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             onClick={() => enableScripts(false)}
             disabled={busy}
           >
-            Withdraw it
+            {busyAction === 'disableScripts' ? <BrandSpinner state="working" label="Saving…" /> : 'Withdraw it'}
           </button>
         </div>
       )}
@@ -480,18 +928,30 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             hint="The sign-in lives here. It runs once for a whole batch, not once per row."
             steps={useCase.setup_steps}
             onRemove={removeStep('setup_steps')}
+            onEditField={editStep('setup_steps')}
+            onEditLocators={editLocators('setup_steps')}
+            onCheckLocators={checkLocators}
+            pageUrlFor={pageUrlFor('setup_steps')}
           />
           {useCase.row_reset && (
             <UseCaseSteps
               title="Reset — before every row"
               hint="Puts the browser back to a known state so one row cannot inherit the last one's state."
               steps={[useCase.row_reset]}
+              onEditField={editStep('row_reset')}
+              onEditLocators={editLocators('row_reset')}
+              onCheckLocators={checkLocators}
+              pageUrlFor={pageUrlFor('row_reset')}
             />
           )}
           <UseCaseSteps
             title="Per row — runs once for each input"
             steps={useCase.row_steps}
             onRemove={removeStep('row_steps')}
+            onEditField={editStep('row_steps')}
+            onEditLocators={editLocators('row_steps')}
+            onCheckLocators={checkLocators}
+            pageUrlFor={pageUrlFor('row_steps')}
           />
 
           {(useCase.dropped ?? []).length > 0 && (
@@ -590,6 +1050,156 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
           )}
 
           <div className="card">
+            <h3>Where it runs</h3>
+            <p className="hint">
+              A use case names a target; this deployment says what address that target has.
+              That is what lets the same use case run in dev, UAT and production without the
+              definition changing.
+            </p>
+            <label className="field" style={{ maxWidth: 380 }}>
+              <span>Target</span>
+              <select
+                value={useCase.target ?? ''}
+                disabled={!session.can('usecase:create')}
+                onChange={(e) => void saveTarget(e.target.value)}
+              >
+                <option value="">
+                  (none — run against the address it was recorded on)
+                </option>
+                {targets.map((target) => (
+                  <option key={target.name} value={target.name}>
+                    {target.name} — {target.base_url}
+                  </option>
+                ))}
+                {/* A target the definition names but this deployment has no
+                    address for. Showing it is what makes the run-time refusal
+                    legible: you can see what it is asking for, and change it. */}
+                {useCase.target && !targets.some((t) => t.name === useCase.target) && (
+                  <option value={useCase.target}>
+                    {useCase.target} — not defined in this deployment
+                  </option>
+                )}
+              </select>
+            </label>
+            {useCase.target && !targets.some((t) => t.name === useCase.target) ? (
+              <p className="hint" style={{ color: 'var(--danger)' }}>
+                This deployment has no address for <code>{useCase.target}</code>, so runs will
+                refuse. Add it under Targets, or pick one above.
+              </p>
+            ) : (
+              <p className="hint">
+                {useCase.target
+                  ? `Runs against whatever ${useCase.target} points at here.`
+                  : `Runs against ${useCase.base_url || 'the recorded address'}. That is right for a single environment, and what you change before promoting.`}
+              </p>
+            )}
+          </div>
+
+          <div className="card">
+            <h3>How it runs</h3>
+            <p className="hint">
+              How much a model is allowed to do. This belongs to the workflow rather than
+              to the installation: one site is rebuilt every sprint and another has not
+              changed in four years, and one setting cannot be right for both.
+            </p>
+
+            <div className="modes">
+              {MODE_CHOICES.map((choice) => {
+                const chosen = (useCase.mode ?? null) === choice.value;
+                // Both modes that can reach a model are unavailable where the
+                // deployment has switched healing off: the ceiling only ever
+                // restricts, and offering a choice a run would not honour is
+                // worse than not offering it.
+                const unavailable =
+                  (choice.value === 'guided' || choice.value === 'explore') &&
+                  healingAllowed === false;
+                return (
+                  <label
+                    key={String(choice.value)}
+                    className={`mode-choice${chosen ? ' chosen' : ''}${unavailable ? ' unavailable' : ''}`}
+                  >
+                    <input
+                      type="radio"
+                      name="usecase-mode"
+                      checked={chosen}
+                      disabled={!session.can('usecase:create') || unavailable}
+                      onChange={() => void saveMode(choice.value)}
+                    />
+                    <span>
+                      <strong>{choice.label}</strong>
+                      <span className="hint" style={{ margin: '2px 0 0' }}>
+                        {choice.description}
+                      </span>
+                      {unavailable && (
+                        <span className="hint" style={{ margin: '2px 0 0' }}>
+                          This deployment has healing switched off, so a repair would not
+                          run even if it were chosen here.
+                        </span>
+                      )}
+                    </span>
+                    <span
+                      className={`mode-price${choice.value === 'explore' ? ' paid' : ''}`}
+                    >
+                      {choice.price}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+
+            {useCase.mode === null || useCase.mode === undefined ? (
+              <p className="hint">
+                Nothing chosen, so this follows the deployment
+                {healingAllowed === null
+                  ? '.'
+                  : healingAllowed
+                    ? ' — which currently allows a repair (Guided).'
+                    : ' — which currently allows no model at all (Strict).'}{' '}
+                Pick one above to decide it here instead.
+              </p>
+            ) : (
+              <p className="hint">
+                Chosen on this use case, so it stays{' '}
+                {useCase.mode === 'strict'
+                  ? 'Strict'
+                  : useCase.mode === 'guided'
+                    ? 'Guided'
+                    : 'Explore'}{' '}
+                wherever it is promoted.
+              </p>
+            )}
+          </div>
+
+          <div className="card">
+            <h3>Pace</h3>
+            <p className="hint">
+              How long to wait between rows. Politeness is a property of the site rather
+              than of this installation: one vendor tolerates a request a second, another
+              starts refusing after three, and a long extraction that reads as an attack
+              gets the account blocked. The person who recorded this knows which site it is.
+            </p>
+            <label className="field" style={{ maxWidth: 260 }}>
+              <span>Seconds between rows</span>
+              <input
+                type="number"
+                min={0}
+                max={600}
+                step={0.1}
+                value={rowDelay}
+                placeholder="server default"
+                disabled={!session.can('usecase:create')}
+                onChange={(e) => setRowDelay(e.target.value)}
+                onBlur={() => void saveRowDelay()}
+              />
+            </label>
+            <p className="hint">
+              {useCase.row_delay_seconds === null || useCase.row_delay_seconds === undefined
+                ? 'Empty uses the deployment default (REPLAY_ROW_DELAY_SECONDS).'
+                : `This use case waits ${useCase.row_delay_seconds}s between rows.`}
+            </p>
+          </div>
+
+          <div className="card">
             <h3>Browser</h3>
             <label className="checkbox">
               <input
@@ -646,65 +1256,135 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
             onClick={runOnce}
             disabled={busy || missingSlots.length > 0}
           >
-            {busy ? 'Running...' : 'Run'}
+            {busyAction === 'run' ? <BrandSpinner state="working" label="Running…" /> : 'Run'}
           </button>
         </div>
       )}
 
       {mode === 'batch' && (
         <div className="card">
+          {lastDiscovery && <Downloads outputs={lastDiscovery.outputs} />}
+
+          {lastDiscovery && (
+            <DiscoveryResult
+              executionId={lastDiscovery.execution_id}
+              outputs={lastDiscovery.outputs}
+              onSaved={() => setNotice('Saved. It is now under Run a file, below.')}
+            />
+          )}
+
+          {pastBatches.length > 0 && (
+            <div className="card">
+              <h3>Earlier runs</h3>
+              <p className="hint">
+                A batch keeps running whether or not this page is open. Open one to watch it,
+                resume what a stopped run never attempted, or take the results.
+              </p>
+              <table className="mapping">
+                <thead>
+                  <tr>
+                    <th>Started</th>
+                    <th>Status</th>
+                    <th>Rows</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pastBatches.map((past) => (
+                    <tr key={past.id}>
+                      <td style={{ fontSize: 13 }}>
+                        {new Date(past.created_at).toLocaleString()}
+                      </td>
+                      <td>
+                        <span className={`badge ${past.status}`}>{past.status}</span>
+                      </td>
+                      <td style={{ fontSize: 13 }}>
+                        {past.succeeded}/{past.total} done
+                        {past.failed > 0 && (
+                          <span style={{ color: 'var(--danger)' }}> · {past.failed} failed</span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              act(async () => setBatch(await api.getBatch(past.id)))
+                            }
+                          >
+                            Open
+                          </button>
+                          <a className="linkish" href={batchResultsUrl(past.id)}>
+                            Results
+                          </a>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           <h3>Run a file</h3>
           <p className="hint">
-            One header row naming the inputs ({useCase.inputs.map((i) => i.name).join(', ') || 'none'}
-            ), then one line per record. Every row is checked before the browser opens. Rows run in
-            sequence on one shared session, signing in once.
+            Upload your records, check that each field is reading the right column, then start.
+            Every row is validated before the browser opens, and rows run in sequence on one
+            shared session so the workflow signs in once.
           </p>
-          <textarea
-            rows={8}
-            value={csv}
-            spellCheck={false}
-            placeholder={`${useCase.inputs.map((i) => i.name).join(',')}\n...`}
-            onChange={(e) => setCsv(e.target.value)}
-          />
-          <input
-            type="file"
-            accept=".csv,.xlsx,text/csv"
-            onChange={async (event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-              if (file.name.toLowerCase().endsWith('.xlsx')) {
-                const bytes = new Uint8Array(await file.arrayBuffer());
-                let binary = '';
-                bytes.forEach((byte) => {
-                  binary += String.fromCharCode(byte);
-                });
-                setWorkbook({ name: file.name, base64: btoa(binary) });
-                setCsv('');
-                return;
-              }
-              setWorkbook(null);
-              setCsv(await file.text());
+
+          {estimate && <CostBeforeCommitting estimate={estimate} />}
+
+          <DatasetMapper
+            useCase={useCase}
+            usecaseId={usecaseId}
+            onRowCount={(rows) => {
+              // A limit is what stops a mistake; this is what prevents one.
+              void api
+                .estimateBatch(usecaseId, Math.max(1, rows))
+                .then(setEstimate)
+                .catch(() => setEstimate(null));
             }}
+            busy={busy}
+            disabled={missingSlots.length > 0}
+            disabledReason={
+              missingSlots.length > 0
+                ? `This workflow signs in. Choose a credential providing: ${missingSlots.join(', ')}.`
+                : undefined
+            }
+            onReady={runBatch}
           />
-          {workbook && (
-            <p className="hint">
-              Using <strong>{workbook.name}</strong> — the first sheet, header row first.{' '}
-              <button type="button" className="link" onClick={() => setWorkbook(null)}>
-                use the text box instead
-              </button>
-            </p>
-          )}
-          <button
-            type="button"
-            className="primary"
-            onClick={runBatch}
-            disabled={busy || (!csv.trim() && !workbook) || missingSlots.length > 0}
-          >
-            {busy ? 'Starting...' : 'Start batch'}
-          </button>
 
           {batch && <BatchProgressPanel batch={batch} onOpenRun={onOpenRun} onResume={resume} />}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** What this batch is expected to cost, said before the button rather than
+ *  after the bill. A range, because how many turns a row takes depends on the
+ *  site and a single figure would imply an accuracy this cannot have. */
+function CostBeforeCommitting({ estimate }: { estimate: BatchEstimate }) {
+  const free = estimate.high_usd === 0;
+  return (
+    <div className={estimate.over_budget ? 'banner error' : free ? 'verified' : 'banner'}>
+      <strong>
+        {free
+          ? 'This batch costs nothing.'
+          : estimate.low_usd === estimate.high_usd
+            ? `About $${estimate.high_usd.toFixed(2)}.`
+            : `Between $${estimate.low_usd.toFixed(2)} and $${estimate.high_usd.toFixed(2)}.`}
+      </strong>{' '}
+      {estimate.note}
+      {estimate.over_budget && (
+        <>
+          {' '}
+          <strong>
+            That is more than this workspace has left this month, so it would stop part
+            way through.
+          </strong>
+        </>
       )}
     </div>
   );
@@ -722,11 +1402,15 @@ function BatchProgressPanel({
   const { batch: summary, executions, pending } = batch;
   const done = summary.succeeded + summary.failed;
   const percent = summary.total ? Math.round((done / summary.total) * 100) : 0;
+  const running = batch.running;
 
   return (
     <div className="panel" style={{ marginTop: 16 }}>
       <header>
-        <span>Batch</span>
+        <span className="row" style={{ gap: 6 }}>
+          Batch
+          {running && <BrandSpinner state="working" size={13} />}
+        </span>
         <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)' }}>
           {summary.succeeded} ok · {summary.failed} failed · {pending} not attempted
         </span>
@@ -786,7 +1470,9 @@ function BatchProgressPanel({
                     .join(', ')}
                 </td>
                 <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
-                  {execution.outputs ? JSON.stringify(execution.outputs) : ''}
+                  {/* A discovery run's output is hundreds of rows; the count
+                      is the readable thing in a cell this size. */}
+                  {summariseOutputs(execution.outputs as Record<string, unknown>)}
                 </td>
                 <td style={{ fontSize: 12 }}>
                   {execution.owner_email || <span className="hint">—</span>}

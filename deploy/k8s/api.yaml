@@ -1,0 +1,96 @@
+# The HTTP surface. Serves the dashboard's API and enqueues batches; it does
+# not run them -- WORKER_ENABLED=false is what makes that true, and it is the
+# one setting that distinguishes this Deployment from the worker one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: browser-automation
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: browser-automation, component: api }
+  template:
+    metadata:
+      labels: { app: browser-automation, component: api }
+    spec:
+      serviceAccountName: browser-automation
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          image: browser-automation:latest
+          command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          envFrom:
+            - configMapRef: { name: browser-automation }
+          env:
+            # This process serves requests. Batches are somebody else's job.
+            - name: WORKER_ENABLED
+              value: "false"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: browser-automation, key: DB_PASSWORD }
+            - name: CREDENTIALS_KEY
+              valueFrom:
+                secretKeyRef: { name: browser-automation, key: CREDENTIALS_KEY }
+          # Liveness asks "is this process answering", readiness asks "can it
+          # do its job". Conflating them makes the kubelet restart a pod whose
+          # only problem is that the database is briefly away -- which
+          # restarting does not fix, and which restarting every pod at once
+          # turns into an outage.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            # 503 means a dependency is down, not that the process is stuck.
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: browser-automation
+spec:
+  selector: { app: browser-automation, component: api }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: browser-automation
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    # The dashboard streams a run over a WebSocket. The default idle timeout
+    # closes a socket that is only quiet because nothing is happening yet, and
+    # the client then reconnects and replays -- correct, but noisy and slow.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port: { name: http }

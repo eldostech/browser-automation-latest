@@ -35,6 +35,55 @@ async def test_events_replay_after_a_sequence_number(store):
     assert [event.seq for event in replayed] == [4, 5]
 
 
+async def test_creating_many_executions_at_once_matches_one_at_a_time(store):
+    """A batch used to insert its execution rows one at a time, each a
+    separate session/round trip -- on a remote database that scaled the wait
+    before row 0 even started with the row count. `create_executions` is the
+    replacement: one session, one bulk insert, the identical rows."""
+    usecase_id, _ = await store.save_usecase(
+        {
+            "id": "uc00000000000000000000000000ex01",
+            "name": "Bulk insert target",
+            "status": "ready",
+            "allowed_domains": ["vendor.test"],
+            "row_steps": [
+                {"id": "s1", "action": "click",
+                 "locators": [{"strategy": "role", "role": "button", "name": "Go"}]}
+            ],
+        }
+    )
+    # No batch_id: a real one is a foreign key to a row in `batches`, which
+    # this test has no reason to create just to prove a bulk insert works --
+    # `run_id` alone is enough to identify these rows as one group.
+    rows = [
+        {
+            "id": f"ex{i:030d}",
+            "usecase_id": usecase_id,
+            "version": 1,
+            "run_id": "r-bulk-insert-test",
+            "row_index": i,
+            "inputs": {"n": i},
+            "owner_id": None,
+            "owner_email": "person@example.com",
+        }
+        for i in range(5)
+    ]
+
+    await store.create_executions(rows)
+
+    saved = await store.list_executions(usecase_id=usecase_id)
+    assert len(saved) == 5
+    assert [row["row_index"] for row in saved] == [0, 1, 2, 3, 4]
+    assert saved[0]["status"] == "pending"
+    assert saved[3]["inputs"] == {"n": 3}
+    assert saved[0]["owner_email"] == "person@example.com"
+
+
+async def test_creating_no_executions_is_a_quiet_no_op(store):
+    await store.create_executions([])
+    assert await store.list_executions(batch_id="nothing-here") == []
+
+
 async def test_thinking_events_upsert_on_the_same_seq(store):
     """Streaming rewrites one row rather than appending a bubble per delta."""
     await store.create_run("r1", "t", None, {})
@@ -157,6 +206,49 @@ async def test_every_row_belongs_to_a_workspace(root_store):
     )
 
 
+# --- agent tool servers -----------------------------------------------------
+
+
+async def test_a_tool_server_is_only_visible_to_its_own_workspace(root_store):
+    """Two workspaces may both register a server called "crm" -- the same
+    property `save_credential` already guarantees, and for the same reason."""
+    a = root_store.workspace(await root_store.ensure_workspace("A", "tenant-a"))
+    b = root_store.workspace(await root_store.ensure_workspace("B", "tenant-b"))
+
+    await a.save_tool_server("s1", "crm", "stdio", {"command": "crm-mcp"})
+    await b.save_tool_server("s2", "crm", "stdio", {"command": "other-mcp"})
+
+    a_rows = await a.list_tool_servers()
+    b_rows = await b.list_tool_servers()
+
+    assert [r["name"] for r in a_rows] == ["crm"]
+    assert a_rows[0]["connection"]["command"] == "crm-mcp"
+    assert [r["name"] for r in b_rows] == ["crm"]
+    assert b_rows[0]["connection"]["command"] == "other-mcp"
+
+    # Cross-tenant delete must fail rather than succeed on the wrong row.
+    assert await a.delete_tool_server("s2") is False
+    assert [r["name"] for r in (await b.list_tool_servers())] == ["crm"]
+
+
+async def test_saving_the_same_name_twice_replaces_it(store):
+    await store.save_tool_server("s1", "crm", "stdio", {"command": "old"})
+    await store.save_tool_server("s1", "crm", "stdio", {"command": "new"}, enabled=False)
+
+    rows = await store.list_tool_servers()
+    assert len(rows) == 1
+    assert rows[0]["connection"]["command"] == "new"
+    assert rows[0]["enabled"] is False
+
+
+async def test_disabled_servers_are_excluded_when_asked(store):
+    await store.save_tool_server("s1", "on", "stdio", {"command": "a"}, enabled=True)
+    await store.save_tool_server("s2", "off", "stdio", {"command": "b"}, enabled=False)
+
+    assert {r["name"] for r in await store.list_tool_servers()} == {"on", "off"}
+    assert {r["name"] for r in await store.list_tool_servers(enabled_only=True)} == {"on"}
+
+
 async def test_the_migrations_reproduce_the_models(db_settings):
     """Applying every migration to an empty schema yields exactly the models.
 
@@ -217,3 +309,85 @@ async def test_the_migrations_reproduce_the_models(db_settings):
             await conn.execute(f'DROP SCHEMA IF EXISTS "{scratch}" CASCADE')
         finally:
             await conn.close()
+
+
+async def test_a_batch_of_events_is_written_in_one_statement(store):
+    """Against a remote database the round trip is the cost, not the rows.
+
+    A replayed step emits four or five events; writing each one as it happened
+    meant a pre-ping, an INSERT and a COMMIT apiece.
+    """
+    await store.create_run("r1", "t", None, {})
+
+    await store.append_events(
+        [ToolCall(run_id="r1", seq=seq, step=1, call_id=f"c{seq}", name="x") for seq in range(1, 6)]
+    )
+
+    assert [event.seq for event in await store.get_events("r1")] == [1, 2, 3, 4, 5]
+
+
+async def test_a_batch_holding_the_same_seq_twice_keeps_the_last(store):
+    """`thinking` events deliberately reuse a seq while the model streams.
+
+    Postgres refuses an ON CONFLICT DO UPDATE that would touch the same row
+    twice in one statement, so a batch carrying both would fail outright and
+    take the whole flush with it. Collapsing to the last is also exactly what
+    the one-at-a-time path did, since each write overwrote the one before.
+    """
+    await store.create_run("r1", "t", None, {})
+
+    await store.append_events(
+        [
+            Thinking(run_id="r1", seq=1, step=1, text="I am th"),
+            Thinking(run_id="r1", seq=1, step=1, text="I am thinking", done=True),
+            ToolCall(run_id="r1", seq=2, step=1, call_id="c1", name="x"),
+        ]
+    )
+
+    events = await store.get_events("r1")
+    assert [event.seq for event in events] == [1, 2]
+    assert events[0].text == "I am thinking"
+    assert events[0].done is True
+
+
+async def test_a_batch_can_update_an_event_written_by_an_earlier_batch(store):
+    """The streaming case across a flush boundary: the deltas of one thinking
+    block can straddle two batches, and the later one still has to win."""
+    await store.create_run("r1", "t", None, {})
+
+    await store.append_events([Thinking(run_id="r1", seq=1, step=1, text="I am th")])
+    await store.append_events(
+        [Thinking(run_id="r1", seq=1, step=1, text="I am thinking", done=True)]
+    )
+
+    events = await store.get_events("r1")
+    assert len(events) == 1 and events[0].text == "I am thinking"
+
+
+async def test_writing_no_events_touches_the_database_not_at_all(store):
+    await store.append_events([])
+
+
+async def test_step_rows_are_written_as_a_batch(store):
+    await store.create_run("r1", "t", None, {})
+
+    await store.record_steps(
+        [
+            {
+                "run_id": "r1",
+                "usecase_id": "u1",
+                "version": 1,
+                "row_index": 0,
+                "seq": seq,
+                "step_id": f"s{seq}",
+                "phase": "row",
+                "action": "click",
+                "status": "succeeded",
+                "duration_ms": 10,
+            }
+            for seq in range(1, 4)
+        ]
+    )
+
+    rows = await store.list_run_steps("r1")
+    assert [row["step_id"] for row in rows] == ["s1", "s2", "s3"]

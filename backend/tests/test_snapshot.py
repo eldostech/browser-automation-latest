@@ -34,7 +34,9 @@ def test_page_url_and_title_are_extracted(real: Snapshot):
 
 def test_parses_a_real_snapshot(real: Snapshot):
     assert len(real) > 50
-    assert all(node.ref for node in real), "every indexed node must carry a ref"
+    # Refs are optional now, so the assertion is that they were *read*, not
+    # that every node had one. See the next test for why.
+    assert len(real.by_ref) > 50
 
 
 def test_role_and_name_are_separated(real: Snapshot):
@@ -54,14 +56,34 @@ def test_attributes_on_both_sides_of_the_ref_are_captured(real: Snapshot):
     assert "ref" not in node.attrs, "ref is promoted to its own field"
 
 
-def test_nodes_without_a_ref_are_skipped(real: Snapshot):
-    # The fixture contains `- button "copy link"` with no ref -- nothing that
-    # can be acted on, so it must not appear.
-    assert all(n.name != "copy link" for n in real)
+def test_a_node_without_a_ref_is_still_a_node(real: Snapshot):
+    """Refs are optional, and that is what lets one parser serve two sources.
+
+    Playwright MCP stamps `[ref=eN]` on every node. Playwright's own
+    `locator.aria_snapshot()` emits the same YAML *without* refs, and the
+    engine reads that. Requiring a ref made every node of a real aria snapshot
+    invisible: the tree parsed cleanly and produced nothing, which is the most
+    expensive kind of wrong.
+
+    The fixture contains `- button "copy link"` with no ref, which is now
+    found by role and name like anything else.
+    """
+    node = real.locate("button", "copy link")
+    assert node is not None
+    assert node.ref == ""
+
+
+def test_refless_nodes_stay_out_of_the_ref_index(real: Snapshot):
+    """Otherwise they all collect under the empty string and `get("")`
+    returns an arbitrary element."""
+    assert all(ref for ref in real.by_ref)
+    assert real.get("") is None
 
 
 def test_property_lines_are_not_mistaken_for_nodes(real: Snapshot):
-    assert all(n.role not in {"text", "url"} for n in real)
+    """`- /url: ...` describes no element. It fails the role pattern, so it is
+    skipped on its own merits rather than because it lacks a ref."""
+    assert all(n.role != "url" for n in real)
 
 
 def test_trailing_text_content_is_captured(real: Snapshot):
@@ -189,11 +211,30 @@ def test_roles_histogram_reports_what_was_on_the_page(real: Snapshot):
 
 
 @pytest.mark.parametrize(
-    "value", ["ref=e15", "[ref=e15]", " ref=f1e42 ", "e15", " e407 "]
+    "value", ["ref=e15", "[ref=e15]", " ref=f1e42 ", "e15", " e407 ", "f1e42"]
 )
 def test_is_ref_recognises_every_spelling(value: str):
     assert is_ref(value) is True
     assert extract_ref(value) in {"e15", "f1e42", "e407"}
+
+
+def test_a_bare_ref_inside_an_iframe_is_a_ref_not_a_selector():
+    """The bug this file's own `test_a_bare_ref_is_a_ref_not_a_selector` was
+    written from, one level deeper: `f1e42` -- the shape Playwright MCP gives
+    an element inside a frame, `ref=f1e42` prefixed or bare -- used to only
+    pass this check with the `ref=` prefix on. The bare spelling, which is
+    exactly the one a model's `target` argument actually carries, was refused
+    outright as "not an element reference", regardless of whether it was ever
+    valid. Found for real, on a page whose only interactive widget happened to
+    be inside an iframe -- meaning nothing on that page was reachable at all.
+    """
+    assert is_ref("f1e42") is True
+    assert extract_ref("f1e42") == "f1e42"
+    assert is_ref("f10e107") is True, "more than one digit in either segment"
+
+
+def test_a_doubly_nested_frame_ref_is_still_a_ref():
+    assert is_ref("f10f3e107") is True
 
 
 def test_a_bare_ref_is_a_ref_not_a_selector():

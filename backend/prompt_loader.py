@@ -29,33 +29,43 @@ from string import Template
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 #: Prompt names, so call sites are not stringly typed.
-SYSTEM = "system"
-TASK = "task"
-LOOP_NUDGE = "loop_nudge"
-APPROVAL_REJECTED = "approval_rejected"
+#:
+#: For a while this list was only what a model is asked during a *replay*:
+#: repair a broken locator, and explain a navigation the allowlist refused.
+#: The authoring prompts are back, for an agent with a different job from the
+#: one that was deleted -- it records a workflow the engine then repeats for
+#: nothing, rather than being the only way to run anything.
 NAVIGATION_BLOCKED = "navigation_blocked"
-EMPTY_TOOL_RESULT = "empty_tool_result"
-DISTILL = "distill"
 HEAL = "heal"
 HEAL_REQUEST = "heal_request"
 REPAIR = "repair"
 REPAIR_REQUEST = "repair_request"
+AUTHOR = "author"
+AUTHOR_TASK = "author_task"
+BRIEF = "brief"
+BRIEF_REQUEST = "brief_request"
+WALKTHROUGH = "walkthrough"
+WALKTHROUGH_REQUEST = "walkthrough_request"
+RECOVER = "recover"
+EXPLORE = "explore"
 
 #: Every prompt the application expects to find on disk. ``test_prompts.py``
 #: asserts this matches the directory, so a deleted or renamed file fails the
-#: suite instead of an agent run.
+#: suite rather than a run.
 REQUIRED_PROMPTS: tuple[str, ...] = (
-    SYSTEM,
-    TASK,
-    LOOP_NUDGE,
-    APPROVAL_REJECTED,
     NAVIGATION_BLOCKED,
-    EMPTY_TOOL_RESULT,
-    DISTILL,
     HEAL,
     HEAL_REQUEST,
     REPAIR,
     REPAIR_REQUEST,
+    AUTHOR,
+    AUTHOR_TASK,
+    BRIEF,
+    BRIEF_REQUEST,
+    WALKTHROUGH,
+    WALKTHROUGH_REQUEST,
+    RECOVER,
+    EXPLORE,
 )
 
 _BLANK_RUN = re.compile(r"\n{3,}")

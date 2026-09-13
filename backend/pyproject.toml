@@ -33,6 +33,17 @@ pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-  "e2e: exercises a real browser through a real MCP server (set RUN_E2E=1)",
+  # The description was left over from the retired MCP design: the e2e tests
+  # drive Playwright directly, which is the whole point of them.
+  "e2e: records and replays against a real Chromium (set RUN_E2E=1)",
+  "mcp: drives a real `npx @playwright/mcp` server (set RUN_MCP=1)",
+  # Off by default because it spends money. No test should be able to bill
+  # somebody by being run.
+  "llm: calls a real Bedrock model (set RUN_LLM=1 -- this costs a few cents)",
+  # Not a pass/fail test so much as a measurement, and it runs every case
+  # several times against a real browser. Separate from `e2e` because the two
+  # answer different questions: e2e asks "is this correct", eval asks "how
+  # often", and only the second one can tell you whether a change helped.
+  "eval: measures accuracy and run-to-run variance (set RUN_EVAL=1)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]

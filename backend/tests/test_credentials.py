@@ -13,7 +13,6 @@ from credentials import (
     VaultError,
     VaultUnavailable,
     generate_key,
-    missing_slots,
     new_credential_id,
 )
 
@@ -95,13 +94,6 @@ def test_corrupt_input_is_reported_not_swallowed(vault: Vault):
 
 def test_slots_are_reported_in_a_stable_order(vault: Vault):
     assert Vault.slots_of(BUNDLE) == ["password", "username"]
-
-
-def test_missing_slots_reports_what_a_use_case_still_needs():
-    assert missing_slots(["username", "password", "pin"], {"username": "u", "pin": ""}) == [
-        "password",
-        "pin",
-    ]
 
 
 def test_ids_are_unique():

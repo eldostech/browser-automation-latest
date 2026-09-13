@@ -4,7 +4,7 @@ This file exists because of a shipped bug. Every other test built ``Settings``
 in Python with real list objects, so nothing exercised the dotenv path -- and
 pydantic-settings runs ``json.loads()`` on ``list[str]`` fields *before* any
 validator, which made a perfectly ordinary comma-separated
-``AGENT_ALLOWED_DOMAINS`` crash the backend at import time with
+``CORS_ORIGINS`` crash the backend at import time with
 ``SettingsError``. The fields are annotated ``NoDecode`` to prevent that; these
 tests hold that behaviour in place.
 """
@@ -25,16 +25,20 @@ def write_env(tmp_path, body: str):
 # --- the regression --------------------------------------------------------
 
 
-def test_comma_separated_domains_load_from_a_dotenv_file(tmp_path):
-    """The exact shape of .env.example must not raise."""
+def test_comma_separated_lists_load_from_a_dotenv_file(tmp_path):
+    """A list setting is written comma-separated, not as JSON.
+
+    Nobody writes a JSON array in a .env file, and pydantic's default list
+    parsing demands one -- which crashed the backend at import time with a
+    message about JSON naming a variable the operator had written perfectly
+    reasonably.
+    """
     env = write_env(
         tmp_path,
-        "AGENT_ALLOWED_DOMAINS=example.com,*.example.com\n"
-        "CORS_ORIGINS=http://localhost:5173\n",
+        "CORS_ORIGINS=http://localhost:5173,https://app.example.com\n",
     )
     settings = Settings(_env_file=env)
-    assert settings.agent_allowed_domains == ["example.com", "*.example.com"]
-    assert settings.cors_origins == ["http://localhost:5173"]
+    assert settings.cors_origins == ["http://localhost:5173", "https://app.example.com"]
 
 
 def test_the_shipped_env_example_parses(tmp_path):
@@ -49,26 +53,26 @@ def test_the_shipped_env_example_parses(tmp_path):
         line for line in body.splitlines() if line.strip() and not line.strip().startswith("#")
     )
     settings = Settings(_env_file=write_env(tmp_path, active))
-    assert settings.agent_allowed_domains
     assert settings.cors_origins
-    assert settings.llm_model.startswith(("us.", "eu.", "apac.", "global."))
+    assert settings.cors_origins
+    assert settings.llm_repair_model.startswith(("us.", "eu.", "apac.", "global."))
 
 
 def test_whitespace_around_entries_is_trimmed(tmp_path):
-    env = write_env(tmp_path, "AGENT_ALLOWED_DOMAINS= example.com , shop.test ,\n")
-    assert Settings(_env_file=env).agent_allowed_domains == ["example.com", "shop.test"]
+    env = write_env(tmp_path, "CORS_ORIGINS= example.com , shop.test ,\n")
+    assert Settings(_env_file=env).cors_origins == ["example.com", "shop.test"]
 
 
 def test_json_array_form_also_works(tmp_path):
     """NoDecode disables pydantic's JSON handling, so we accept it ourselves --
     a value written either way behaves the same."""
-    env = write_env(tmp_path, 'AGENT_ALLOWED_DOMAINS=["example.com", "shop.test"]\n')
-    assert Settings(_env_file=env).agent_allowed_domains == ["example.com", "shop.test"]
+    env = write_env(tmp_path, 'CORS_ORIGINS=["example.com", "shop.test"]\n')
+    assert Settings(_env_file=env).cors_origins == ["example.com", "shop.test"]
 
 
 def test_a_single_domain_is_still_a_list(tmp_path):
-    env = write_env(tmp_path, "AGENT_ALLOWED_DOMAINS=example.com\n")
-    assert Settings(_env_file=env).agent_allowed_domains == ["example.com"]
+    env = write_env(tmp_path, "CORS_ORIGINS=example.com\n")
+    assert Settings(_env_file=env).cors_origins == ["example.com"]
 
 
 # --- other .env round-trips ------------------------------------------------
@@ -77,16 +81,16 @@ def test_a_single_domain_is_still_a_list(tmp_path):
 def test_scalars_and_bools_load_from_dotenv(tmp_path):
     env = write_env(
         tmp_path,
-        "AGENT_MAX_STEPS=7\n"
-        "AGENT_TIMEOUT_SECONDS=45.5\n"
-        "AGENT_REQUIRE_APPROVAL=false\n"
-        "MCP_HEADLESS=true\n",
+        "REPLAY_STEP_TIMEOUT=45.5\n"
+        "REPLAY_FAILURE_STREAK_LIMIT=7\n"
+        "REPLAY_HEALING_ENABLED=false\n"
+        "BROWSER_HEADLESS=true\n",
     )
     settings = Settings(_env_file=env)
-    assert settings.agent_max_steps == 7
-    assert settings.agent_timeout_seconds == 45.5
-    assert settings.agent_require_approval is False
-    assert settings.mcp_headless is True
+    assert settings.replay_step_timeout == 45.5
+    assert settings.replay_failure_streak_limit == 7
+    assert settings.replay_healing_enabled is False
+    assert settings.browser_headless is True
 
 
 def test_blank_optional_values_become_none(tmp_path):
@@ -94,14 +98,13 @@ def test_blank_optional_values_become_none(tmp_path):
     settings = Settings(_env_file=env)
     assert settings.aws_profile is None
     assert settings.aws_region is None
-    assert settings.mcp_storage_state is None
 
 
 def test_bedrock_settings_load_from_dotenv(tmp_path):
     env = write_env(
         tmp_path,
         "LLM_PROVIDER=bedrock\n"
-        "LLM_MODEL=eu.anthropic.claude-haiku-4-5-20251001-v1:0\n"
+        "LLM_REPAIR_MODEL=eu.anthropic.claude-haiku-4-5-20251001-v1:0\n"
         "BEDROCK_API=mantle\n"
         "AWS_REGION=eu-west-1\n"
         "AWS_PROFILE=work\n",
@@ -110,36 +113,54 @@ def test_bedrock_settings_load_from_dotenv(tmp_path):
     assert settings.aws_region == "eu-west-1"
     assert settings.aws_profile == "work"
     # A colon in the value must survive -- dotenv splits on '=', not ':'.
-    assert settings.llm_model.endswith("-v1:0")
+    assert settings.llm_repair_model.endswith("-v1:0")
 
 
 def test_a_typo_in_a_typed_setting_fails_at_load(tmp_path):
-    env = write_env(tmp_path, "AGENT_MAX_STEPS=not-a-number\n")
-    with pytest.raises(Exception, match="agent_max_steps"):
+    env = write_env(tmp_path, "REPLAY_FAILURE_STREAK_LIMIT=not-a-number\n")
+    with pytest.raises(Exception, match="replay_failure_streak_limit"):
         Settings(_env_file=env)
 
 
 def test_a_setting_that_no_longer_exists_is_ignored_not_fatal(tmp_path):
     """An old .env keeps working.
 
-    LLM_PROVIDER, ANTHROPIC_API_KEY and BEDROCK_API are gone; a stale line for
-    any of them must not stop the backend starting.
+    ANTHROPIC_API_KEY and BEDROCK_API are gone; a stale line for either must
+    not stop the backend starting.
     """
-    env = write_env(
-        tmp_path,
-        "LLM_PROVIDER=anthropic\nANTHROPIC_API_KEY=sk-ant-stale\nBEDROCK_API=mantle\n",
-    )
+    env = write_env(tmp_path, "ANTHROPIC_API_KEY=sk-ant-stale\nBEDROCK_API=mantle\n")
     settings = Settings(_env_file=env)
 
-    assert not hasattr(settings, "llm_provider")
     assert not hasattr(settings, "anthropic_api_key")
     assert not hasattr(settings, "bedrock_api")
 
 
+def test_a_provider_value_from_an_older_version_starts_on_the_default(tmp_path):
+    """`LLM_PROVIDER` existed, was removed when this went Bedrock-only, and is
+    back now that there are two providers again.
+
+    An operator upgrading across all of that may still have
+    `LLM_PROVIDER=anthropic` in a file nobody has opened in months, and a
+    backend that will not start because of one dead line is worse than one that
+    starts on its default and says so in the log.
+    """
+    env = write_env(tmp_path, "LLM_PROVIDER=anthropic\n")
+
+    assert Settings(_env_file=env).llm_provider == "bedrock"
+
+
+def test_a_provider_typo_still_fails_at_load(tmp_path):
+    """Forgiving one historical value is not the same as accepting anything."""
+    env = write_env(tmp_path, "LLM_PROVIDER=bedrok\n")
+
+    with pytest.raises(Exception, match="llm_provider"):
+        Settings(_env_file=env)
+
+
 def test_defaults_apply_with_no_dotenv_file(tmp_path):
     settings = Settings(_env_file=str(tmp_path / "does-not-exist.env"))
-    assert settings.agent_allowed_domains == ["example.com", "*.example.com"]
-    assert settings.llm_model.startswith(("us.", "eu.", "apac.", "global."))
+    assert settings.cors_origins == ["http://localhost:5173"]
+    assert settings.llm_repair_model.startswith(("us.", "eu.", "apac.", "global."))
 
 
 # --- the parser itself -----------------------------------------------------

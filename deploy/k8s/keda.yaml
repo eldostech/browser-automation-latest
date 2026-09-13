@@ -1,0 +1,66 @@
+# Scale the workers on how much work is waiting.
+#
+# The queue is a Postgres table rather than SQS, so this is KEDA's postgresql
+# scaler and the metric is a query. That is not a workaround: enqueueing a
+# batch and writing the rows it is about happen in one transaction, so there is
+# never a queued batch no worker will claim. A broker cannot offer that without
+# an outbox table.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-postgres
+  namespace: browser-automation
+type: Opaque
+stringData:
+  # KEDA connects itself, so it needs its own connection string. A read-only
+  # role is enough -- it only ever runs the COUNT below.
+  connection: "postgresql://keda:CHANGE_ME@browser-automation.cluster-xxxxx.eu-west-1.rds.amazonaws.com:5432/postgres?sslmode=require"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-postgres
+  namespace: browser-automation
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: keda-postgres
+      key: connection
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: browser-automation
+spec:
+  scaleTargetRef:
+    name: worker
+  # Zero when nothing is queued: every worker holds a Chromium, and an idle
+  # cluster should not be holding any.
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  pollingInterval: 15
+  # Generous, because scaling down mid-batch costs a retry. The lease makes
+  # that recoverable rather than lost, but recovering is still slower than
+  # waiting.
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+  triggers:
+    - type: postgresql
+      metricType: AverageValue
+      authenticationRef:
+        name: keda-postgres
+      metadata:
+        # One worker per queued batch. `targetQueryValue: 1` with AverageValue
+        # means "aim for one queued job per replica" -- ten queued batches ask
+        # for ten workers, subject to maxReplicaCount.
+        #
+        # Only `queued` counts. Including `running` would keep the desired
+        # count high while the work was already being done, and the pods would
+        # never scale back down.
+        query: "SELECT COUNT(*) FROM browser.jobs WHERE status = 'queued'"
+        targetQueryValue: "1"

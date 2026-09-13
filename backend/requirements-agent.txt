@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# The agent, as an optional extra.
+#
+# This is deliberately NOT in requirements.txt, and the decision is the opposite
+# of the one made for boto3 there. That argument was "a missing package
+# discovered on the first screenshot of a production run is not a good trade for
+# a few megabytes", and it was right: nothing about a replay tells you in
+# advance that it is about to need S3.
+#
+# The agent is different in two ways. A replay pod does not need it at all --
+# recording and agent work happen elsewhere, and adding a Node runtime and a
+# graph library to the image that runs the batches grows the thing that has to
+# keep working, for a capability it never uses. And a missing agent is
+# discovered on a screen that says the agent is not enabled here, because
+# AGENT_ENABLED reports it the way RECORDER_ENABLED reports a machine with no
+# display.
+#
+# The consequence is the compatibility contract: with these uninstalled, the
+# platform is exactly the platform it was before the agent was written. There
+# is a test asserting that nothing imports them at module scope.
+#
+#   pip install -r backend/requirements-agent.txt
+#
+# You also need Node 18 or newer on PATH. The browser tools are
+# `npx @playwright/mcp`, pinned by AGENT_MCP_VERSION -- pinned for the same
+# reason `playwright` is pinned in requirements.txt: that server's tool names
+# and argument shapes are the contract backend/agent/tools/ is written
+# against, and `@latest` would let a release change them inside somebody's
+# session rather than in CI.
+# ---------------------------------------------------------------------------
+
+-r requirements.txt
+
+# The MCP client. Speaks stdio to `npx @playwright/mcp` locally and, later,
+# HTTP to an AgentCore Gateway -- one protocol for the browser and for whatever
+# third-party tools a workspace mounts beside it.
+mcp>=1.2,<2
+
+# The graph. Arrives with phase D; declared here now so the extra is installed
+# once rather than twice, and so a deployment enabling the agent gets a
+# consistent set.
+#
+# What this replaces: langgraph was removed from requirements.txt when the
+# original agent was deleted, along with its checkpointers and the MCP client.
+# The comment there still records why. It comes back for a different job -- the
+# agent finds the way and the engine repeats it, rather than the agent being
+# the only way to run anything.
+langgraph>=0.2,<2
+
+# `create_agent` and its middleware system -- what the authoring loop is built
+# on now instead of a hand-rolled StateGraph. Requires langgraph>=1.2.11,
+# still inside the pin above; verified in isolation before anything using it
+# was written, because a version bump changing checkpointer or interrupt
+# behaviour out from under the already-hardened graph code is a different
+# problem than the migration itself.
+langchain>=1.4,<2
+
+# langgraph 1.2.11 (what the line above pulls in) needs langgraph-checkpoint
+# >=4.1.0, which no 2.x release of this package supports -- only 3.x does.
+# Found by installing into a scratch venv first rather than guessed: the old
+# <3 pin here, not langchain itself, was what made this unresolvable.
+# Unused today (nothing in this codebase passes a checkpointer other than the
+# in-memory one), so the bump has no runtime effect yet.
+langgraph-checkpoint-postgres>=3.1,<4

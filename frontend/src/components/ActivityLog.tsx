@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react';
 
 import { api } from '../lib/api';
 import type { AuditEntry } from '../lib/events';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   /** Omit to show the whole workspace log (administrators only). */
@@ -97,7 +98,7 @@ export function ActivityLog({ usecaseId, limit = 100 }: Props) {
   }, [usecaseId, limit]);
 
   if (error) return <p className="hint">Could not load the activity: {error}</p>;
-  if (entries === null) return <p className="hint">Loading activity…</p>;
+  if (entries === null) return <BrandSpinner state="working" label="Loading activity…" />;
   if (entries.length === 0) {
     return (
       <p className="hint">

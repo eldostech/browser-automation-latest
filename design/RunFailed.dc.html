@@ -1,0 +1,203 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <style>
+    body { margin: 0; font-family: 'Public Sans', 'Segoe UI', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: #10566B; text-decoration: none; }
+    a:hover { color: #0B3F4F; text-decoration: underline; }
+  </style>
+</helmet>
+
+<div style="width: 1440px; min-height: 900px; background: #F4F2ED; color: #16232E; display: flex; flex-direction: column;">
+
+  <div style="background: #12293D; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; height: 60px;">
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#C9A227" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7.5 3v6c0 4.4-3 7.9-7.5 9-4.5-1.1-7.5-4.6-7.5-9V6z"></path><path d="M9 12l2.2 2.2L15.5 10"></path></svg>
+      <span style="font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600; color: #FFFFFF;">TRACE</span>
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #92A9BC; border-left: 1px solid rgba(255,255,255,0.2); padding-left: 14px;">Automation Platform</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 20px;">
+      <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #E8C86A; background: rgba(201,162,39,0.14); border: 1px solid rgba(201,162,39,0.4); border-radius: 2px; padding: 4px 9px;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #C9A227;"></span>UAT</span>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="width: 30px; height: 30px; border-radius: 50%; background: #274A66; color: #FFFFFF; font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center;">NA</span>
+        <div style="display: flex; flex-direction: column; gap: 1px;">
+          <span style="font-size: 13px; font-weight: 600; color: #FFFFFF;">Nitin Asati</span>
+          <span style="font-size: 11px; color: #92A9BC;">Author</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="background: #0D1F2E; padding: 0 40px; display: flex; align-items: stretch; gap: 4px; height: 46px;">
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Use cases</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Record</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 600; color: #FFFFFF; border-bottom: 3px solid #C9A227;">Runs</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Datasets</span>
+    <span style="display: flex; align-items: center; padding: 0 18px; font-size: 14px; font-weight: 500; color: #A8BCCC; border-bottom: 3px solid transparent;">Learned fixes</span>
+  </div>
+
+  <!-- failure banner -->
+  <div style="background: #FBF2F1; border-bottom: 1px solid #E8CFCC; padding: 16px 40px; display: flex; align-items: flex-start; gap: 14px;">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9B2226" stroke-width="2" stroke-linecap="round" style="flex-shrink: 0; margin-top: 1px;"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5.5"></path><path d="M12 16.5v.5"></path></svg>
+    <div style="display: flex; flex-direction: column; gap: 4px; flex-grow: 1;">
+      <span style="font-size: 14.5px; font-weight: 600; color: #7A1B1E;">Step s7 failed &mdash; no element matched</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; line-height: 1.6; color: #55636F;">Tried: role=textbox name="User ID"; text='User ID'</span>
+    </div>
+    <span style="font-size: 12.5px; color: #8A96A1; white-space: nowrap;">30 Aug, 20:47:48</span>
+  </div>
+
+  <div style="flex-grow: 1; padding: 24px 40px 48px;">
+
+    <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 40px; margin-bottom: 22px;">
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #55636F;">
+          <a href="#">Runs</a><span style="color: #C9C3B8;">/</span><span style="font-family: 'IBM Plex Mono', monospace; color: #16232E;">84379f60</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <h1 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 28px; font-weight: 600; letter-spacing: -0.01em; color: #12293D;">Login to bank home page</h1>
+          <span style="display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 2px; background: #FBF2F1; border: 1px solid #E8CFCC; color: #9B2226; font-size: 12px; font-weight: 600;"><span style="width: 6px; height: 6px; border-radius: 50%; background: #9B2226;"></span>Failed</span>
+        </div>
+        <div style="display: flex; gap: 26px; font-size: 13px; color: #55636F;">
+          <span>Row 1 of 1</span><span>6 of 9 steps completed</span><span>18.4s</span><span>v2</span>
+        </div>
+      </div>
+      <div style="display: flex; gap: 10px; flex-shrink: 0;">
+        <button style="height: 38px; padding: 0 16px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Download trace</button>
+        <button style="height: 38px; padding: 0 16px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Run again</button>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 24px; align-items: start;">
+
+      <!-- step trail -->
+      <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+        <div style="padding: 15px 20px; border-bottom: 1px solid #E2DED6;">
+          <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 16px; font-weight: 600; color: #12293D;">Step trail</h2>
+        </div>
+        <div style="display: flex; flex-direction: column;">
+          <div style="display: flex; align-items: center; gap: 11px; padding: 10px 20px; border-bottom: 1px solid #F5F2EC;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#2C6E49" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #8A96A1; width: 24px;">s1</span>
+            <span style="font-size: 13px; color: #16232E; flex-grow: 1;">Navigate to /login-page</span>
+            <span style="font-size: 12px; color: #8A96A1;">2.1s</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 11px; padding: 10px 20px; border-bottom: 1px solid #F5F2EC;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#2C6E49" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #8A96A1; width: 24px;">s3</span>
+            <span style="font-size: 13px; color: #16232E; flex-grow: 1;">Click &ldquo;Personal Banking&rdquo;</span>
+            <span style="font-size: 12px; color: #8A96A1;">1.4s</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 11px; padding: 10px 20px; border-bottom: 1px solid #F5F2EC;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#2C6E49" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #8A96A1; width: 24px;">s5</span>
+            <span style="font-size: 13px; color: #16232E; flex-grow: 1;">Click &ldquo;Login&rdquo;</span>
+            <span style="font-size: 12px; color: #8A96A1;">3.9s</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 11px; padding: 12px 20px; border-bottom: 1px solid #F5F2EC; background: #FBF2F1; border-left: 3px solid #9B2226;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9B2226" stroke-width="2.6" stroke-linecap="round"><path d="M18 6L6 18"></path><path d="M6 6l12 12"></path></svg>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #9B2226; width: 24px; font-weight: 600;">s7</span>
+            <span style="font-size: 13px; color: #7A1B1E; font-weight: 600; flex-grow: 1;">Click User ID field</span>
+            <span style="font-size: 12px; color: #9B2226;">30.0s</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 11px; padding: 10px 20px; border-bottom: 1px solid #F5F2EC; opacity: 0.5;">
+            <span style="width: 15px; height: 15px; border-radius: 50%; border: 1.5px dashed #C9C3B8;"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #8A96A1; width: 24px;">s8</span>
+            <span style="font-size: 13px; color: #8A96A1; flex-grow: 1;">Fill User ID</span>
+            <span style="font-size: 12px; color: #8A96A1;">Skipped</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 11px; padding: 10px 20px; opacity: 0.5;">
+            <span style="width: 15px; height: 15px; border-radius: 50%; border: 1.5px dashed #C9C3B8;"></span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; color: #8A96A1; width: 24px;">s9</span>
+            <span style="font-size: 13px; color: #8A96A1; flex-grow: 1;">Click Submit</span>
+            <span style="font-size: 12px; color: #8A96A1;">Skipped</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- right column -->
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+
+        <!-- repair, resolved -->
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+          <div style="padding: 16px 22px; border-bottom: 1px solid #E2DED6; display: flex; align-items: center; justify-content: space-between;">
+            <div style="display: flex; align-items: center; gap: 11px;">
+              <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#10566B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 6.5a3.5 3.5 0 004.8 4.6l-8.4 8.4a2.1 2.1 0 01-3-3l8.4-8.4a3.5 3.5 0 01-1.8-1.6z"></path></svg>
+              <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 17px; font-weight: 600; color: #12293D;">Suggested repair</h2>
+            </div>
+            <span style="display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 2px; background: #EAF2ED; border: 1px solid #BFD8CB; color: #2C6E49; font-size: 12px; font-weight: 600;">High confidence</span>
+          </div>
+
+          <div style="padding: 18px 22px; display: flex; flex-direction: column; gap: 16px;">
+            <p style="margin: 0; font-size: 14px; line-height: 1.6; color: #16232E;">The sign-in form now sits inside a dialog, and the field is labelled <strong>Customer ID</strong> rather than User ID. Nothing else on the page changed.</p>
+
+            <div style="display: flex; flex-direction: column; gap: 9px;">
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: #55636F;">Change to step s7</span>
+              <div style="display: flex; flex-direction: column; gap: 1px; border: 1px solid #EFEBE4; border-radius: 3px; overflow: hidden;">
+                <div style="display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: #FBF2F1;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #9B2226; width: 14px;">&minus;</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #7A1B1E;">role=textbox name="User ID"</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: #F1F7F3;">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #2C6E49; width: 14px;">+</span>
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #1F5236;">role=textbox name="Customer ID"</span>
+                </div>
+              </div>
+              <span style="font-size: 12.5px; line-height: 1.55; color: #55636F;">The recorded locator is kept beneath the new one, so a wrong repair falls back to what the recording already knew.</span>
+            </div>
+
+            <div style="display: flex; align-items: flex-start; gap: 11px; padding: 13px 15px; background: #F7F9FA; border: 1px solid #DCE6EA; border-radius: 3px;">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#10566B" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0; margin-top: 1px;"><path d="M12 4.5a7.5 7.5 0 015 13v2.5H7V17.5a7.5 7.5 0 015-13z"></path><path d="M10 22.5h4"></path></svg>
+              <div style="display: flex; flex-direction: column; gap: 3px;">
+                <span style="font-size: 13.5px; font-weight: 600; color: #12293D;">This will be remembered</span>
+                <span style="font-size: 12.5px; line-height: 1.55; color: #55636F;">Recorded against uat.schemora.ai under your name, so the next failure on this site is offered the answer instead of working it out again.</span>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <button style="height: 40px; padding: 0 20px; border-radius: 3px; border: 1px solid #12293D; background: #12293D; color: #FFFFFF; font-size: 14px; font-weight: 600;">Apply as a new draft</button>
+              <button style="height: 40px; padding: 0 18px; border-radius: 3px; border: 1px solid #C9C3B8; background: #FFFFFF; color: #16232E; font-size: 14px; font-weight: 600;">Dismiss</button>
+              <span style="margin-left: auto; font-size: 12.5px; color: #8A96A1;">One model call &middot; 1,240 tokens</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- page at failure -->
+        <div style="background: #FFFFFF; border: 1px solid #E2DED6; border-radius: 4px;">
+          <div style="padding: 15px 22px; border-bottom: 1px solid #E2DED6; display: flex; align-items: center; justify-content: space-between;">
+            <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 16px; font-weight: 600; color: #12293D;">The page when it failed</h2>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #8A96A1;">/login-page</span>
+          </div>
+          <div style="padding: 18px 22px; display: flex; gap: 20px;">
+            <div style="width: 300px; height: 176px; background: #F4F2ED; border: 1px solid #E2DED6; border-radius: 3px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; flex-shrink: 0;">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#B4AEA2" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><circle cx="9" cy="10.5" r="1.8"></circle><path d="M3 16l4.5-4 3.5 3 3-2.5L21 17"></path></svg>
+              <span style="font-size: 12px; color: #8A96A1;">Screenshot at failure</span>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 10px; flex-grow: 1;">
+              <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: #55636F;">What was on the page</span>
+              <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">link &times;7</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">listitem &times;6</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">text &times;3</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">list &times;2</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">img &times;2</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 4px 9px; background: #FAF8F5; border: 1px solid #EFEBE4; border-radius: 2px; color: #55636F;">banner &times;1</span>
+              </div>
+              <p style="margin: 0; font-size: 12.5px; line-height: 1.55; color: #55636F;">No form control of any kind was on the page &mdash; navigation only. The step waited the full 30 seconds before giving up.</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

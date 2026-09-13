@@ -210,16 +210,58 @@ export interface RunDetail extends RunSummary {
   artifacts: { id: string; kind: string; mime: string; url: string }[];
 }
 
+/** A name, and the address it means in this deployment. */
+export interface Target {
+  id: string;
+  name: string;
+  base_url: string;
+  description: string;
+  updated_at: string;
+  updated_by: string;
+}
+
+/** One model the picker can offer, as `GET /api/models` reports it. */
+export interface ModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  /** USD per million tokens. `null` where the provider does not publish a
+   *  price, which is different from free and is rendered differently. */
+  input_per_million: number | null;
+  output_per_million: number | null;
+  context: number | null;
+}
+
+export interface ModelCatalogue {
+  providers: string[];
+  models: ModelInfo[];
+  /** Per provider: why it cannot be reached. A provider missing without a
+   *  reason is a gap somebody fills in with a guess. */
+  problems: Record<string, string>;
+  default: { provider: string; model: string };
+}
+
+/** What the picker holds, and what travels on a request that spends tokens.
+ *  Null means "whatever the deployment is configured for". */
+export interface ModelChoice {
+  provider: string;
+  model: string;
+}
+
 export interface ServerConfig {
   defaults: {
-    max_steps: number;
-    timeout_seconds: number;
-    allowed_domains: string[];
-    require_approval: boolean;
-    screenshot_every_step: boolean;
-    headless: boolean;
     browser: string;
+    headless: boolean;
+    trace: boolean;
+    screenshots: string;
+    healing: boolean;
   };
+  /** What to call this deployment: "Dev", "UAT", "Production". Blank on a
+   *  single-environment install, and then the badge is not shown. */
+  environment: string;
+  recorder: { enabled: boolean };
+  /** The third deployment role. `reason` says why not, when it is off. */
+  agent: { enabled: boolean; reason: string | null };
   model: string;
   /** Always "bedrock" — the only provider. */
   provider: string;
@@ -233,17 +275,60 @@ export interface ServerConfig {
 export type UseCaseStatus = 'draft' | 'ready' | 'archived';
 
 /** One rung of the locator ladder, most durable first. */
+export type LocatorStrategy =
+  | 'role'
+  | 'label'
+  | 'placeholder'
+  | 'test_id'
+  | 'alt_text'
+  | 'css'
+  | 'text'
+  | 'nth';
+
 export interface Locator {
-  strategy: 'role' | 'css' | 'text' | 'nth';
+  strategy: LocatorStrategy;
   role?: string | null;
   name?: string | null;
   selector?: string | null;
   text?: string | null;
   nth?: number;
+  /** Whether the name must be the element's whole accessible name. Playwright
+   *  matches a substring by default, so "Invite" also finds "+ Invite User". */
+  exact?: boolean;
+  /** Search inside this element rather than the whole page. Recursive. */
+  within?: Locator | null;
+  /** Keep only matches whose text contains this. */
+  has_text?: string | null;
+  /** iframes to descend through, outermost first, as CSS selectors. */
+  frames?: string[];
+}
+
+/** One rung's verdict from the locator check, against a live page. */
+export interface LocatorCheckResult {
+  describe: string;
+  total: number;
+  visible: number;
+  matches: string[];
+  ok: boolean;
+  reason: string;
+}
+
+export interface LocatorCheckReport {
+  page_url: string;
+  page_title: string;
+  results: LocatorCheckResult[];
 }
 
 export interface Assertion {
-  kind: 'url_contains' | 'text_present' | 'element_visible' | 'element_count' | 'title_contains';
+  kind:
+    | 'url_contains'
+    | 'text_present'
+    | 'element_visible'
+    | 'element_count'
+    | 'title_contains'
+    | 'attribute_contains';
+  /** attribute_contains only: which attribute is read. */
+  attribute?: string;
   value?: string | null;
   count?: number | null;
   locator?: Locator | null;
@@ -262,6 +347,14 @@ export interface UseCaseStep {
   id: string;
   action: string;
   description: string;
+  /**
+   * What the step is *for*, in the recorder's own words.
+   *
+   * `description` renders the locator, which says what the step does and
+   * nothing about why. Read by people and by the two prompts that ask a model
+   * where a control went; never by anything that runs.
+   */
+  intent: string;
   locators: Locator[];
   url?: string | null;
   value?: string | null;
@@ -270,10 +363,21 @@ export interface UseCaseStep {
   code?: string | null;
   assert?: Assertion | null;
   wait_for?: Record<string, unknown> | null;
+  /** Run this step only when this check holds. null means always. */
+  when: Assertion | null;
+  /**
+   * What the element said when the step was recorded.
+   *
+   * Checked before acting, and only when the locator that matched does not
+   * itself match on text: a CSS path or a bare role has proved that something
+   * sits in that position, not that it is the same control.
+   */
+  expect_text: string;
   optional: boolean;
   on_failure: 'abort' | 'continue' | 'heal';
   timeout_ms: number;
-  rejected_locators: Locator[];
+  rejected_locators: Locator[];  /** `extract_rows` — the fields read out of each matched row. */
+  columns?: { name: string; selector: string; attribute?: string }[];
 }
 
 export interface InputSpec {
@@ -290,6 +394,15 @@ export interface SecretSpec {
   required: boolean;
   description: string;
 }
+
+/**
+ * How much a model may do while a use case runs.
+ *
+ * `null` means the document never chose and follows the deployment. It is not
+ * the same as "strict": a use case published before the choice existed was
+ * being healed if the deployment allowed it, and must keep being.
+ */
+export type UseCaseMode = 'strict' | 'guided' | 'explore';
 
 export interface UseCase {
   schema_version: number;
@@ -312,6 +425,18 @@ export interface UseCase {
   row_steps: UseCaseStep[];
   teardown_steps: UseCaseStep[];
   outputs: string[];
+  /** Seconds between rows; null uses the deployment default. */
+  row_delay_seconds: number | null;
+  /** Which target supplies the base URL; "" means the recorded one. */
+  target: string;
+  /** How it runs; null follows the deployment. */
+  mode: UseCaseMode | null;
+  /** Which authoring path produced this document. */
+  authored_by: 'person' | 'agent';
+  /** The origin this was recorded against, used when no target is named. */
+  base_url: string;
+  /** The whole flow in plain language, written after recording. */
+  instructions: string;
   warnings: string[];
   /** Recorded calls that did NOT become steps, and why. */
   dropped: string[];
@@ -324,25 +449,13 @@ export interface UseCaseSummary {
   name: string;
   description: string;
   status: UseCaseStatus;
+  /** Mirrored from the definition so a list needs no extra query. */
+  mode: UseCaseMode | null;
+  authored_by: 'person' | 'agent';
   current_version: number;
   source_run_id: string | null;
   created_at: string;
   updated_at: string;
-}
-
-export interface DistillResult {
-  usecase_id: string;
-  version: number;
-  name: string;
-  /** What the model proposed. Editable before you move on. */
-  suggested_name: string;
-  status: UseCaseStatus;
-  warnings: string[];
-  setup_steps: number;
-  row_steps: number;
-  inputs: string[];
-  secrets: string[];
-  blocked_scripts: string[];
 }
 
 export interface ExecutionRecord {
@@ -389,10 +502,283 @@ export interface BatchDetail {
   pending: number;
 }
 
+/**
+ * What one column of an uploaded file holds, as far as the file can say.
+ *
+ * `kind` is inferred and never applied — the values themselves are always the
+ * text that will be typed into the page. It is here so the mapper can refuse
+ * to offer a date column for a number field, and so a person can see at a
+ * glance which column is which.
+ */
+/** One line of a recording that could not be represented as a step. */
+export interface UnsupportedLine {
+  line: number;
+  source: string;
+  reason: string;
+}
+
+export interface RecordedStep {
+  id: string;
+  action: string;
+  url: string | null;
+  value: string | null;
+  /** The first rung of the ladder, rendered for a human. */
+  locator: string;
+}
+
+/**
+ * A recording in progress, or one that has finished.
+ *
+ * `recording` means a browser window is open and the user is working in it.
+ * Everything below `status` is present only once it is `ready`.
+ */
+export interface RecordingDetail {
+  recording_id: string;
+  status: 'recording' | 'parsing' | 'ready' | 'failed' | 'cancelled';
+  name: string;
+  start_url: string;
+  started_at: number;
+  finished_at: number | null;
+  error: string | null;
+  owner_email: string;
+  summary?: string;
+  domains?: string[];
+  steps?: RecordedStep[];
+  /** Values typed during the recording, for the user to name and classify. */
+  typed?: string[];
+  /** Elements pointed at with the recorder's assert buttons. Each is offered
+   *  as either a check or a value to read into the results file. */
+  captured?: {
+    describe: string;
+    label: string;
+    value: string;
+    kind: 'text' | 'value';
+    line: number;
+  }[];
+  /** The same values, each with the control it went into. `label` is what was
+   *  on screen; it is empty when the control had no accessible name, which is
+   *  common for a custom dropdown. */
+  values?: { value: string; action: string; label: string }[];
+  unsupported?: UnsupportedLine[];
+}
+
+/**
+ * One step of a finished run, read back as a row rather than as an event.
+ *
+ * `pixel_diff` is the fraction of the page that changed since the last run
+ * that worked. `null` means there was nothing to compare against — a first
+ * run, or a step that has never succeeded — which is a different thing from
+ * `0` meaning nothing moved.
+ */
+export interface RunStep {
+  id: string;
+  run_id: string;
+  seq: number;
+  step_id: string;
+  phase: string;
+  action: string;
+  locator: string;
+  /** Which rung of the ladder matched. Above zero means the recording is drifting. */
+  locator_rung: number | null;
+  /** Where the step happened; the domain scopes any fix recorded from it. */
+  page_url: string;
+  status: 'succeeded' | 'failed' | 'skipped' | 'healed';
+  duration_ms: number;
+  error: string | null;
+  row_index: number | null;
+  screenshot_id: string | null;
+  baseline_id: string | null;
+  pixel_diff: number | null;
+  /** The ratio in words, so nobody has to read four decimal places. */
+  diff: string;
+  screenshot_url: string | null;
+  baseline_url: string | null;
+  created_at: string;
+}
+
+/**
+ * A locator that broke, and what fixed it.
+ *
+ * `confirmed_by` is `"model"` when healing worked it out alone, or an email
+ * when a person did. That distinction is not decorative: a fix somebody looked
+ * at is ranked above a closer match nobody checked when these are put in front
+ * of the model.
+ */
+export interface RememberedFix {
+  id: string;
+  usecase_id: string | null;
+  domain: string;
+  step_id: string;
+  error_kind: string;
+  old_locator: { name?: string; selector?: string } | null;
+  new_locator: { name?: string; selector?: string } | null;
+  explanation: string;
+  confirmed_by: string;
+  created_at: string;
+}
+
+export interface ColumnProfile {
+  name: string;
+  kind: 'text' | 'integer' | 'number' | 'date' | 'boolean' | 'empty';
+  /** A recognised value shape, where every populated value has it. */
+  shape: 'email' | 'url' | 'phone' | 'date' | null;
+  non_null: number;
+  nulls: number;
+  distinct: number;
+  examples: string[];
+}
+
+export interface DatasetSummary {
+  id: string;
+  name: string;
+  filename: string;
+  source: string;
+  row_count: number;
+  columns: ColumnProfile[];
+  /** A preview, not the file. A listing returns none of these. */
+  sample: Record<string, string>[];
+  warnings: string[];
+  created_at: string;
+  owner_email: string;
+}
+
+/** One declared input, and what the dataset offers for it. */
+export interface MappingSuggestion {
+  field: string;
+  column: string | null;
+  score: number;
+  /** Above the confidence threshold — offered pre-selected rather than as a guess. */
+  confident: boolean;
+  reason: string;
+  alternatives: { column: string; score: number; reason: string }[];
+}
+
+export interface MappingResult {
+  usecase_id: string;
+  dataset_id: string;
+  suggestions: MappingSuggestion[];
+  /** Fields whose match is absent or too close to call. */
+  unresolved: string[];
+  columns: string[];
+}
+
 export interface CredentialSummary {
   id: string;
   name: string;
   slots: string[];
   created_at: string;
   last_used_at: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// The agent
+// ---------------------------------------------------------------------------
+
+/** Everything a session needs to start. Budgets are per-session because they
+ *  are a judgement: exploring an unfamiliar site is worth more steps than
+ *  re-recording one somebody already knows. */
+export interface StartAgentSession {
+  task: string;
+  target?: string;
+  start_url?: string;
+  name?: string;
+  credential_id?: string | null;
+  sample?: Record<string, string>;
+  may_write?: boolean;
+  /** Show a real window instead of running headless. Unset follows the
+   *  deployment default. */
+  headless?: boolean;
+  budget_steps?: number;
+  budget_usd?: number;
+}
+
+/** What a session cost so far. */
+export interface AgentSpend {
+  steps: number;
+  /** Every token the provider was sent or returned, cache reads included. */
+  tokens: number;
+  /** How many of those were a prompt prefix recognised from cache. */
+  cache_read_tokens: number;
+  /**
+   * What the token ceiling is enforced against: `tokens` less the cache reads.
+   *
+   * A session recorded 405,305 tokens and cost 44 cents, nearly all of it one
+   * prefix re-read on every turn. Counting that against a runaway ceiling
+   * stopped it mid-record with half its money unspent.
+   */
+  fresh_tokens: number;
+  usd: number;
+  llm_calls: number;
+  seconds: number;
+}
+
+/** Whether the distilled draft replays. The whole point of the phase: the
+ *  agent does not get to claim it recorded something. */
+export interface AgentVerification {
+  ran: boolean;
+  ok: boolean;
+  failed_step: string;
+  error: string;
+  outputs: Record<string, unknown>;
+  duration_ms: number;
+  skipped: string;
+}
+
+export interface AgentSessionDetail {
+  id: string;
+  run_id: string;
+  task: string;
+  start_url: string;
+  /** running · awaiting_approval · succeeded · partial · failed · cancelled */
+  status: string;
+  error: string | null;
+  /** Set while it is stopped, waiting for a person. */
+  awaiting: {
+    approval_id: string;
+    call: { id: string; name: string; input: Record<string, unknown> };
+    categories: string;
+  } | null;
+  summary: string;
+  stopped_by: string;
+  spend: Partial<AgentSpend>;
+  steps: number;
+  marks: { kind: string; name: string; after_call: number }[];
+  /** How the request was read before the browser opened: the goal, the values
+   *  expected to vary per row, what proves a row worked, and what the request
+   *  did not say. null when the deployment runs no brief pass. */
+  brief: {
+    goal: string;
+    per_row: { name: string; means: string }[];
+    done_when: string[];
+    cautions: string[];
+    unclear: string[];
+  } | null;
+  unfinished: string;
+  use_case: UseCase | null;
+  draft_warnings: string[];
+  verification: Partial<AgentVerification>;
+}
+
+
+/** What a workspace has spent with a model this month, and its ceiling.
+ *  `limit_usd` null means no ceiling was ever set, which is not the same as a
+ *  ceiling of zero. */
+export interface WorkspaceSpend {
+  usd: number;
+  tokens: number;
+  runs: number;
+  since: string;
+  limit_usd: number | null;
+  remaining_usd: number | null;
+}
+
+/** What a batch is expected to cost, as a range. Ranges rather than numbers
+ *  because precision here would imply an accuracy the estimate cannot have. */
+export interface BatchEstimate {
+  mode: UseCaseMode;
+  rows: number;
+  low_usd: number;
+  high_usd: number;
+  note: string;
+  over_budget: boolean;
 }

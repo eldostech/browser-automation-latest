@@ -20,9 +20,9 @@ from healing import (
     apply_repairs,
 )
 from llm import LLMTurn, ToolCallRequest
-from replay import UseCaseExecutor
+from engine import UseCaseExecutor
 from snapshot import parse as parse_snapshot
-from test_replay import SIGNED_IN, SIGNED_OUT, ScriptedMCP, role
+from fake_browser import SIGNED_IN, SIGNED_OUT, role, session_serving
 from usecase import Locator, Step, UseCase
 
 RENAMED = """### Page
@@ -122,10 +122,18 @@ async def test_only_the_controls_on_the_page_are_offered():
 
 
 async def test_the_healer_cannot_invent_a_locator():
-    """Structural: the tool schema only accepts an index into the real page."""
+    """Structural: the tool schema only accepts an index into the real page.
+
+    Everything else it may return is prose about *why* -- a confidence, a
+    reason, an explanation a person reads later. None of it can name an
+    element, which is what stops a hallucinated selector having any route into
+    a use case.
+    """
     properties = CHOOSE_TOOL["input_schema"]["properties"]
-    assert set(properties) == {"index", "confidence", "reason"}
+    assert set(properties) == {"index", "confidence", "reason", "explanation"}
+    assert CHOOSE_TOOL["input_schema"]["required"] == ["index"]
     assert "selector" not in str(properties)
+    assert "locator" not in str(properties)
 
 
 @pytest.mark.parametrize("index", [-1, 99, None])
@@ -176,7 +184,7 @@ async def test_no_healer_means_no_repair_and_no_model():
         row_steps=[broken_step()],
     )
     result = await UseCaseExecutor(
-        use_case, ScriptedMCP([RENAMED]), RecordingSink(), run_id="r1"
+        use_case, session_serving([RENAMED])(None), RecordingSink(), run_id="r1"
     ).run_row({})
 
     assert not result.ok
@@ -188,7 +196,7 @@ async def test_a_heal_step_is_repaired_and_the_row_then_succeeds():
         name="x", allowed_domains=["example.com"],
         row_steps=[broken_step()],
     )
-    mcp = ScriptedMCP([RENAMED])
+    mcp = session_serving([RENAMED])(None)
     sink = RecordingSink()
     llm = ChoosingLLM(index=2)
     runner = UseCaseExecutor(
@@ -199,7 +207,15 @@ async def test_a_heal_step_is_repaired_and_the_row_then_succeeds():
 
     assert result.ok, result.error
     assert llm.calls == 1
-    assert [args["target"] for name, args in mcp.calls if name == "browser_click"] == ["ref=e3"]
+    # The repaired step clicked the control the healer chose. It is described
+    # by role and name now rather than by an MCP ref, because the engine
+    # addresses elements with locators.
+    # The page renamed "Sign in" to "Log in"; the healer found the control
+    # under its new name and the retry clicked that. The target is described by
+    # role and name now rather than by an MCP ref, because the engine addresses
+    # elements with locators.
+    clicked = [args["target"] for name, args in mcp.calls if name == "click"]
+    assert clicked and "Log in" in clicked[0]
 
 
 async def test_a_repair_is_recorded_and_labelled_in_the_timeline():
@@ -208,7 +224,7 @@ async def test_a_repair_is_recorded_and_labelled_in_the_timeline():
     )
     sink = RecordingSink()
     runner = UseCaseExecutor(
-        use_case, ScriptedMCP([RENAMED]), sink, run_id="r1",
+        use_case, session_serving([RENAMED])(None), sink, run_id="r1",
         healer=StepHealer(ChoosingLLM(index=2)),
     )
     await runner.run_row({})
@@ -228,7 +244,7 @@ async def test_a_step_that_did_not_ask_for_healing_is_not_offered_it():
     )
     llm = ChoosingLLM(index=2)
     result = await UseCaseExecutor(
-        use_case, ScriptedMCP([RENAMED]), RecordingSink(), run_id="r1",
+        use_case, session_serving([RENAMED])(None), RecordingSink(), run_id="r1",
         healer=StepHealer(llm),
     ).run_row({})
 
@@ -244,7 +260,7 @@ async def test_a_repair_that_still_fails_leaves_the_row_failed():
     # chosen element does not exist by making the healer point at nothing.
     llm = ChoosingLLM(index=None)
     result = await UseCaseExecutor(
-        use_case, ScriptedMCP([RENAMED]), RecordingSink(), run_id="r1",
+        use_case, session_serving([RENAMED])(None), RecordingSink(), run_id="r1",
         healer=StepHealer(llm),
     ).run_row({})
 
@@ -306,9 +322,9 @@ def test_a_duplicate_repair_does_not_double_the_ladder():
 # --- the structural guarantee still holds ----------------------------------
 
 
-def test_replay_still_never_imports_an_llm():
+def test_the_engine_still_never_imports_an_llm():
     """Healing lives in healing.py precisely so this stays true."""
-    source = (Path(__file__).parent.parent / "replay.py").read_text(encoding="utf-8")
+    source = (Path(__file__).parent.parent / "engine.py").read_text(encoding="utf-8")
     assert "import llm" not in source
     assert "from llm" not in source
 
@@ -369,3 +385,162 @@ def test_no_factory_means_no_healer_even_when_enabled(tmp_path):
         EventBus(),
     )
     assert manager.make_healer() is None
+
+
+# --- what gets remembered, and when ----------------------------------------
+
+
+class RecordingMemory:
+    """A healing memory that only records what it was asked to write."""
+
+    def __init__(self) -> None:
+        self.written: list[dict] = []
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def recall(self, **_: object) -> list:
+        return []
+
+    async def remember(self, **fields: object) -> None:
+        self.written.append(dict(fields))
+
+
+async def test_proposing_a_repair_does_not_remember_it_yet():
+    """The write used to happen here, which recorded what the model *believed*
+    about a page rather than what turned out to be true of it."""
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert repair is not None
+    assert memory.written == [], "nothing is known yet about whether this worked"
+
+
+async def test_a_repair_that_worked_is_remembered():
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, True)
+
+    assert len(memory.written) == 1
+    assert memory.written[0]["new_locator"]["name"] == "Log in"
+
+
+async def test_a_repair_that_failed_is_not_remembered():
+    """The case the old write could not see, and the one that matters.
+
+    Recall puts past fixes in front of the model as context, so a confident
+    wrong answer does not merely fail to help -- it argues for repeating
+    itself, every time that site breaks again.
+    """
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, False)
+
+    assert memory.written == []
+
+
+async def test_a_repair_the_model_was_unsure_of_is_not_remembered_even_when_it_worked():
+    """A guess that happened to land is still a guess, and it is exactly the
+    answer not to offer as evidence next time."""
+    memory = RecordingMemory()
+    healer = StepHealer(ChoosingLLM(index=2), memory=memory)
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+    repair.confidence = "low"
+
+    await healer.confirm(repair, True)
+
+    assert memory.written == []
+
+
+async def test_confirming_without_a_memory_is_harmless():
+    """A healer built without an embedder has no memory behind it, and the
+    executor calls `confirm` on every repair regardless."""
+    healer = StepHealer(ChoosingLLM(index=2))
+    repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
+
+    await healer.confirm(repair, True)
+
+
+# --- the page as it was, beside the page as it is --------------------------
+
+
+AS_RECORDED = """### Page
+- Page URL: https://example.com/signin
+### Snapshot
+```yaml
+- textbox "Username" [ref=e1]
+- textbox "Password" [ref=e2]
+- button "Sign in" [ref=e3]
+```"""
+
+
+async def test_the_healer_is_shown_the_page_as_it_was_when_the_step_worked():
+    """Given only the current page, a repair chooses between plausible
+    controls. Given both, a renamed control is obvious side by side and close
+    to invisible from the new page alone."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.recorded_page = AS_RECORDED
+
+    await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert "when the step was recorded and working" in llm.last_user_message
+    assert 'button "Sign in"' in llm.last_user_message, "the control that is gone"
+    assert 'button "Log in"' in llm.last_user_message, "and the one that replaced it"
+
+
+async def test_a_step_with_no_recorded_page_asks_exactly_as_it_did_before():
+    """Every recording made before this existed takes this path, and the
+    prompt must not grow an empty section for them."""
+    llm = ChoosingLLM(index=2)
+
+    await StepHealer(llm).repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert "when the step was recorded" not in llm.last_user_message
+
+
+async def test_an_unparseable_recorded_page_is_ignored_rather_than_fatal():
+    """Context is a bonus. Losing the repair over it would be the wrong trade."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.recorded_page = "this is not a snapshot at all"
+
+    repair = await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert repair is not None
+
+
+# --- what the step was for ------------------------------------------------
+
+
+async def test_the_healer_is_told_what_the_step_was_for():
+    """The question changes from "which of these forty controls resembles a
+    link named Billing" to "which of these opens the customer's billing tab",
+    and the second is the one a person answers without thinking.
+
+    The sentence is not new work for anybody: the authoring agent already has
+    to write one before every tool call. It was being thrown away."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.intent = "opens the customer's billing tab"
+
+    await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert "what it is for: opens the customer's billing tab" in llm.last_user_message
+
+
+async def test_a_step_with_no_purpose_leaves_no_empty_bullet():
+    """Every codegen recording and everything recorded before `Step.intent`
+    existed takes this path."""
+    llm = ChoosingLLM(index=2)
+
+    await StepHealer(llm).repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert "what it is for" not in llm.last_user_message

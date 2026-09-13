@@ -1,0 +1,41 @@
+# Upgrade the schema, once, before the rollout.
+#
+# A Job rather than an init container on every pod. Alembic takes an advisory
+# lock, so concurrent init containers would serialise rather than corrupt --
+# but a Job makes "has the schema been upgraded" a thing you can look at, and a
+# failed upgrade stops the rollout instead of crash-looping every replica with
+# the real error buried in the third pod's logs.
+#
+# This is also where `CREATE EXTENSION vector` happens, so the database user
+# needs rights to create it -- or an administrator should have created it
+# beforehand, in which case the migration's `IF NOT EXISTS` makes this a no-op.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: browser-automation
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: browser-automation
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: browser-automation:latest
+          command: ["python", "-m", "alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef: { name: browser-automation }
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: browser-automation, key: DB_PASSWORD }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }

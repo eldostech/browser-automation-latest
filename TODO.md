@@ -4,6 +4,31 @@ Derived from [`docs/review/architecture-review.md`](docs/review/architecture-rev
 (24 Aug 2026). That document carries the evidence and the reasoning; this file is
 the actionable list.
 
+> **The redesign supersedes parts of this file.**
+> [`docs/design/deterministic-automation-platform.md`](docs/design/deterministic-automation-platform.md)
+> replaces the LLM-agent recorder with `playwright codegen` and the MCP replay
+> with async Playwright. Items below that concern `agent.py`, `mcp_client.py`,
+> `chat.py`, `graph.py` or `checkpoints.py` — **B5**, **C3**, **C4** — are
+> resolved by deleting that code rather than by doing the work. Its P2 has also
+> landed: uploads are a resource (`ingest.py`, `mapping.py`, the `datasets`
+> table), and `batch.py` no longer reads files. P3 has landed too: `codegen.py`
+> parses what `playwright codegen` writes, `recorder.py` owns the subprocess,
+> and a recording costs nothing. The agent recorder still exists and is deleted
+> in P4 -- which has now landed: the agent, its MCP client, the distiller and
+> the old replay engine are gone, and `engine.py` drives Playwright directly.
+> **B5** and **C3** are resolved by that deletion rather than by doing the work.
+> **C4** is the one that survived and got sharper: `chat.py` is now the *only*
+> reason two message dialects exist, because healing and repair still speak
+> the Anthropic-shaped one. Phases 5 to 7 have landed too: the step trail and
+> its visual diff, healing memory on pgvector with the human-in-the-loop, and
+> the EKS manifests under `deploy/`. **E2** (metrics) is now the largest gap:
+> token spend per repair and locator-drift rate are recorded per step and
+> nothing aggregates them, and "zero tokens per row" is the product's central
+> claim. **C2** (merge
+> `healing.py` and `repair.py`) is folded into the redesign's P6, and **E3**
+> (one real end-to-end test) becomes a precondition of its P4 rather than a
+> nice-to-have. The redesign's phase list is in §10 of that document.
+
 Phases are ordered by **dependency, not preference**. Two orderings matter and are
 easy to get wrong:
 
@@ -50,10 +75,11 @@ the WebSocket are unauthenticated, and no table has an owner column.
       Backend on 3.11/3.13 against a real Postgres, `alembic check`, frontend
       type-check and build, and a secret scan. The scan caught a real password
       during this work, which is the argument for automating the habit.
-- [x] **B1 — Persistent checkpointer** *(done — `checkpoints.py`)*
-      Postgres where psycopg's async mode can run, a SQLite *file* on Windows
-      where it cannot (psycopg needs a Selector loop; the browser subprocess
-      needs Proactor). Durable on both.
+- [x] **B1 — Persistent checkpointer** *(done, then simplified — `agent/graph.py:memory_checkpointer`)*
+      The Postgres/SQLite dual-backend checkpointer (`checkpoints.py`) that
+      this line used to describe is gone: the `create_agent` rewrite moved to
+      LangGraph's in-memory saver, one per session. `checkpoints.py` no
+      longer exists — do not point new readers at it.
 - [x] **B2 + D2 — Postgres via SQLAlchemy 2.0 + Alembic** *(done)*
       Ownership columns were born in the initial migration, as planned.
       Artifacts still go to local disk — S3 remains outstanding.
@@ -61,12 +87,19 @@ the WebSocket are unauthenticated, and no table has an owner column.
       Postgres rather than Redis: no new infrastructure. The notification
       carries a pointer, not the payload, because a snapshot exceeds NOTIFY's
       8000-byte cap.
-- [x] **B4 — Durable job queue** *(done — `jobs.py`)*
+- [x] **B4 — Durable job queue** *(done and wired — `jobs.py`, `worker.py`)*
       `SELECT ... FOR UPDATE SKIP LOCKED` with leases rather than lock flags,
       so a worker that dies releases its work. Per-workspace concurrency
-      limits. **Not yet wired**: `ReplayManager` still runs batches in-process;
-      moving them onto the queue is the remaining step.
-- [ ] **B5 — Browser session pool** *(Medium, M)*
+      limits. Batches are enqueued by `ReplayManager.start_batch` and run by
+      `run_batch_job`, in this process when `WORKER_ENABLED` (the default) or
+      in `make worker` beside it. The `ExecutionBusy` single slot is gone.
+      Two things fell out of it: a batch now stores its input rows (resume used
+      to replay blanks for rows it never attempted), and a batch takes a
+      credential id rather than inline secrets. `tests/test_jobs.py` covers the
+      queue, which had no tests at all — a large part of how it stayed unwired.
+- [ ] ~~**B5 — Browser session pool**~~ *(superseded — the redesign's P4 removes
+      the per-run MCP fork; pooling belongs to `engine.py` if it is still needed
+      once one browser serves a whole batch)*
       Every run forks a Chromium via Playwright MCP; ten users means ten forks on
       one box. Put a pool with per-tenant quotas and TTLs behind the existing
       `MCPBrowserSession` seam rather than changing callers.
@@ -88,7 +121,8 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
 - [x] **D1 — Routers and a service layer** *(done)*
       `main.py` 1,280 → 197 lines. Seven routers, `services.py`, and shared
       404 lookups in `deps.py` replacing 21 hand-written raises.
-- [ ] **C2 — Merge `healing.py` and `repair.py` onto one kernel** *(Medium, M)*
+- [ ] **C2 — Merge `healing.py` and `repair.py` onto one kernel** *(Medium, M —
+      the last piece of the redesign's P6)*
       274 + 450 lines implementing the same idea at two moments (mid-run vs
       post-mortem): two prompts, two choose-element-by-index schemas, two budgets.
       The safety invariant — *the model cannot invent a locator* — is implemented
@@ -99,12 +133,14 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
       healing and repair still speak Anthropic-shaped dicts. Migrating those three
       call sites to LangChain messages deletes **≈150 lines** and one of the two
       message dialects. Already flagged in the `f0037a0` commit message.
-- [ ] **C3 — Approvals via LangGraph `interrupt()`** *(Medium, M — after B1)*
-      Two pause mechanisms coexist today: the graph, and a custom future-based
-      rendezvous (`RunApprovalGate`). With a persistent checkpointer,
-      `interrupt()` + `Command(resume=)` makes a **pending approval survive a
-      restart** — a genuinely new property. Restructures the run-task lifecycle and
-      the approve endpoint, so it needs its own change.
+- [x] **C3 — Approvals via LangGraph `interrupt()`** *(done —
+      `HumanInTheLoopMiddleware` in `agent/graph.py`)*
+      An irreversible action suspends the graph via `interrupt()`; `resume()`
+      answers with `Command(resume=...)`. The custom future-based rendezvous
+      is gone. The one caveat B1 used to promise — surviving a process
+      restart — no longer holds now that the checkpointer is in-memory rather
+      than Postgres-backed; a pending approval survives within the process,
+      not across a restart.
 - [x] **D3 — `Settings` by injection** *(done)*
       The module-level `settings` object is gone; `create_app(settings)` is a
       factory. This is what closed the "`.env` leaks into tests" class.
@@ -128,10 +164,15 @@ This is where "remove boilerplate" is genuinely correct, and it is worth roughly
       **Token spend per role and locator-drift rate are already recorded per step
       and nothing aggregates them** — and "zero tokens" is the product's central
       claim, so the dashboard should prove it continuously.
-- [ ] **E3 — One end-to-end test against a real browser** *(Medium, M)*
-      Every test fakes the MCP session, so the first real batch is the first real
-      proof. Add an opt-in nightly run (the existing `RUN_E2E=1` pattern):
-      record → distil → replay against a local static site.
+- [x] **E3 — One end-to-end test against a real browser** *(done —
+      `tests/test_e2e_engine.py`)*
+      Eleven tests, a real Chromium, a two-page site served from a temp
+      directory, nothing stubbed: record a codegen script, parse it, replay it,
+      and check parameterisation per row, the setup/row split, locator drift,
+      assertions, extraction, screenshots, traces and the allowlist. Writing it
+      found three things the design document had asserted and should not have.
+      Run with `make test-e2e`.
+
 - [x] **E4 — Container hardening** *(done)*
       Non-root (`pwuser`), an explicit liveness `HEALTHCHECK` kept separate
       from readiness, and compose runs migrations before the server starts.

@@ -68,6 +68,13 @@ class DeclaredFieldPayload(BaseModel):
     #: Write-only. No endpoint returns this for a secret field, and the value
     #: of a secret is never persisted at all.
     value: str = Field(max_length=4000)
+    #: Which of the recording's typed values this field names, as a position in
+    #: ``Recording.typed``. Values alone cannot identify a field: type the same
+    #: text into two boxes -- a name and a description, say -- and both steps
+    #: collapse onto whichever field was declared last, leaving the other
+    #: declared but unreferenced. The position tells them apart. Optional, so a
+    #: client that does not send it keeps the older value-matching behaviour.
+    index: int | None = Field(default=None, ge=0)
     secret: bool = False
     description: str = Field(default="", max_length=300)
     example: str = Field(default="", max_length=200)
@@ -84,7 +91,27 @@ class DeclaredFieldPayload(BaseModel):
         return stripped
 
 
-class CreateRunRequest(BaseModel):
+class ModelOverride(BaseModel):
+    """Which model this request should spend on, if not the configured one.
+
+    On the request rather than in configuration, and rather than in a "current
+    model" somewhere on the server, because comparing two models means running
+    two at once. A setting would serialise that, and two people trying
+    different models in the same workspace would silently overwrite each other.
+
+    Both fields optional and independent. Naming only a provider takes that
+    provider's default, which is useful for Bedrock and refused for OpenRouter,
+    where a provider fronting hundreds of models has no sensible default to
+    pick on your behalf.
+    """
+
+    #: "bedrock" or "openrouter". Validated in `llm.ModelChoice.resolve` rather
+    #: than by an enum here, so adding a provider is one list in one file.
+    provider: str | None = Field(default=None, max_length=40)
+    model: str | None = Field(default=None, max_length=200)
+
+
+class CreateRunRequest(ModelOverride):
     task: str = Field(min_length=1, max_length=8000)
     start_url: str | None = None
 
@@ -182,11 +209,21 @@ class DistillRequest(BaseModel):
     save_credential_as: str | None = Field(default=None, max_length=120)
 
 
-class RepairRequest(BaseModel):
+class RepairRequest(ModelOverride):
     """Which failure to mend. Either is enough to find the rest."""
 
     execution_id: str | None = None
     run_id: str | None = None
+
+
+class DescribeRequest(ModelOverride):
+    """Write down what a use case does, in plain language.
+
+    No arguments of its own: what to describe is the use case, and which model
+    writes it is the only choice. Kept a body rather than a bare POST so the
+    model override has somewhere to live -- somebody comparing models wants to
+    compare this too.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +239,85 @@ class CredentialRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Agent tool servers
+# ---------------------------------------------------------------------------
+
+
+class StdioConnection(BaseModel):
+    """What it takes to open one stdio MCP server.
+
+    Its own model rather than a bare dict, so a malformed registration is
+    refused at the boundary rather than surfacing as a subprocess that will
+    not start, three steps into an agent session nobody can debug from there.
+    """
+
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class ToolServerRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    #: Only stdio exists today; the field exists so an sse/http server later
+    #: is a new value here rather than a new endpoint.
+    transport: Literal["stdio"] = "stdio"
+    connection: StdioConnection
+    enabled: bool = True
+
+
+class ToolServerPreviewRequest(BaseModel):
+    """Same shape as registering one, but nothing is saved -- see the
+    ``/preview`` route: this is what a person answers *before* deciding
+    whether a server is worth registering at all."""
+
+    transport: Literal["stdio"] = "stdio"
+    connection: StdioConnection
+
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
 
-class ExecuteRequest(BaseModel):
+class ExtractionChoice(BaseModel):
+    """One element the person pointed at, and what they want done with it.
+
+    ``line`` identifies which captured element this is about -- it is the line
+    of the recording it came from, which is stable and does not depend on the
+    client keeping a list in order.
+    """
+
+    line: int
+    #: The spreadsheet column to put it under. Empty means "not a value" --
+    #: keep it as a check, or drop it.
+    name: str = Field(default="", max_length=64)
+
+
+class DatasetFromRunRequest(BaseModel):
+    """Make a dataset out of what a discovery run extracted."""
+
+    #: Exactly one of these. A batch, because discovery is often itself a batch
+    #: -- one row per page of a paginated list -- and their rows are one list.
+    execution_id: str = ""
+    batch_id: str = ""
+    #: The name the ``extract_rows`` step landed its rows under.
+    output: str = Field(min_length=1, max_length=64)
+    name: str = Field(default="", max_length=200)
+
+
+class TargetRequest(BaseModel):
+    """The address this deployment gives one target."""
+
+    base_url: str = Field(min_length=1, max_length=2000)
+    description: str = Field(default="", max_length=300)
+
+
+class ExecuteRequest(ModelOverride):
     inputs: dict[str, Any] = Field(default_factory=dict)
+    #: Run against this address instead of the use case's target. For a one-off
+    #: against a branch deployment or one customer's tenant, where a standing
+    #: target would be ceremony for a single run.
+    base_url: str = Field(default="", max_length=2000)
     #: Bind stored credentials by id, or pass values inline for a one-off.
     credential_id: str | None = None
     secrets: dict[str, str] | None = None
@@ -216,9 +326,73 @@ class ExecuteRequest(BaseModel):
     browser: str | None = None
 
 
-class BatchRequestBody(BaseModel):
-    """Rows arrive as CSV text, a base64 .xlsx workbook, or JSON objects."""
+class StartRecordingRequest(BaseModel):
+    """Open a browser window at a URL and record what happens in it."""
 
+    start_url: str
+    name: str = ""
+
+
+class SaveRecordingRequest(BaseModel):
+    """Turn a finished recording into a draft use case.
+
+    ``fields`` names the values that were typed: which become per-row inputs,
+    and which are credentials. It is the same payload the distil path takes,
+    because it answers the same question about the same kind of recording.
+    """
+
+    name: str = ""
+    description: str = ""
+    fields: list[DeclaredFieldPayload] = []
+    #: Which of the pointed-at elements are values to read out, and what to
+    #: call each. Anything not named here stays a check, as codegen recorded it.
+    extractions: list[ExtractionChoice] = []
+
+
+class RememberFixRequest(BaseModel):
+    """A repair a person worked out, recorded so the next run recalls it.
+
+    ``page`` and ``page_url`` are what the failure looked like: the URL scopes
+    recall to a domain, and the page is what gets embedded. Both come back from
+    the failure the user is looking at, so the UI does not ask them to type
+    anything it already knows.
+    """
+
+    step_id: str
+    page_url: str
+    page: str = ""
+    step_summary: str = ""
+    wanted: str = ""
+    explanation: str = Field(min_length=1, max_length=2000)
+    usecase_id: str | None = None
+    old_locator: dict[str, Any] | None = None
+    new_locator: dict[str, Any] | None = None
+    error_kind: str = "not_found"
+
+
+class MappingRequest(BaseModel):
+    """Which dataset to line up against which version of a use case."""
+
+    dataset_id: str
+    version: int | None = None
+
+
+class BatchRequestBody(ModelOverride):
+    """Rows arrive as an uploaded dataset, CSV text, a base64 .xlsx workbook,
+    or JSON objects.
+
+    ``dataset_id`` is the route the UI takes, because it is the only one where
+    the columns were profiled and mapped before anything ran. The others remain
+    for callers driving the API directly.
+    """
+
+    #: An already-uploaded dataset. With it, ``mapping`` says which column
+    #: fills which declared input; without a mapping the column names must
+    #: already be the field names.
+    dataset_id: str | None = None
+    mapping: dict[str, str] | None = None
+    #: Run every row against this address instead of the use case's target.
+    base_url: str = Field(default="", max_length=2000)
     csv: str | None = None
     #: A base64-encoded .xlsx. Spreadsheets are how people actually keep lists
     #: of records, and re-saving one as CSV silently mangles leading zeros,
@@ -236,6 +410,10 @@ class BatchRequestBody(BaseModel):
 __all__ = [
     "ApprovalRequest",
     "BatchRequestBody",
+    "MappingRequest",
+    "RememberFixRequest",
+    "SaveRecordingRequest",
+    "StartRecordingRequest",
     "ChangePasswordRequest",
     "CreateRunRequest",
     "CreateRunResponse",
@@ -249,3 +427,88 @@ __all__ = [
     "ScriptsRequest",
     "UpdateUserRequest",
 ]
+
+
+class StartAgentSessionRequest(ModelOverride):
+    """Start an agent working on a task in a browser.
+
+    Budgets are on the request rather than only in configuration because they
+    are a per-session judgement: exploring an unfamiliar site is worth more
+    steps than re-recording one somebody already knows.
+    """
+
+    task: str = Field(min_length=1, max_length=4000)
+    #: Where to start. A target is preferred -- the deployment says where a
+    #: site lives, so nothing about the address is baked into what is recorded.
+    target: str = ""
+    start_url: str = ""
+    #: What to call the use case this produces. Optional; the task is used.
+    name: str = Field(default="", max_length=200)
+    #: A stored credential to bind. The slot names reach the model; the values
+    #: never do.
+    credential_id: str | None = None
+    #: Inline values, for a one-off. Same shape as a single-row execute.
+    secrets: dict[str, str] | None = None
+    #: One record to work through, so the agent has something concrete to do
+    #: and the draft has a row to be verified against.
+    sample: dict[str, Any] = Field(default_factory=dict)
+    #: Off by default. An agent sent to find out how a form works must not
+    #: submit it on the way.
+    may_write: bool = False
+    #: Show a real window instead of running headless. None follows the
+    #: deployment default; a person starting a session chooses for themselves
+    #: the same way they choose it for a replay, under "Show the browser while
+    #: it runs" -- watching is how trust in this gets built the first few
+    #: times, and nobody should have to ask an administrator for that.
+    headless: bool | None = None
+
+    budget_steps: int | None = Field(default=40, ge=1, le=500)
+    #: A backstop, not the everyday limit -- see agent.budget.Budget. The
+    #: frontend does not ask for this; ``budget_usd`` is the number a person
+    #: actually sets, and this stays out of its way.
+    budget_tokens: int | None = Field(default=400_000, ge=1000)
+    budget_seconds: float | None = Field(default=600.0, ge=10, le=3600)
+    budget_usd: float | None = Field(default=1.0, ge=0.01, le=100)
+
+
+class AgentDecisionRequest(BaseModel):
+    """A person's answer to a session that stopped to ask."""
+
+    decision: Literal["approved", "rejected"]
+
+
+class SaveAgentSessionRequest(BaseModel):
+    """Turn a finished session's draft into a use case."""
+
+    name: str = Field(default="", max_length=200)
+
+
+class SpendLimitRequest(BaseModel):
+    """The monthly ceiling, or None to remove it.
+
+    None rather than zero for "no limit": zero is a perfectly reasonable
+    ceiling to set deliberately, and conflating the two would make "stop all
+    spending" unexpressible.
+    """
+
+    limit_usd: float | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class LocatorCheckRequest(BaseModel):
+    """Try some locators against a real page and say what each one matches.
+
+    A person editing a locator is otherwise guessing: the rung reads fine and
+    only a batch discovers it matched nothing, or matched four things. This is
+    the difference between editing a locator and editing a string.
+    """
+
+    #: Where to look. Must be inside the use case's own allowlist -- the same
+    #: gate a run passes, for the same reason.
+    url: str = Field(min_length=1, max_length=2_000)
+    #: The ladder as it would be saved. Validated as `Locator` in the handler,
+    #: so a malformed rung comes back as a message rather than a 422 on a body
+    #: the editor cannot map back to a field.
+    locators: list[dict] = Field(min_length=1, max_length=12)
+    #: A step's own timeout, so a check on a slow page behaves like the step
+    #: it is checking rather than failing faster than the real thing would.
+    timeout_ms: int = Field(default=10_000, ge=1_000, le=60_000)

@@ -75,6 +75,13 @@ class EventBus:
     def publish(self, run_id: str, event: AgentEvent) -> None:
         self._deliver_locally(run_id, event)
 
+    def publish_many(self, run_id: str, events: "list[AgentEvent]") -> None:
+        """Publish a batch. In process there is nothing to batch, so this is
+        the loop -- the method exists for the Postgres bus, which sends one
+        notification for the whole batch instead of one per event."""
+        for event in events:
+            self.publish(run_id, event)
+
     def _deliver_locally(self, run_id: str, event: AgentEvent) -> None:
         for queue in list(self._subscribers.get(run_id, ())):
             try:
@@ -83,12 +90,6 @@ class EventBus:
                 # A stalled client must not slow the agent down. It will
                 # reconnect and replay from its last seq.
                 log.warning("dropping event for slow subscriber", extra={"run_id": run_id})
-
-    def subscriber_count(self, run_id: str) -> int:
-        return len(self._subscribers.get(run_id, ()))
-
-    def watched_runs(self) -> set[str]:
-        return set(self._subscribers)
 
     # -- lifecycle, so callers can treat both buses the same -----------------
     async def start(self) -> None:
@@ -111,17 +112,33 @@ class PostgresEventBus(EventBus):
     def __init__(
         self,
         settings: Settings,
-        fetch_event: Callable[[str, int], Awaitable[AgentEvent | None]],
+        fetch_events: Callable[[str, int, int], Awaitable[list[AgentEvent]]],
         *,
         queue_size: int = 1000,
     ) -> None:
         super().__init__(queue_size=queue_size)
         self._settings = settings
-        self._fetch_event = fetch_event
+        self._fetch_events = fetch_events
         #: Distinguishes our own notifications from other workers', so a local
         #: publish is not delivered twice.
         self._origin = uuid.uuid4().hex[:12]
         self._listener: asyncpg.Connection | None = None
+        #: A second connection, kept open, used only for NOTIFY.
+        #:
+        #: This used to be opened and closed around every single notification,
+        #: which meant a TCP handshake, a TLS handshake and an authentication
+        #: round trip *per event* -- five or so per replayed step, each one
+        #: also occupying a backend process on the database. Against a remote
+        #: instance that was the single most expensive thing a step did, and
+        #: none of it bought anything: the payload is a pointer, and the local
+        #: subscribers already have the event in hand.
+        #:
+        #: Separate from the listener because a connection in LISTEN mode may
+        #: not be used for other statements while a notification is being
+        #: dispatched on it. That is why the original opened one each time;
+        #: the fix is to keep the second connection, not to make it repeatedly.
+        self._notifier: asyncpg.Connection | None = None
+        self._notify_lock = asyncio.Lock()
         self._notify_tasks: set[asyncio.Task] = set()
         self._connected = False
 
@@ -157,38 +174,76 @@ class PostgresEventBus(EventBus):
                 await self._listener.remove_listener(CHANNEL, self._on_notify)
                 await self._listener.close()
             self._listener = None
+        if self._notifier is not None:
+            with contextlib.suppress(Exception):
+                await self._notifier.close()
+            self._notifier = None
         self._connected = False
 
     def publish(self, run_id: str, event: AgentEvent) -> None:
-        # Local subscribers get the object we already hold -- no round trip,
-        # and no dependence on the notification arriving.
-        self._deliver_locally(run_id, event)
-        if self._connected:
-            task = asyncio.create_task(self._notify(run_id, event.seq))
-            self._notify_tasks.add(task)
-            task.add_done_callback(self._notify_tasks.discard)
+        self.publish_many(run_id, [event])
 
-    async def _notify(self, run_id: str, seq: int) -> None:
-        payload = json.dumps({"run_id": run_id, "seq": seq, "origin": self._origin})
+    def publish_many(self, run_id: str, events: "list[AgentEvent]") -> None:
+        """Deliver a batch locally, and tell other processes about it once.
+
+        One notification for the whole batch rather than one per event. The
+        payload is a *range* for the same reason it was ever a pointer: a
+        notification is capped at 8000 bytes and an event is not, so the
+        listener reads what it was told about rather than being sent it.
+        """
+        if not events:
+            return
+        for event in events:
+            self._deliver_locally(run_id, event)
+        if not self._connected:
+            return
+        first = min(event.seq for event in events)
+        last = max(event.seq for event in events)
+        task = asyncio.create_task(self._notify(run_id, first, last))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _connection(self) -> "asyncpg.Connection | None":
+        """The notify connection, opened on first use and reopened if it dies."""
+        if self._notifier is not None and not self._notifier.is_closed():
+            return self._notifier
         try:
-            # A separate short-lived connection rather than the listener: a
-            # connection in LISTEN mode may not be used for other statements
-            # while a notification is being dispatched on it.
-            conn = await asyncpg.connect(
+            self._notifier = await asyncpg.connect(
                 host=self._settings.db_host,
                 port=self._settings.db_port,
                 user=self._settings.db_user,
                 password=self._settings.db_password,
                 database=self._settings.db_name,
             )
+        except Exception:  # noqa: BLE001 - staleness, not data loss
+            self._notifier = None
+        return self._notifier
+
+    async def _notify(self, run_id: str, first: int, last: int) -> None:
+        payload = json.dumps(
+            {"run_id": run_id, "seq": last, "from_seq": first, "origin": self._origin}
+        )
+        # Serialised: two flushes finishing together would otherwise use the
+        # one connection concurrently, which asyncpg does not allow.
+        async with self._notify_lock:
             try:
+                conn = await self._connection()
+                if conn is None:
+                    return
                 await conn.execute(f"NOTIFY {CHANNEL}, $1", payload)
-            finally:
-                await conn.close()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - a missed notification costs staleness, not data
-            log.debug("event notification failed", extra={"run_id": run_id, "seq": seq})
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a missed notification costs staleness
+                log.debug(
+                    "event notification failed",
+                    extra={"run_id": run_id, "seq": last},
+                )
+                # Dropped so the next publish reopens rather than reusing a
+                # connection that has already failed once.
+                with contextlib.suppress(Exception):
+                    if self._notifier is not None:
+                        await self._notifier.close()
+                self._notifier = None
 
     def _on_notify(self, _conn, _pid, _channel, payload: str) -> None:  # noqa: ANN001 - asyncpg hook
         try:
@@ -202,23 +257,26 @@ class PostgresEventBus(EventBus):
         if not run_id or seq is None or not self._subscribers.get(run_id):
             return  # nobody here is watching this run
 
-        task = asyncio.create_task(self._deliver_remote(run_id, int(seq)))
+        # `from_seq` is absent on a notification sent by an older process, and
+        # the range then collapses to the single event it used to describe.
+        first = int(message.get("from_seq", seq))
+        task = asyncio.create_task(self._deliver_remote(run_id, first, int(seq)))
         self._notify_tasks.add(task)
         task.add_done_callback(self._notify_tasks.discard)
 
-    async def _deliver_remote(self, run_id: str, seq: int) -> None:
+    async def _deliver_remote(self, run_id: str, first: int, last: int) -> None:
         try:
-            event = await self._fetch_event(run_id, seq)
+            events = await self._fetch_events(run_id, first - 1, last - first + 1)
         except Exception:  # noqa: BLE001 - never break the listener
-            log.debug("could not read a notified event", extra={"run_id": run_id, "seq": seq})
+            log.debug("could not read notified events", extra={"run_id": run_id, "seq": last})
             return
-        if event is not None:
+        for event in events:
             self._deliver_locally(run_id, event)
 
 
 def build_bus(
     settings: Settings,
-    fetch_event: Callable[[str, int], Awaitable[AgentEvent | None]] | None = None,
+    fetch_events: Callable[[str, int, int], Awaitable[list[AgentEvent]]] | None = None,
     *,
     cross_process: bool = True,
 ) -> EventBus:
@@ -228,8 +286,8 @@ def build_bus(
     reason to open a listener connection for a fan-out that never leaves the
     process.
     """
-    if cross_process and fetch_event is not None:
-        return PostgresEventBus(settings, fetch_event)
+    if cross_process and fetch_events is not None:
+        return PostgresEventBus(settings, fetch_events)
     return EventBus()
 
 

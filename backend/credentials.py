@@ -28,9 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -58,26 +56,6 @@ def generate_key() -> str:
     from cryptography.fernet import Fernet
 
     return Fernet.generate_key().decode()
-
-
-@dataclass(slots=True)
-class CredentialRecord:
-    """Metadata only. The values are never part of this."""
-
-    id: str
-    name: str
-    slots: list[str]
-    created_at: str
-    last_used_at: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "slots": self.slots,
-            "created_at": self.created_at,
-            "last_used_at": self.last_used_at,
-        }
 
 
 def _now() -> str:
@@ -147,7 +125,3 @@ class Vault:
 def new_credential_id() -> str:
     return uuid.uuid4().hex
 
-
-def missing_slots(required: list[str], values: dict[str, str]) -> list[str]:
-    """Required slot names a bundle does not provide."""
-    return [name for name in required if not values.get(name)]

@@ -204,6 +204,78 @@ async def test_a_model_that_declines_is_not_an_error():
 #  page to look at" -- it is reported rather than raised.)
 
 
+# --- the page as it was, beside the page as it is --------------------------
+#
+# `Step.recorded_page` reached healing first and repair second, and repair is
+# the path that needs it more: healing runs seconds after the failure, a repair
+# can happen weeks later and be driven by somebody who was never there when it
+# was recorded.
+
+
+AS_RECORDED = """### Page
+- Page URL: https://example.com/contact
+### Snapshot
+```yaml
+- textbox "Full name" [ref=e1]
+- textbox "Work email" [ref=e2]
+- button "Request a demo" [ref=e3]
+```"""
+
+
+def recorded(page: str) -> UseCase:
+    """The same use case, with the failing step remembering its own page."""
+    case = use_case()
+    case.row_steps[0].recorded_page = page
+    return case
+
+
+async def test_the_doctor_is_shown_the_page_as_it_was_when_the_step_worked():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded(AS_RECORDED), execution(), failure_events())
+    )
+
+    assert "when the step was recorded and working" in llm.last_message
+    assert 'textbox "Full name"' in llm.last_message, "the label that is gone"
+    assert 'textbox "Your name"' in llm.last_message, "and the one that replaced it"
+
+
+async def test_the_recorded_controls_are_offered_without_indices():
+    """The numbered list is the one a fix picks from. Numbering a control that
+    is no longer on the page would invite `element_index` pointing at it."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded(AS_RECORDED), execution(), failure_events())
+    )
+
+    was = llm.last_message.split("when the step was recorded and working", 1)[1]
+    assert '- textbox "Full name"' in was
+    assert '0. textbox "Full name"' not in was
+
+
+async def test_a_step_with_no_recorded_page_asks_as_it_did_before():
+    """Every use case recorded before this existed takes this path, and the
+    prompt must not grow an empty section for them."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(gather_context(use_case(), execution(), failure_events()))
+
+    assert "when the step was recorded" not in llm.last_message
+
+
+async def test_an_unparseable_recorded_page_is_ignored_rather_than_fatal():
+    """Context is a bonus. Losing the repair over it would be the wrong trade."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    proposal = await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded("this is not a snapshot at all"), execution(), failure_events())
+    )
+
+    assert proposal.diagnosis == "d"
+
+
 # --- applying ---------------------------------------------------------------
 
 
@@ -364,17 +436,174 @@ def test_a_repair_that_breaks_the_schema_is_rejected():
     validate_patched(patched)
 
 
+# --- a repeated card, the ordinary shape of a list page ---------------------
+
+#: 11 identical "Chat" buttons, one per project card -- the page that broke a
+#: real run: a step recorded against one specific card's button could not be
+#: told apart from the other 10 by role and name alone.
+CARDS = """### Page
+- Page URL: https://example.com/dashboard
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic "Alpha Project" [ref=e2]:
+    - heading "Alpha Project" [ref=e3]
+    - button "Chat" [ref=e4]
+  - generic "Beta Project" [ref=e5]:
+    - heading "Beta Project" [ref=e6]
+    - button "Chat" [ref=e7]
+  - generic "Gamma Project" [ref=e8]:
+    - heading "Gamma Project" [ref=e9]
+    - button "Chat" [ref=e10]
+```"""
+
+
+def test_a_duplicate_group_offers_every_instance_not_just_the_first():
+    """This used to collapse to one candidate no matter which card failed."""
+    options = candidates(gather_context(use_case(), execution(), failure_events(CARDS)).snapshot)
+    chat_buttons = [n for n in options if n.role == "button" and n.name == "Chat"]
+    assert len(chat_buttons) == 3
+    assert [n.ref for n in chat_buttons] == ["e4", "e7", "e10"]
+
+
+def test_the_listing_says_which_card_each_duplicate_belongs_to():
+    from repair import _listing
+
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    listing = _listing(candidates(snapshot), snapshot)
+
+    assert 'inside "Beta Project"' in listing
+    assert 'inside "Gamma Project"' in listing
+
+
+def test_picking_one_of_a_duplicate_group_names_the_card_it_sits_in():
+    """The fix that would have unblocked the real incident: a repair can point
+    at *the second* identical button.
+
+    It says so by naming the card rather than by counting, which is the
+    stronger of the two answers -- "the Chat button on Beta Project" survives a
+    fourth project being added above it, and "the second Chat button" does not.
+    """
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    beta_index = next(i for i, n in enumerate(options) if n.ref == "e7")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": beta_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    locator = patched["row_steps"][0]["locators"][0]
+    assert locator["name"] == "Chat"
+    assert locator["nth"] == 0, "scoped, so no position is needed"
+    assert locator["within"]["name"] == "Beta Project"
+    assert "Beta Project" in applied[0]
+    validate_patched(patched)
+
+
+def test_the_first_of_a_duplicate_group_can_be_repaired_once_its_card_is_named():
+    """`nth=0` means "no position given", so the first of several identical
+    controls has no positional spelling at all and used to be refused outright.
+    Naming where it sits gives it one -- and it is the answer a person would
+    have given anyway."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    alpha_index = next(i for i, n in enumerate(options) if n.ref == "e4")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": alpha_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    locator = patched["row_steps"][0]["locators"][0]
+    assert locator["name"] == "Chat"
+    assert locator["within"]["name"] == "Alpha Project"
+    assert "SKIPPED" not in applied[0]
+    validate_patched(patched)
+
+
+def test_without_the_full_snapshot_ambiguity_still_degrades_safely():
+    """A caller that does not thread the snapshot through (every existing one
+    before this change) still gets a correct answer for anything the trimmed
+    candidate list itself already contains -- it just cannot see duplicates
+    MAX_PER_GROUP trimmed away."""
+    snapshot = gather_context(use_case(), execution(), failure_events(CARDS)).snapshot
+    options = candidates(snapshot)
+    beta_index = next(i for i, n in enumerate(options) if n.ref == "e7")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": beta_index}],
+    )
+    patched, _ = apply_fixes(definition(), proposal, options)  # no snapshot passed
+
+    assert patched["row_steps"][0]["locators"][0]["nth"] == 1
+
+
+#: The same three cards, with nothing naming any of them. There is genuinely
+#: no way to single out the first "Chat" button here, and the point of the
+#: fixture is that this case still exists after scoping was added.
+BARE_CARDS = """### Page
+- Page URL: https://example.com/dashboard
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - button "Chat" [ref=e4]
+  - generic [ref=e5]:
+    - button "Chat" [ref=e7]
+  - generic [ref=e8]:
+    - button "Chat" [ref=e10]
+```"""
+
+
+def test_the_first_of_a_duplicate_group_is_still_refused_when_nothing_names_it():
+    """`nth=0` means "no position given" as far as the executor's resolver is
+    concerned -- so a "fix" that pins the first of several identical elements
+    to position 0 would look applied in the diff and still be refused, for
+    the identical reason, the next time it runs.
+
+    Scoping answers this whenever something around the element has a name. When
+    nothing does, skipping and saying so is still more honest than a repair
+    that appears to work and does not."""
+    snapshot = gather_context(use_case(), execution(), failure_events(BARE_CARDS)).snapshot
+    options = candidates(snapshot)
+    alpha_index = next(i for i, n in enumerate(options) if n.ref == "e4")
+
+    proposal = RepairProposal(
+        diagnosis="x",
+        fixes=[{"kind": "replace_locator", "step_id": "s10", "element_index": alpha_index}],
+    )
+    patched, applied = apply_fixes(definition(), proposal, options, snapshot)
+
+    assert patched["row_steps"][0]["locators"][0]["name"] == "Full name", "unchanged"
+    assert "SKIPPED" in applied[0]
+    assert "nothing around it is named" in applied[0]
+
+
 # --- when there is no page to look at --------------------------------------
 
 
-async def test_no_captured_page_refuses_before_spending_a_token():
-    """Every fix would be a guess, so do not pay for a refusal."""
+async def test_a_run_that_never_reached_a_step_says_so_rather_than_advising_a_retry():
+    """Two different refusals, because they need two different things done.
+
+    No events at all means the run died before any step was attempted -- the
+    browser would not start, or setup never finished. There was no page to
+    record, and telling the person to run it again just sends them round the
+    same loop; the useful thing is the error that actually stopped it.
+    """
     llm = ProposingLLM({"diagnosis": "d", "fixes": []})
     context = gather_context(use_case(), execution(), [])
 
-    with pytest.raises(RepairError, match="not recorded"):
+    with pytest.raises(RepairError) as caught:
         await UseCaseDoctor(llm).diagnose(context)
-    assert llm.calls == 0
+
+    message = str(caught.value)
+    assert "before any step" in message
+    assert "run it once more" not in message
+    assert llm.calls == 0, "every fix would be a guess, so do not pay for a refusal"
 
 
 async def test_a_snapshot_that_was_only_a_link_counts_as_no_page():
@@ -518,3 +747,107 @@ def test_an_unknown_field_name_is_refused():
         offered(),
     )
     assert "SKIPPED" in applied[0] and "'Nope'" in applied[0]
+
+
+# --- what each step was for -----------------------------------------------
+
+
+async def test_the_doctor_is_told_what_the_failing_step_was_for():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+    case = use_case()
+    case.row_steps[0].intent = "finds the customer the row names"
+
+    await UseCaseDoctor(llm).diagnose(gather_context(case, execution(), failure_events()))
+
+    assert "what it is for: finds the customer the row names" in llm.last_message
+
+
+async def test_the_purpose_of_the_steps_around_it_is_shown_too():
+    """A repair judges one step against the flow it sits in. A list of
+    mechanics with no purposes on it is what made "which of these forty
+    controls" the only question available."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+    case = use_case()
+    case.row_steps[1].intent = "saves the change"
+
+    await UseCaseDoctor(llm).diagnose(gather_context(case, execution(), failure_events()))
+
+    assert "      for: saves the change" in llm.last_message
+
+
+async def test_a_use_case_with_no_purposes_reads_as_it_always_did():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(gather_context(use_case(), execution(), failure_events()))
+
+    assert "what it is for" not in llm.last_message
+    assert "      for:" not in llm.last_message
+
+
+# --- what the browser tried, and what stopped it --------------------------
+#
+# The failure that kept coming back. A recorded click on a column header
+# failed with "TimeoutError: Locator.click: Timeout 30000ms exceeded" and
+# nothing else, because the engine kept the first line of Playwright's error
+# and dropped the call log. The element had been found; something was covering
+# it. Given only a timeout and a locator, a repair proposed the same locator
+# with `exact` turned off -- the only change it could express -- and the next
+# run happened to work, so the diagnosis was never made.
+
+
+COVERED = """Call log:
+  - waiting for get_by_role("columnheader", name="Make")
+  -   locator resolved to <th class="sortable">Make</th>
+  - attempting click action
+  -   <div id="onetrust-consent-sdk">…</div> intercepts pointer events
+  - retrying click action"""
+
+
+def covering_events(snapshot: str = PAGE) -> list:
+    return [
+        ErrorEvent(
+            run_id="run-1",
+            seq=1,
+            step=1,
+            kind="step_failed",
+            message="TimeoutError: Locator.click: Timeout 30000ms exceeded.",
+            recoverable=True,
+            detail={
+                "step_id": "s10",
+                "page_url": "https://example.com/contact",
+                "snapshot": snapshot,
+                "call_log": COVERED,
+            },
+        )
+    ]
+
+
+def test_the_call_log_is_recovered_from_the_failure_event():
+    context = gather_context(use_case(), execution(), covering_events())
+
+    assert "intercepts pointer events" in context.call_log
+
+
+async def test_the_doctor_is_shown_what_stopped_the_action(client=None):
+    """So it can tell "cannot find it" from "found it and could not click
+    it" -- which need different answers and got the same one."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(use_case(), execution(), covering_events())
+    )
+
+    assert "What the browser tried" in llm.last_message
+    assert "onetrust-consent-sdk" in llm.last_message
+
+
+async def test_a_failure_with_no_call_log_asks_exactly_as_it_did_before():
+    """Every run recorded before this existed, and every failure that was not
+    an action -- an assertion, a URL off the allowlist."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(use_case(), execution(), failure_events())
+    )
+
+    assert "What the browser tried" not in llm.last_message

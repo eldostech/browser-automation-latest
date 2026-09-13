@@ -10,6 +10,7 @@ import { useState, type FormEvent } from 'react';
 
 import { api, ApiError } from '../lib/api';
 import type { CurrentUser } from '../lib/session';
+import { BrandSpinner } from './BrandSpinner';
 
 interface Props {
   onSignedIn: (user: CurrentUser) => void;
@@ -43,7 +44,7 @@ export function SignIn({ onSignedIn }: Props) {
   return (
     <div className="signin">
       <form className="signin-card" onSubmit={submit}>
-        <h1>Browser Agent</h1>
+        <h1>TRACE</h1>
         <p className="signin-sub">Sign in to record and run browser tasks.</p>
 
         <label htmlFor="signin-email">Email</label>
@@ -77,7 +78,7 @@ export function SignIn({ onSignedIn }: Props) {
         )}
 
         <button type="submit" disabled={busy || !email || !password}>
-          {busy ? 'Signing in…' : 'Sign in'}
+          {busy ? <BrandSpinner state="working" label="Signing in…" /> : 'Sign in'}
         </button>
 
         <p className="signin-hint">
