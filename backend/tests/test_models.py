@@ -19,7 +19,10 @@ pytestmark = pytest.mark.anyio
 
 
 def settings(**overrides) -> Settings:
-    return Settings(db_schema="browser_test", **overrides)
+    # Discovery off unless a test asks: it is an AWS call, and the suite does
+    # not make those. See `conftest.test_settings`.
+    overrides.setdefault("bedrock_discover", False)
+    return Settings(db_schema="browser_test", _env_file=None, **overrides)
 
 
 # --- resolving a choice ----------------------------------------------------
@@ -287,3 +290,165 @@ def test_an_unknown_provider_is_refused_by_the_endpoint(client: TestClient):
 
     assert response.status_code == 422
     assert "not a provider this build can reach" in response.json()["detail"]
+
+
+# --- a provider that can be switched off entirely -------------------------
+#
+# Asked for by an operator taking this into a company: "when I disable
+# OpenRouter, it shouldn't make any call from my code". So the test is not
+# that the provider is hidden -- it is that every path which could produce a
+# request refuses, including the one nobody thinks of, which is the model
+# catalogue: reading it is itself an HTTP request to openrouter.ai.
+
+
+def switched_off():
+    return settings(openrouter_enabled=False, openrouter_api_key="or-key-that-is-set")
+
+
+def test_naming_the_provider_on_a_request_is_refused():
+    from llm import ModelChoice
+
+    with pytest.raises(ValueError, match="OPENROUTER_ENABLED"):
+        ModelChoice.resolve(switched_off(), "openrouter", "anthropic/claude-sonnet-4.5")
+
+
+def test_building_a_client_for_it_is_refused():
+    from llm import build_llm
+
+    with pytest.raises(ValueError, match="OPENROUTER_ENABLED"):
+        build_llm(switched_off(), "anthropic/claude-sonnet-4.5", "openrouter")
+
+
+def test_the_layer_that_would_construct_the_http_client_refuses_too():
+    """Defence in depth, and the one that decides whether a packet leaves: a
+    caller that forgot to ask still gets nothing."""
+    from chat import chat_model
+
+    with pytest.raises(ValueError, match="OPENROUTER_ENABLED"):
+        chat_model(switched_off(), "anthropic/claude-sonnet-4.5", "openrouter")
+
+
+async def test_the_catalogue_is_never_fetched():
+    """The path most easily forgotten. Listing models is a request to
+    openrouter.ai, made in front of a dashboard page load, and a key being
+    present is not permission to use it."""
+    from catalog import ModelCatalogue
+
+    def must_not_be_called():
+        raise AssertionError("the OpenRouter catalogue was fetched")
+
+    catalogue = ModelCatalogue(switched_off(), fetch=must_not_be_called)
+    listing = await catalogue.read()
+
+    assert [m for m in listing.models if m.provider == "openrouter"] == []
+    assert "OPENROUTER_ENABLED" in listing.problems["openrouter"]
+
+
+async def test_a_price_lookup_is_not_a_way_round_it():
+    """`prices_for` reads the same catalogue, from the costing layer, which is
+    a long way from anything that looks like choosing a provider."""
+    from catalog import ModelCatalogue
+
+    def must_not_be_called():
+        raise AssertionError("the OpenRouter catalogue was fetched")
+
+    catalogue = ModelCatalogue(switched_off(), fetch=must_not_be_called)
+
+    assert await catalogue.prices_for("anthropic/claude-sonnet-4.5") is None
+
+
+def test_why_it_is_missing_is_said_rather_than_left_to_be_guessed():
+    """A picker with no OpenRouter in it and no reason given looks broken."""
+    reason = settings(openrouter_enabled=False).openrouter_available
+
+    assert reason is False
+
+
+def test_defaulting_to_a_forbidden_provider_is_refused_at_startup():
+    """Rather than failing one call at a time with a message about a flag."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="LLM_PROVIDER"):
+        settings(llm_provider="openrouter", openrouter_enabled=False)
+
+
+# --- Bedrock, discovered rather than hand-listed --------------------------
+
+
+def _summary(model_id: str, *, kinds: list[str], name: str = "", vendor: str = "Meta",
+             status: str = "ACTIVE") -> dict:
+    return {
+        "modelId": model_id,
+        "modelName": name or model_id,
+        "providerName": vendor,
+        "inferenceTypesSupported": kinds,
+        "modelLifecycle": {"status": status},
+    }
+
+
+def test_an_on_demand_model_is_offered_by_its_own_id():
+    from catalog import _bedrock_info
+
+    info = _bedrock_info(_summary("meta.llama3-8b", kinds=["ON_DEMAND"], name="Llama 3 8B"), {})
+
+    assert info.id == "meta.llama3-8b"
+    assert info.name == "Meta Llama 3 8B"
+
+
+def test_a_profile_only_model_is_offered_by_the_id_that_can_run_it():
+    """Its own id cannot be invoked, so offering it would put an entry in the
+    dropdown that fails the moment somebody picks it."""
+    from catalog import _bedrock_info
+
+    info = _bedrock_info(
+        _summary("meta.llama4-scout", kinds=["INFERENCE_PROFILE"]),
+        {"meta.llama4-scout": "us.meta.llama4-scout"},
+    )
+
+    assert info.id == "us.meta.llama4-scout"
+
+
+def test_a_model_with_no_way_to_invoke_it_on_demand_is_left_out():
+    """Available only against a provisioned throughput commitment. Choosing it
+    fails with a billing error nobody reading a dropdown could predict."""
+    from catalog import _bedrock_info
+
+    assert _bedrock_info(_summary("meta.llama-provisioned", kinds=["PROVISIONED"]), {}) is None
+    assert _bedrock_info(_summary("meta.llama4", kinds=["INFERENCE_PROFILE"]), {}) is None
+
+
+def test_a_legacy_model_is_offered_and_says_so():
+    from catalog import _bedrock_info
+
+    info = _bedrock_info(
+        _summary("ai21.jamba", kinds=["ON_DEMAND"], name="Jamba", vendor="AI21", status="LEGACY"),
+        {},
+    )
+
+    assert "(legacy)" in info.name
+
+
+def test_a_refusal_names_the_permission_and_keeps_the_configured_list():
+    """The objection that kept this as configuration for so long. It is a
+    degradation now, not a reason to show nothing."""
+    from catalog import _bedrock_refusal
+
+    said = _bedrock_refusal(Exception("AccessDeniedException: not authorized to perform"))
+
+    assert "bedrock:ListFoundationModels" in said
+    assert "BEDROCK_MODELS are still" in said
+    assert "BEDROCK_DISCOVER=false" in said
+
+
+async def test_discovery_off_offers_exactly_what_was_configured():
+    from catalog import ModelCatalogue
+
+    listing = await ModelCatalogue(
+        settings(
+            bedrock_discover=False,
+            openrouter_enabled=False,
+            bedrock_models=["us.anthropic.claude-sonnet-5"],
+        )
+    ).read()
+
+    assert [m.id for m in listing.models] == ["us.anthropic.claude-sonnet-5"]

@@ -48,6 +48,14 @@ PROVIDER = "bedrock"
 #: The providers this build can reach.
 PROVIDERS: tuple[str, ...] = ("bedrock", "openrouter")
 
+#: Said the same way everywhere it is said. An operator reading it needs the
+#: setting's name, not a paraphrase of it.
+OPENROUTER_OFF = (
+    "OpenRouter is switched off in this deployment (OPENROUTER_ENABLED=false). "
+    "Nothing here will call it. Pick a Bedrock model, or enable OpenRouter in "
+    "the environment and restart the backend."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ModelChoice:
@@ -87,6 +95,14 @@ class ModelChoice:
                 f"{chosen!r} is not a provider this build can reach. "
                 f"Available: {', '.join(PROVIDERS)}."
             )
+        if chosen == "openrouter" and not getattr(settings, "openrouter_enabled", True):
+            # The first of three refusals on this path, and each one is worth
+            # having: this is where a request names a provider, `build_llm` is
+            # where a client would be constructed, and `catalog` is where the
+            # model list would be fetched. A deployment that must not reach a
+            # third party should not have to reason about which of those a
+            # given feature happens to go through.
+            raise ValueError(OPENROUTER_OFF)
         if model:
             return cls(chosen, model)
         fallback = cls.default(settings)
@@ -488,6 +504,8 @@ def build_llm(
 
     chosen = provider or settings.llm_provider
     if chosen == "openrouter":
+        if not getattr(settings, "openrouter_enabled", True):
+            raise ValueError(OPENROUTER_OFF)
         resolved = model or settings.openrouter_model
         return LangChainLLM(
             chat_model(settings, resolved, "openrouter"), resolved, "openrouter"

@@ -192,7 +192,15 @@ def test_settings(**overrides) -> Settings:
     reads the developer's real ``.env``, which is how this project shipped the
     same bug three times (an API key, then a default model, then a repair
     model, each leaking from a developer machine into the suite).
+
+    ``bedrock_discover`` is forced off for the same class of reason: it is on
+    by default because a picker should show what an account can reach, and it
+    is a real AWS control-plane call. The suite's guarantee is that a default
+    run touches no network, so the guarantee is enforced here rather than left
+    to every test that happens to build a catalogue. A test *about* discovery
+    passes its own fake client.
     """
+    overrides.setdefault("bedrock_discover", False)
     return Settings(_env_file=None, db_schema=TEST_SCHEMA, **overrides)
 
 

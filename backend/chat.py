@@ -96,6 +96,14 @@ def _openrouter_model(settings: Any, model: str | None, **overrides: Any):
     on its own terms. And the prompt cache is Bedrock's; see
     ``LangChainLLM.run_turn`` for why the flag cannot simply be sent anyway.
     """
+    # The last of the three refusals, and the one that matters most: this is
+    # the function that would construct a client pointed at openrouter.ai. A
+    # deployment that has switched the provider off must not get one even if
+    # something upstream forgot to ask.
+    if not getattr(settings, "openrouter_enabled", True):
+        from llm import OPENROUTER_OFF
+
+        raise ValueError(OPENROUTER_OFF)
     if not settings.openrouter_api_key:
         raise ValueError(
             "OpenRouter was selected and OPENROUTER_API_KEY is not set, so there is "

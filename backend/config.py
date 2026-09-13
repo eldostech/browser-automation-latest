@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -90,6 +90,19 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
 
     # --- OpenRouter --------------------------------------------------------
+    #: Whether this deployment may reach OpenRouter **at all**.
+    #:
+    #: A kill switch rather than a preference, and the reason is a deployment
+    #: leaving one company for another: an installation that must not send a
+    #: byte to a third party needs a single line it can point at, not an
+    #: argument about which code paths happen to be reachable. False means the
+    #: provider is not offered, not resolvable, not buildable, and its
+    #: catalogue is never fetched -- which is itself an HTTP request to
+    #: openrouter.ai and the one most easily forgotten.
+    #:
+    #: `tests/test_models.py` asserts that every one of those paths refuses.
+    openrouter_enabled: bool = True
+
     #: The key. Without it the provider is offered nowhere and selecting it is
     #: refused with that as the reason, rather than failing at the first call.
     openrouter_api_key: str = ""
@@ -111,14 +124,27 @@ class Settings(BaseSettings):
     #: load would put a third-party request in front of the dashboard.
     openrouter_catalog_ttl_seconds: int = 900
 
-    #: The Bedrock models offered in the picker.
+    #: Whether to ask Bedrock what models the account can reach.
     #:
-    #: A list rather than a discovery call: `ListFoundationModels` returns what
-    #: the *region* carries, not what this account may invoke, so it offers
-    #: models that then fail with an access error -- and it needs an IAM
-    #: permission beyond invoking a model, which a deployment given only
-    #: `bedrock:InvokeModel` does not have. An operator who wants a different
-    #: one adds it here, where the region prefix is visible and deliberate.
+    #: On, now that the objections to it are handled rather than avoided. They
+    #: were real: `ListFoundationModels` reports what the *region* carries
+    #: rather than what this account may invoke, and it needs an IAM permission
+    #: beyond invoking a model. So the discovery is *additive* -- it degrades to
+    #: `BEDROCK_MODELS` and says why when the permission is missing -- and the
+    #: picker has a check button that proves one model by calling it, which is
+    #: the only thing that can distinguish "listed" from "invokable".
+    #:
+    #: Off for a deployment that would rather make no control-plane call.
+    bedrock_discover: bool = True
+
+    #: How long the discovered Bedrock list is reused. Longer than
+    #: OpenRouter's: a region's model list changes on AWS's schedule, not
+    #: weekly, and this is a control-plane call in front of a page load.
+    bedrock_catalog_ttl_seconds: int = 3600
+
+    #: Bedrock models always offered in the picker, whether or not discovery
+    #: works. The configured default belongs here so it is present even when
+    #: the account cannot list models at all.
     bedrock_models: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
             "us.anthropic.claude-opus-5",
@@ -439,6 +465,31 @@ class Settings(BaseSettings):
             )
             return "bedrock"
         return value
+
+    @model_validator(mode="after")
+    def _openrouter_default_needs_openrouter(self) -> "Settings":
+        """Refuse the one combination that cannot work.
+
+        `LLM_PROVIDER=openrouter` with `OPENROUTER_ENABLED=false` is a
+        deployment configured to default to a provider it has forbidden. Every
+        model call would then fail, one at a time, with a message about a flag
+        -- so it is said once, at startup, where a person is looking.
+        """
+        if self.llm_provider == "openrouter" and not self.openrouter_enabled:
+            raise ValueError(
+                "LLM_PROVIDER is 'openrouter' but OPENROUTER_ENABLED is false, so "
+                "nothing could run. Enable OpenRouter, or set LLM_PROVIDER=bedrock."
+            )
+        return self
+
+    @property
+    def openrouter_available(self) -> bool:
+        """Whether an OpenRouter call may be made at all.
+
+        The one predicate every path asks, so "disabled" and "no key" cannot
+        drift into two different answers in two different files.
+        """
+        return bool(self.openrouter_enabled and self.openrouter_api_key)
 
     @field_validator("cors_origins", "bedrock_models", mode="before")
     @classmethod

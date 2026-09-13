@@ -44,6 +44,12 @@ async def list_models(
     """
     catalogue = await request.app.state.model_catalogue.read()
     settings = request.app.state.settings
+    # Every provider this build knows, including one that is switched off. The
+    # picker renders a provider with a stated problem as a disabled tab
+    # carrying the reason, which is better than silent absence: "OpenRouter is
+    # missing" with no explanation is a gap a person fills in with a guess.
+    # The refusal is enforced in `ModelChoice.resolve` and below it, not by
+    # hiding the name.
     return {
         "providers": list(PROVIDERS),
         **catalogue.to_dict(ModelChoice.default(settings)),
