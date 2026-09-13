@@ -38,18 +38,22 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from snapshot import STRUCTURAL_ROLES, ordinal_suffix
+from pydantic import ValidationError
+
 from usecase import (
     InputSpec,
     Locator,
     SecretSpec,
     Step,
     UseCase,
+    WaitFor,
     clean_recorded_urls,
     drop_focus_keystrokes,
     strip_data_locators,
 )
 
 from .marks import Mark, Marks
+from .ran import locator_from
 from .session import ToolCallRecord
 
 log = logging.getLogger(__name__)
@@ -153,6 +157,13 @@ def distil(
     if not row_steps:
         warnings.append("No steps fall inside the recorded row, so a batch would do nothing.")
 
+    # Declared before the document is built, because a reference with no
+    # declaration behind it is fatal and the recovery below cannot mend it by
+    # dropping declarations -- see `_declare_what_is_referenced`.
+    inputs, secrets = _declare_what_is_referenced(
+        setup_steps + row_steps, inputs, secrets, warnings
+    )
+
     fields: dict[str, Any] = {
         "name": name,
         "description": task,
@@ -179,6 +190,54 @@ def distil(
     )
 
 
+def _declare_what_is_referenced(
+    steps: list[Step],
+    inputs: list[str],
+    secrets: list[str],
+    warnings: list[str],
+) -> tuple[list[str], list[str]]:
+    """Add the declarations the steps already refer to.
+
+    A step that types ``{{secret.secretword}}`` is the recording saying it
+    needs a secret slot by that name. Usually the matching `mark_as_secret`
+    said so too -- but a mark is refused for reasons that have nothing to do
+    with whether the value is a secret, and the one that bites is an ambiguous
+    locator: the agent typed the value, the mark came back "matches 3
+    elements", and the slot was never declared.
+
+    A whole session was lost to exactly that. One undeclared reference fails
+    validation; `_build` then tries to recover by dropping declarations, which
+    for a reference is the opposite of a recovery -- dropping `secrets` leaves
+    *every* `{{secret.x}}` undeclared -- and the ladder ran out at an empty
+    document. The person saw a session that had signed in, solved the task and
+    signed out, and a draft with no steps in it at all.
+
+    So the reference wins. It is evidence from the recording, the value is
+    already a placeholder rather than a credential, and a declared slot that
+    nobody fills is refused later with a message naming it -- which is a
+    problem somebody can fix in a minute, unlike a draft that is not there.
+    """
+    known_inputs, known_secrets = list(inputs), list(secrets)
+    for step in steps:
+        for kind, name in sorted(step.references()):
+            if kind == "input" and name not in known_inputs:
+                known_inputs.append(name)
+                warnings.append(
+                    f"Step {step.id} uses {{{{input.{name}}}}} but nothing marked it as "
+                    "an input, so it has been declared from the step itself. Check that "
+                    "the column is named the way you want before publishing."
+                )
+            elif kind == "secret" and name not in known_secrets:
+                known_secrets.append(name)
+                warnings.append(
+                    f"Step {step.id} types {{{{secret.{name}}}}} but the mark that would "
+                    "have declared it did not go through, so the slot has been declared "
+                    "from the step itself. Bind a credential with a "
+                    f"{name!r} slot before running this."
+                )
+    return known_inputs, known_secrets
+
+
 def _build(fields: dict[str, Any], warnings: list[str]) -> UseCase:
     """The draft, or the most of it that can be built.
 
@@ -201,20 +260,65 @@ def _build(fields: dict[str, Any], warnings: list[str]) -> UseCase:
         refusal = str(exc)
         log.warning("draft did not validate; degrading", extra={"error": refusal})
 
+    # Normalised once, because every rung below reads a step's references and
+    # a caller may hand us either objects or the dicts a dump produced. A
+    # recovery path that raises on the shape of its own input is not one.
+    for phase in ("setup_steps", "row_steps", "teardown_steps"):
+        if phase in fields:
+            fields[phase] = _as_steps(fields[phase])
+
     warnings.append(
         "Some of what was recorded could not be turned into a valid use case "
         f"and was left out: {refusal}. Everything else is here, and the steps "
         "are worth reading before you decide whether to record it again."
     )
-    # Dropped in the order that loses least. The steps are the recording; the
-    # declared inputs and outputs are labels on it, and a reviewer can retype
-    # a column name far more easily than a browser can redo the session.
-    for give_up in ("inputs", "secrets", "outputs"):
+    # A step whose references nothing can satisfy, dropped first. This rung
+    # comes before the declarations because a *setup* step reading a per-row
+    # input cannot be fixed by declaring anything -- setup runs once per batch,
+    # so the reference itself is the error -- and because dropping one step
+    # keeps the other forty.
+    offending = _unsatisfiable(fields)
+    if offending:
+        warnings.append(
+            "These steps referenced a value nothing could supply and were left out: "
+            + ", ".join(sorted(offending))
+            + ". The rest of the recording is here."
+        )
+        for phase in ("setup_steps", "row_steps", "teardown_steps"):
+            fields[phase] = [s for s in fields.get(phase) or [] if s.id not in offending]
+        try:
+            return UseCase(**fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Then the labels, in the order that loses least. The steps are the
+    # recording; declared inputs and outputs are labels on it, and a reviewer
+    # can retype a column name far more easily than a browser can redo the
+    # session.
+    #
+    # `secrets` is dropped **last and with its steps**, because dropping it
+    # alone leaves every `{{secret.x}}` in the document undeclared -- which is
+    # a worse document than the one that failed, and is how this ladder once
+    # ran all the way to an empty draft.
+    for give_up in ("inputs", "outputs"):
         fields[give_up] = []
         try:
             return UseCase(**fields)
         except Exception:  # noqa: BLE001
             continue
+
+    fields["secrets"] = []
+    for phase in ("setup_steps", "row_steps", "teardown_steps"):
+        fields[phase] = [
+            s
+            for s in fields.get(phase) or []
+            if not any(kind == "secret" for kind, _ in s.references())
+        ]
+    try:
+        return UseCase(**fields)
+    except Exception:  # noqa: BLE001
+        pass
+
     return UseCase(
         name=str(fields.get("name") or "Recorded by the agent"),
         status="draft",
@@ -223,9 +327,75 @@ def _build(fields: dict[str, Any], warnings: list[str]) -> UseCase:
     )
 
 
+def _as_steps(value: Any) -> list[Step]:
+    """``value`` as `Step` objects, dropping anything that will not become one.
+
+    A step the schema refuses is a step no rung of the recovery can keep, so
+    losing it here is the same answer arrived at earlier and more quietly.
+    """
+    out: list[Step] = []
+    for item in value or []:
+        if isinstance(item, Step):
+            out.append(item)
+            continue
+        try:
+            out.append(Step.model_validate(item))
+        except Exception:  # noqa: BLE001 - see the docstring
+            continue
+    return out
+
+
+def _unsatisfiable(fields: dict[str, Any]) -> set[str]:
+    """Ids of steps referencing something no declaration could supply.
+
+    One case, and it is a modelling error rather than a missing label: a setup
+    step reading a per-row input. Setup runs once per batch, so such a step
+    would apply row one's value to every row -- which looks like success and is
+    not, and is why the schema refuses it.
+    """
+    return {
+        step.id
+        for step in fields.get("setup_steps") or []
+        if any(kind == "input" for kind, _ in step.references())
+    }
+
+
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
+
+
+def _why_not(call: ToolCallRecord) -> str:
+    """Why this call could not become a step, in its own terms.
+
+    One message per reason rather than one for all of them: "nothing says where
+    it went" is true of a navigation with no URL and nonsense about a wait,
+    and a warning that describes the wrong problem sends a reviewer looking in
+    the wrong place.
+    """
+    if call.action == "wait":
+        return (
+            "was left out: it named nothing to wait for -- no text and no "
+            "number of seconds -- so there is no condition for a replay to "
+            "wait on."
+        )
+    return (
+        "could not be recorded: nothing says where it went, so a replay would "
+        "have nowhere to go."
+    )
+
+
+def _first_message(exc: ValidationError) -> str:
+    """The one useful sentence out of a pydantic error report.
+
+    The same shape as ``codegen._first_message``, for the same reason: what
+    reaches a person has to be a sentence, not a validation dump.
+    """
+    for error in exc.errors():
+        message = str(error.get("msg", "")).removeprefix("Value error, ").strip()
+        if message:
+            return message
+    return "the schema refused it"
 
 
 def _steps(
@@ -238,12 +408,22 @@ def _steps(
     is told about."""
     steps: list[Step] = []
     for call in calls:
-        step = _step(call, bindings)
-        if step is None:
+        try:
+            step = _step(call, bindings)
+        except ValidationError as exc:
+            # The codegen recorder has done this from the start: a line it
+            # cannot represent becomes an `Unsupported` entry and the rest of
+            # the recording survives. This path raised instead, so one call
+            # the schema refused threw away a session somebody had just spent
+            # ten minutes driving -- and the only thing they could do with it
+            # was delete it.
             warnings.append(
-                f"{call.name} at step {call.seq} could not be recorded: nothing "
-                "says where it went, so a replay would have nowhere to go."
+                f"{call.name} at step {call.seq} could not be recorded as a step "
+                f"and was left out: {_first_message(exc)}"
             )
+            continue
+        if step is None:
+            warnings.append(f"{call.name} at step {call.seq} {_why_not(call)}")
             continue
         steps.append(step)
         if call.match_count != 1 and step.locators:
@@ -353,7 +533,18 @@ def _step(call: ToolCallRecord, bindings: dict[int, tuple[str, str]]) -> Step | 
         "id": f"a{call.seq}",
         "action": call.action,
         "description": call.element,
-        "locators": [Locator.model_validate(loc) for loc in call.locators],
+        "locators": _ladder(call),
+        # Why the agent did this, in the sentence it had to write before the
+        # call. It was captured on the record and then dropped here, which
+        # left healing and repair the mechanics of every step and the purpose
+        # of none -- see `Step.intent`.
+        "intent": call.observation,
+        # What the element said when the agent acted on it. Checked before a
+        # positional rung is acted on -- see `Step.expect_text`.
+        "expect_text": call.expect_text,
+        # What the page looked like when this worked. Read by a repair, never
+        # by the engine -- see `Step.recorded_page`.
+        "recorded_page": call.page,
     }
 
     if call.action == "navigate":
@@ -365,6 +556,16 @@ def _step(call: ToolCallRecord, bindings: dict[int, tuple[str, str]]) -> Step | 
             return None
         fields["url"] = url
 
+    if call.action == "wait":
+        # `browser_wait_for` was mapped to a `wait` action and then nothing
+        # built the condition, so every wait an agent performed produced a
+        # step the schema refuses -- and the exception took the whole session
+        # with it. A real session was lost to `{"time": 2}`.
+        waiting = _wait_for(call.arguments)
+        if waiting is None:
+            return None
+        fields["wait_for"] = waiting
+
     value = _value_of(call)
     if value is not None:
         # A bound value becomes a template: the point of the whole exercise is
@@ -373,6 +574,65 @@ def _step(call: ToolCallRecord, bindings: dict[int, tuple[str, str]]) -> Step | 
         fields["value"] = bound[1] if bound else value
 
     return Step(**fields)
+
+
+def _ladder(call: ToolCallRecord) -> list[Locator]:
+    """The rungs from the snapshot, plus the one the server actually ran.
+
+    Last, because a CSS path is less durable than a role and name across a
+    redesign -- and present at all because it is the only evidence of which
+    DOM element received the action. A profile picker recorded as
+    `role=radio name="Nayra Asati"` from the tree was clicked by the server as
+    `locator('label').filter({hasText: 'Nayra Asati'})`, because the site's
+    radio input is not clickable. The recording found the radio on replay and
+    spent thirty seconds failing to click it. With this rung the ladder has
+    somewhere to fall through to; `engine._do_element_action` is what falls.
+    """
+    rungs = [Locator.model_validate(loc) for loc in call.locators]
+    served = locator_from(call.ran)
+    if served is None:
+        return rungs
+    already = {rung.describe() for rung in rungs}
+    if served.describe() in already:
+        return rungs
+    return [*rungs, served]
+
+
+def _wait_for(arguments: dict[str, Any]) -> WaitFor | None:
+    """What a recorded ``browser_wait_for`` was actually waiting for.
+
+    The tool takes three arguments and the agent may send any combination of
+    them, including all three with two of them blank -- seen for real:
+    ``{"text": "architecture", "time": 2, "textGone": ""}``.
+
+    Text wins over time when both are given. A replay that waits for the text
+    waits exactly as long as the page needs; one that sleeps for the recorded
+    two seconds is guessing that the next page is no slower than this one was,
+    which is the guess every flaky replay is built on.
+
+    ``None`` when the call named no condition at all. There is nothing to wait
+    for, so the step is dropped and reported rather than turned into a sleep
+    nobody asked for.
+    """
+    text = str(arguments.get("text") or "").strip()
+    if text:
+        return WaitFor(kind="text", value=text)
+
+    gone = str(arguments.get("textGone") or arguments.get("text_gone") or "").strip()
+    if gone:
+        return WaitFor(kind="text_gone", value=gone)
+
+    try:
+        seconds = float(arguments.get("time") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0:
+        # Clamped to what the schema allows rather than refused: a recorded
+        # wait longer than two minutes is a person's patience, not a
+        # requirement, and losing the step over it would be the worse trade.
+        return WaitFor(kind="time", seconds=min(seconds, 120.0))
+
+    return None
 
 
 def _value_of(call: ToolCallRecord) -> str | None:

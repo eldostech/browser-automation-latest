@@ -72,8 +72,60 @@ class Settings(BaseSettings):
     #: foundation model fails with "on-demand throughput isn't supported".
     llm_repair_model: str = "us.anthropic.claude-opus-5"
 
+    #: Which provider answers a model call by default.
+    #:
+    #: This module's own docstring used to say Bedrock "and only that", on the
+    #: reasoning that a second provider is a second code path to keep working.
+    #: That reasoning holds for a *deployment* and did not survive contact with
+    #: the reason anyone wants a second one: comparing models for accuracy.
+    #: OpenRouter is one endpoint in front of most of them, so it buys a great
+    #: many models for one code path rather than one model for each -- and it
+    #: is OpenAI-shaped, which `langchain-openai` already speaks.
+    #:
+    #: A run may override this per request; see `llm.ModelChoice`. This is the
+    #: fallback for everything that does not.
+    llm_provider: Literal["bedrock", "openrouter"] = "bedrock"
+
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
+
+    # --- OpenRouter --------------------------------------------------------
+    #: The key. Without it the provider is offered nowhere and selecting it is
+    #: refused with that as the reason, rather than failing at the first call.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
+    #: Used when a run asks for OpenRouter without naming a model. Blank means
+    #: "no default": the picker has to choose, which is honest for a provider
+    #: whose whole point is that there are hundreds.
+    openrouter_model: str = ""
+
+    #: Sent as OpenRouter's attribution headers. They show up on their activity
+    #: page, which is how an operator tells this application's spend apart from
+    #: everything else on the same key.
+    openrouter_app_name: str = "TRACE"
+    openrouter_app_url: str = ""
+
+    #: How long the fetched model catalogue is reused before asking again.
+    #: OpenRouter lists hundreds and changes them weekly; refetching per page
+    #: load would put a third-party request in front of the dashboard.
+    openrouter_catalog_ttl_seconds: int = 900
+
+    #: The Bedrock models offered in the picker.
+    #:
+    #: A list rather than a discovery call: `ListFoundationModels` returns what
+    #: the *region* carries, not what this account may invoke, so it offers
+    #: models that then fail with an access error -- and it needs an IAM
+    #: permission beyond invoking a model, which a deployment given only
+    #: `bedrock:InvokeModel` does not have. An operator who wants a different
+    #: one adds it here, where the region prefix is visible and deliberate.
+    bedrock_models: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "us.anthropic.claude-opus-5",
+            "us.anthropic.claude-sonnet-5",
+            "us.anthropic.claude-haiku-4-5-20251001",
+        ]
+    )
 
     #: Claude's extended-thinking budget, in tokens. 0 disables it. A model
     #: asked to act with no room to reason first will happily emit a tool
@@ -246,6 +298,20 @@ class Settings(BaseSettings):
     #: watching an authoring session wants to see it, and that is a per-session
     #: choice made where the session starts rather than here.
     agent_headless: bool = True
+    #: Whether a finished recording is replayed once, cold, before anybody
+    #: sees the draft.
+    #:
+    #: On, because it is the only thing that distinguishes "the agent got
+    #: through the task" from "this recording runs" -- the two are not the same
+    #: and the gap between them is what a reviewer cannot see. The replay
+    #: itself spends **no tokens**: it is the ordinary engine, which has no
+    #: path to a model. What it costs is a browser launch and one pass through
+    #: the flow.
+    #:
+    #: Turn it off if that wall-clock cost is not worth it to you. What you
+    #: give up is finding out that a draft does not replay *before* publishing
+    #: it rather than on the first real run.
+    agent_verify_draft: bool = True
 
     # --- Job worker --------------------------------------------------------
     #: Whether this process claims queued batches as well as serving HTTP. True
@@ -348,7 +414,33 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173"]
     )
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _known_provider(cls, value):  # noqa: ANN001 - pydantic hook
+        """Accept a stale value from an older .env rather than refusing to start.
+
+        This setting existed once, was removed when the codebase went
+        Bedrock-only, and is back. An operator upgrading across all of that may
+        still have `LLM_PROVIDER=anthropic` in a file nobody has opened in
+        months, and a backend that will not start because of one dead line is a
+        worse outcome than one that starts on its default and says so.
+
+        A *typo* still fails, which is the house rule -- see
+        `test_a_typo_in_a_typed_setting_fails_at_load`. Only the one value this
+        codebase itself used to accept is forgiven.
+        """
+        if isinstance(value, str) and value.strip().lower() == "anthropic":
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "LLM_PROVIDER=anthropic is from an older version of this "
+                "application and no longer exists; using bedrock. Set it to "
+                "'bedrock' or 'openrouter' to say which you meant."
+            )
+            return "bedrock"
+        return value
+
+    @field_validator("cors_origins", "bedrock_models", mode="before")
     @classmethod
     def _csv(cls, value):  # noqa: ANN001 - pydantic hook
         return _split_csv(value)

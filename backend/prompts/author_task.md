@@ -2,6 +2,8 @@
 
 $task
 
+$brief
+
 ## Where
 
 Start at: $start_url

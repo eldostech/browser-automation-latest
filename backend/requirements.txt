@@ -46,6 +46,10 @@ playwright>=1.48,<2.0
 # MCP server to talk to.
 langchain-core>=1.6,<2.0
 langchain-aws>=1.7,<2.0
+# OpenRouter, which is OpenAI-shaped on purpose: one endpoint in front of most
+# of the models a person would want to compare for accuracy. `langchain-openai`
+# supplies that wire format; nothing here talks to OpenAI itself.
+langchain-openai>=1.0,<2.0
 
 # botocore, for resolving and reporting AWS credentials in /healthz.
 botocore>=1.34,<2.0

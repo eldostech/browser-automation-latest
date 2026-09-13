@@ -42,6 +42,10 @@ REPAIR = "repair"
 REPAIR_REQUEST = "repair_request"
 AUTHOR = "author"
 AUTHOR_TASK = "author_task"
+BRIEF = "brief"
+BRIEF_REQUEST = "brief_request"
+WALKTHROUGH = "walkthrough"
+WALKTHROUGH_REQUEST = "walkthrough_request"
 RECOVER = "recover"
 EXPLORE = "explore"
 
@@ -56,6 +60,10 @@ REQUIRED_PROMPTS: tuple[str, ...] = (
     REPAIR_REQUEST,
     AUTHOR,
     AUTHOR_TASK,
+    BRIEF,
+    BRIEF_REQUEST,
+    WALKTHROUGH,
+    WALKTHROUGH_REQUEST,
     RECOVER,
     EXPLORE,
 )

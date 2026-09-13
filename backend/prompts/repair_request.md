@@ -5,7 +5,10 @@ Use case: $name
 - failing step: $failed_step_id — $failed_step
 - its action: $failed_action
 - element it looked for: $wanted
+$purpose
 - error: $error
+
+$call_log
 
 ## Where it was
 
@@ -19,6 +22,8 @@ $steps
 ## Controls on the page when it failed
 
 $candidates
+
+$was_working
 
 ## Fixes already made on this site
 

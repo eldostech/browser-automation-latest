@@ -26,6 +26,41 @@ import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
 import { BrandSpinner } from './BrandSpinner';
 
+/** Actions the screen waits for, and what to say while it does. */
+const BLOCKING: Record<
+  string,
+  { state: 'working' | 'validating'; label: string; detail: string }
+> = {
+  fixIt: {
+    state: 'validating',
+    label: 'Diagnosing the failure and drafting a fix…',
+    detail:
+      'One model call: reads the page as it was when the step broke, and proposes a repair. This can take up to half a minute.',
+  },
+  run: {
+    state: 'working',
+    label: 'Running this workflow…',
+    detail:
+      "No model is involved in the replay itself. How long this takes depends on the site it drives — you'll see the full step-by-step trail once it finishes.",
+  },
+  runBatch: {
+    state: 'working',
+    label: 'Queueing the rows…',
+    detail:
+      'The batch runs on the server, so it keeps going if you close this tab. Progress appears here as soon as it starts.',
+  },
+  resume: {
+    state: 'working',
+    label: 'Re-running the rows that did not succeed…',
+    detail: 'Rows that already succeeded are left alone.',
+  },
+  describe: {
+    state: 'validating',
+    label: 'Reading the steps and writing down what this does…',
+    detail: 'One model call over the recorded steps. Nothing that runs is changed.',
+  },
+};
+
 interface Props {
   usecaseId: string;
   onBack: () => void;
@@ -266,7 +301,7 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // edit here: patch the definition, save as a new version, reload.
   const editStep =
     (phase: 'setup_steps' | 'row_steps' | 'row_reset') =>
-    (stepId: string, field: 'url' | 'value', value: string) =>
+    (stepId: string, field: 'url' | 'value' | 'expect_text', value: string) =>
       act(async () => {
         if (!useCase) return;
         const patch = (step: UseCaseStep) =>
@@ -462,6 +497,37 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       await load();
     }, 'fixIt');
 
+  // Downloaded rather than shown in a panel: it is a file, it is long, and
+  // the thing somebody wants to do with it is put it in a repository. Built
+  // from a blob so no second endpoint has to serve it as an attachment.
+  const [script, setScript] = useState<{ filename: string; script: string } | null>(null);
+
+  const exportScript = () =>
+    act(async () => {
+      const result = await api.exportPython(usecaseId);
+      setScript({ filename: result.filename, script: result.script });
+      setNotice(
+        `Exported ${result.filename}. This is a one-way export: TRACE runs the ` +
+          `use case, not the file, so re-export after any repair.`,
+      );
+    }, 'exportScript');
+
+  const describe = () =>
+    act(async () => {
+      const result = await api.describeUseCase(usecaseId);
+      setNotice(
+        [
+          result.instructions,
+          '',
+          `Saved as v${result.version}, still ${result.status}. ` +
+            `${result.steps_described} step(s) now say what they are for. ` +
+            `${result.llm_tokens} tokens.`,
+          ...result.warnings.map((line) => `• ${line}`),
+        ].join('\n'),
+      );
+      await load();
+    }, 'describe');
+
   const rename = (name: string) =>
     act(async () => {
       setDraftName(null);
@@ -525,24 +591,19 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
   // themselves code execution by editing JSON.
   const scriptsNeedAdmin = scriptSteps.length > 0 && !scriptsEnabled;
 
-  const blockingAction = busyAction === 'fixIt' ? 'fixIt' : busyAction === 'run' ? 'run' : null;
+  // The actions the whole screen has to wait for, each with what it is
+  // actually doing. A click that starts something slow and then shows nothing
+  // is the same to a person as a click that did nothing.
+  const blocking = busyAction ? BLOCKING[busyAction] : undefined;
 
   return (
     <div className="spinner-host">
-      {blockingAction === 'fixIt' && (
+      {blocking && (
         <BrandSpinner
-          layout="overlay"
-          state="validating"
-          label="Diagnosing the failure and drafting a fix…"
-          detail="One model call: reads the page as it was when the step broke, and proposes a repair. This can take up to half a minute."
-        />
-      )}
-      {blockingAction === 'run' && (
-        <BrandSpinner
-          layout="overlay"
-          state="working"
-          label="Running this workflow…"
-          detail="No model is involved in the replay itself. How long this takes depends on the site it drives — you'll see the full step-by-step trail once it finishes."
+          layout="blocking"
+          state={blocking.state}
+          label={blocking.label}
+          detail={blocking.detail}
         />
       )}
       <div className="run-header">
@@ -628,6 +689,76 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
         </div>
       )}
       {notice && <div className="banner" style={{ whiteSpace: 'pre-wrap' }}>{notice}</div>}
+
+      {/* What the workflow is for, in plain language, above the steps rather
+          than below them. A reviewer's first question is "is this the thing I
+          asked for", and the step list cannot answer it. */}
+      <section className="card">
+        <header>
+          <h2>What this does</h2>
+          <span className="hint">
+            {useCase.instructions
+              ? 'Written from the recording. Read it against the steps.'
+              : 'Nothing recorded says what this workflow is for.'}
+          </span>
+          <button type="button" className="ghost" onClick={exportScript} disabled={busy}>
+            {busyAction === 'exportScript' ? (
+              <BrandSpinner state="working" label="Writing it out…" />
+            ) : (
+              'Export as Playwright Python'
+            )}
+          </button>
+          <button type="button" className="ghost" onClick={describe} disabled={busy}>
+            {busyAction === 'describe' ? (
+              <BrandSpinner state="working" label="Reading the steps…" />
+            ) : useCase.instructions ? (
+              'Rewrite with AI'
+            ) : (
+              'Describe with AI'
+            )}
+          </button>
+        </header>
+        <div className="body">
+          {script && (
+            <details className="step-script" open>
+              <summary>{script.filename}</summary>
+              <p className="hint" style={{ margin: '6px 0' }}>
+                Only the leading locator of each step is executed here. The rest of each
+                ladder is written beside it as a comment, because a script that fell
+                through a ladder would be the engine, reimplemented.
+              </p>
+              <div className="row" style={{ marginBottom: 6 }}>
+                <button
+                  type="button"
+                  className="linkish"
+                  onClick={() => void navigator.clipboard.writeText(script.script)}
+                >
+                  Copy
+                </button>
+                <a
+                  download={script.filename}
+                  href={URL.createObjectURL(
+                    new Blob([script.script], { type: 'text/x-python' }),
+                  )}
+                >
+                  Download
+                </a>
+              </div>
+              <pre>{script.script}</pre>
+            </details>
+          )}
+          {useCase.instructions ? (
+            <p className="usecase-instructions">{useCase.instructions}</p>
+          ) : (
+            <p className="hint" style={{ margin: 0 }}>
+              One LLM call reads the steps and writes what the workflow does, plus a line
+              per step saying what it is for. Repairs read those lines, which is what turns
+              "which of these controls resembles a link named Billing" into "which of these
+              opens the customer's billing tab". Nothing that runs is changed.
+            </p>
+          )}
+        </div>
+      </section>
 
       {useCase.warnings.length > 0 && (
         <div className="banner warn">

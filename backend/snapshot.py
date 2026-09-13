@@ -506,3 +506,41 @@ def locator_for(snapshot: "Snapshot", node: Node):
         )
     position = index_among(snapshot, node, True)
     return base.model_copy(update={"nth": position}) if position else None
+
+
+def named_controls(page: str, roles: "frozenset[str]", limit: int) -> list[str]:
+    """The named controls in a snapshot, one per line, deduplicated.
+
+    Both the healer and the repair doctor show a diagnosis the page as it was
+    when the step last worked, beside the page as it is now. This is that
+    listing, and it lives here rather than in either of them because two copies
+    of it drifted once already: the field it reads (`Step.recorded_page`) was
+    wired into healing and reported as wired into repair when it was not.
+
+    Deliberately *not* the same as either module's candidate list. Those are
+    numbered, because a model answers them with an index; this has no numbers,
+    because nothing in it is selectable -- none of it is on the page any more.
+    """
+    if not page:
+        return []
+    try:
+        before = parse(page)
+    except Exception:  # noqa: BLE001 - context is a bonus, never a requirement
+        return []
+
+    seen: set[str] = set()
+    lines: list[str] = []
+    for node in before:
+        if node.role not in roles:
+            continue
+        label = node.name or node.text
+        if not label:
+            continue
+        entry = f'- {node.role} "{label}"'
+        if entry in seen:
+            continue
+        seen.add(entry)
+        lines.append(entry)
+        if len(lines) >= limit:
+            break
+    return lines

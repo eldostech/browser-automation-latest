@@ -435,3 +435,80 @@ async def test_starting_a_session_can_request_a_visible_browser(client: TestClie
     client.post("/api/agent-sessions", json={**START, "headless": False})
 
     assert seen["headless"] is False
+
+
+# --- a password typed into the task ----------------------------------------
+#
+# The task text is the run row, the `run_started` event, the audit entry, the
+# use case's own description and the first message sent to a model. A redactor
+# cannot help: none of those know the string is a password. So it is caught on
+# the way in.
+
+
+PASTED = {
+    "task": (
+        "Go to this website\n\nLogin with below credentials\n"
+        "User: nitinasati\nPassword : HappyLearning@123\n\n"
+        "Select Nayra Asati and open the assignment."
+    ),
+    "start_url": "https://vendor.test/accounts",
+}
+
+
+async def test_a_task_with_a_password_and_no_credential_is_refused(client: TestClient):
+    """Refused rather than started, because that session could not sign in
+    anyway: the value is not going to be stored or sent, and there is nothing
+    bound to use instead. Better said now than discovered after a budget."""
+    arm(client)
+
+    response = client.post("/api/agent-sessions", json=PASTED)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "password" in detail
+    assert "Credentials" in detail, "and where to put it instead"
+    assert "Sign in as" in detail
+
+
+async def test_the_value_never_reaches_the_run_the_audit_or_the_model(client: TestClient):
+    """With a credential bound, the task is rewritten to the slots that hold
+    the values -- which is the literal the recorder is already told to type."""
+    from conftest import app_workspace
+
+    arm(client)
+    created = client.post(
+        "/api/credentials",
+        json={"name": "vendor", "values": {"username": "nitinasati", "password": "HappyLearning@123"}},
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.post(
+        "/api/agent-sessions",
+        json={**PASTED, "credential_id": created.json()["id"]},
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    session = await settle(client, body["id"], {"succeeded", "partial", "failed"})
+
+    assert "HappyLearning@123" not in session["task"]
+    assert "{{secret.password}}" in session["task"]
+    assert "Select Nayra Asati" in session["task"], "the rest of the task survives"
+    assert "replaced" in (body.get("notice") or ""), "and the person is told"
+
+    store = await app_workspace(client.app)
+    run = await store.get_run(session["run_id"])
+    assert "HappyLearning@123" not in (getattr(run, "task", "") or "")
+
+    entries = await store.list_audit(limit=20)
+    written = " ".join(str(entry) for entry in entries)
+    assert "HappyLearning@123" not in written
+
+
+async def test_a_task_with_no_credentials_in_it_is_started_unchanged(client: TestClient):
+    arm(client)
+
+    response = client.post("/api/agent-sessions", json=START)
+
+    assert response.status_code == 201
+    assert response.json().get("notice") is None
+    assert response.json()["task"] == START["task"]

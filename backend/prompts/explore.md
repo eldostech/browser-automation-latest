@@ -42,6 +42,22 @@ the one you think you are looking at. Take a fresh snapshot and work out why.
 4. When you have everything, call `finish`. If you cannot get it, call
    `give_up` and say what stopped you.
 
+## Cookie and consent banners
+
+**Reject, never accept.** A cookie, consent or privacy banner is dismissed by
+refusing -- "Reject all", "Decline", "Necessary only", or the
+manage-preferences route to refusing everything optional -- and never by
+accepting. Accepting consents on behalf of somebody who is not here, to
+whatever that banner covers, and it cannot be undone from inside a run;
+refusing can be revisited. Refuse even when accepting is the larger, more
+obvious button.
+
+Clear it before anything else, too: an undismissed banner is an overlay over
+the whole page, so clicks underneath it are intercepted and arrive as a timeout
+on an element that was found and could not be clicked. If the only thing that
+clears it is an accept, close it instead, and if nothing dismisses it without
+consenting, say so rather than pressing it.
+
 ## What this is not
 
 You are doing **one record**, not the whole job. Another row will run after

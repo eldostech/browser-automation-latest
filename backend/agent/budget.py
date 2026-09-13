@@ -81,6 +81,16 @@ class Spend:
     budget: Budget = field(default_factory=Budget)
     steps: int = 0
     tokens: int = 0
+    #: How many of ``tokens`` were cache reads -- the same prompt prefix sent
+    #: again and recognised, at a tenth of the price.
+    #:
+    #: Tracked separately because the token *ceiling* is enforced on the rest.
+    #: A real session recorded 405,305 tokens and cost 44 cents: nearly all of
+    #: it was one long prefix re-read on every turn, which caching exists to
+    #: make cheap. Counting those against a runaway ceiling stopped a session
+    #: that had over half its money left, mid-record, with nothing to show --
+    #: which is budget starvation wearing the costume of a limit working.
+    cache_read: int = 0
     usd: float = 0.0
     llm_calls: int = 0
     started_at: float = field(default_factory=time.monotonic)
@@ -89,13 +99,37 @@ class Spend:
     def step(self) -> None:
         self.steps += 1
 
-    def turn(self, usage: dict[str, int], model: str = "") -> None:
-        """One model turn: its tokens, and what they cost."""
+    def turn(
+        self,
+        usage: dict[str, int],
+        model: str = "",
+        rates: "tuple[float, float] | None" = None,
+    ) -> None:
+        """One model turn: its tokens, and what they cost.
+
+        ``rates`` is the provider's own price, which beats the hand-maintained
+        table. It matters here more than anywhere: the USD ceiling is enforced
+        against this number, so costing an OpenRouter model from a default that
+        happens to be Claude Sonnet's would stop a cheap session early and let
+        an expensive one run past its budget.
+        """
         self.llm_calls += 1
         self.tokens += int(usage.get("input_tokens") or 0) + int(
             usage.get("output_tokens") or 0
         )
-        self.usd += price_of(model, usage)
+        self.cache_read += int(usage.get("cache_read_tokens") or 0)
+        self.usd += price_of(model, usage, rates)
+
+    @property
+    def fresh_tokens(self) -> int:
+        """Tokens the provider had to actually read, cache hits excluded.
+
+        What the token ceiling is enforced against. ``tokens`` stays the true
+        total because that is what a person is owed on the screen and what the
+        run row records; this is the number that answers "is this session
+        running away", and a prefix recognised from cache is not running away.
+        """
+        return max(0, self.tokens - self.cache_read)
 
     @property
     def elapsed(self) -> float:
@@ -116,10 +150,17 @@ class Spend:
                 "If it was still making progress, raise the step budget and run "
                 "it again from here.",
             )
-        if caps.tokens is not None and self.tokens >= caps.tokens:
+        if caps.tokens is not None and self.fresh_tokens >= caps.tokens:
+            cached = (
+                f" ({self.tokens:,} in total, {self.cache_read:,} of them read from "
+                "cache and not counted against this limit)"
+                if self.cache_read
+                else ""
+            )
             return (
                 "tokens",
-                f"Stopped at {self.tokens:,} tokens, the limit for this session.",
+                f"Stopped at {self.fresh_tokens:,} new tokens, the limit for this "
+                f"session{cached}.",
             )
         if caps.usd is not None and self.usd >= caps.usd:
             return (
@@ -145,6 +186,8 @@ class Spend:
         return {
             "steps": self.steps,
             "tokens": self.tokens,
+            "cache_read_tokens": self.cache_read,
+            "fresh_tokens": self.fresh_tokens,
             "usd": round(self.usd, 4),
             "llm_calls": self.llm_calls,
             "seconds": round(self.elapsed, 1),

@@ -99,6 +99,12 @@ async def test_an_ambiguous_click_resolved_by_position_gets_a_mild_note():
             turn_calling("browser_snapshot"),
             turn_calling("mark_setup_complete"),
             turn_calling("begin_row", key="project-b"),
+            # Twice, because a click whose only distinguishing feature is
+            # its position is now refused once at record time -- the page is
+            # still on screen and something scoped is usually available. Here
+            # there is not, so the repeat is the agent saying so, and the step
+            # is recorded with the milder note this test is about.
+            turn_calling("browser_click", target="e8", element="Chat button for Project B"),
             turn_calling("browser_click", target="e8", element="Chat button for Project B"),
             turn_calling("mark_as_output", ref="e5", column="open_label"),
             turn_calling("end_row"),
@@ -113,7 +119,11 @@ async def test_an_ambiguous_click_resolved_by_position_gets_a_mild_note():
     )
 
     assert result.use_case is not None
-    click_step = next(s for s in result.use_case["row_steps"] if s["action"] == "click")
+    # One click recorded, not two: the refused attempt never reached the
+    # browser and never became a step.
+    clicks = [s for s in result.use_case["row_steps"] if s["action"] == "click"]
+    assert len(clicks) == 1
+    click_step = clicks[0]
     assert click_step["locators"][0]["name"] == "Chat"
     assert click_step["locators"][0]["nth"] == 1, "e8 is the second of the two matches"
     warning = next(w for w in result.draft_warnings if click_step["id"] in w)
@@ -191,6 +201,12 @@ async def test_a_click_on_an_unnamed_generic_wrapper_gets_the_unreliable_warning
             turn_calling("browser_snapshot"),
             turn_calling("mark_setup_complete"),
             turn_calling("begin_row", key="project-b"),
+            # Refused the first time: the wrapper cannot be *described*, and
+            # the agent is told so while the page is still in front of it.
+            turn_calling("browser_click", target="e3", element="second project card"),
+            # Repeated, which is the agent saying there is nothing better on
+            # this page -- and on this page there genuinely is not. It goes
+            # through, carrying the warning a reviewer has to act on.
             turn_calling("browser_click", target="e3", element="second project card"),
             turn_calling("end_row"),
             turn_calling(FINISH, summary="Opened the second project."),
@@ -597,3 +613,268 @@ async def test_typing_a_per_row_value_before_the_row_began_moves_into_it():
     assert "fill" not in setup
     assert any("before the row began" in w for w in result.draft_warnings)
     assert [i["name"] for i in result.use_case["inputs"]] == ["account"]
+
+
+# ---------------------------------------------------------------------------
+# A recorded wait
+# ---------------------------------------------------------------------------
+#
+# `browser_wait_for` was mapped to a `wait` action and then nothing built the
+# condition, so every wait an agent performed produced a step the schema
+# refuses -- and the exception came out of `distil` and took the whole session
+# with it. A real session was lost to `{"time": 2}`, twice.
+
+
+def a_call(seq, name, action, arguments, locators=(), page_url="https://x.test/"):
+    from agent.session import ToolCallRecord
+
+    return ToolCallRecord(
+        seq=seq,
+        name=name,
+        arguments=dict(arguments),
+        ok=True,
+        action=action,
+        locators=list(locators),
+        element="",
+        page_url=page_url,
+    )
+
+
+def test_a_recorded_pause_becomes_a_timed_wait():
+    from agent.distil import _steps
+
+    steps = _steps([a_call(36, "browser_wait_for", "wait", {"time": 2})], {}, [])
+
+    assert len(steps) == 1
+    assert steps[0].wait_for is not None
+    assert steps[0].wait_for.kind == "time"
+    assert steps[0].wait_for.seconds == 2.0
+
+
+def test_waiting_for_text_beats_waiting_for_a_number_of_seconds():
+    """The agent sends both. Seen for real:
+    `{"text": "architecture", "time": 2, "textGone": ""}`.
+
+    A replay that waits for the text waits exactly as long as the page needs;
+    one that sleeps for the recorded two seconds is guessing the next page is
+    no slower than this one was, which is the guess every flaky replay rests
+    on.
+    """
+    from agent.distil import _steps
+
+    steps = _steps(
+        [
+            a_call(
+                125,
+                "browser_wait_for",
+                "wait",
+                {"text": "architecture", "time": 2, "textGone": ""},
+            )
+        ],
+        {},
+        [],
+    )
+
+    assert steps[0].wait_for.kind == "text"
+    assert steps[0].wait_for.value == "architecture"
+
+
+def test_waiting_for_text_to_go_is_recorded_as_that():
+    from agent.distil import _steps
+
+    steps = _steps(
+        [a_call(1, "browser_wait_for", "wait", {"textGone": "Loading"})], {}, []
+    )
+
+    assert steps[0].wait_for.kind == "text_gone"
+    assert steps[0].wait_for.value == "Loading"
+
+
+def test_a_wait_that_named_no_condition_is_left_out_and_said_so():
+    """Turning it into a sleep nobody asked for would be inventing a step."""
+    from agent.distil import _steps
+
+    warnings: list[str] = []
+    steps = _steps([a_call(1, "browser_wait_for", "wait", {})], {}, warnings)
+
+    assert steps == []
+    assert len(warnings) == 1
+    assert "named nothing to wait for" in warnings[0]
+
+
+def test_an_absurdly_long_pause_is_clamped_rather_than_refused():
+    """A recorded wait longer than the schema allows is a person's patience,
+    not a requirement, and losing the step over it is the worse trade."""
+    from agent.distil import _steps
+
+    steps = _steps([a_call(1, "browser_wait_for", "wait", {"time": 900})], {}, [])
+
+    assert steps[0].wait_for.seconds == 120.0
+
+
+def test_one_call_the_schema_refuses_no_longer_destroys_the_session():
+    """The codegen recorder has always reported an unrepresentable line and
+    kept the rest. This path raised instead, so one bad call threw away a
+    session somebody had just spent ten minutes driving -- and the only thing
+    they could do with it was delete it.
+    """
+    from agent.distil import _steps
+
+    warnings: list[str] = []
+    calls = [
+        a_call(
+            1,
+            "browser_click",
+            "click",
+            {"target": "e1"},
+            [{"strategy": "role", "role": "button", "name": "Search"}],
+        ),
+        # `extract` requires an output name, and nothing here supplies one --
+        # a stand-in for any call the schema will not take.
+        a_call(2, "browser_snapshot", "extract", {}),
+        a_call(
+            3,
+            "browser_click",
+            "click",
+            {"target": "e2"},
+            [{"strategy": "role", "role": "button", "name": "Next"}],
+        ),
+    ]
+
+    steps = _steps(calls, {}, warnings)
+
+    assert [step.id for step in steps] == ["a1", "a3"], "the rest survives"
+    assert any("could not be recorded as a step" in w for w in warnings)
+
+
+def test_the_reason_a_call_was_left_out_describes_that_call():
+    """"Nothing says where it went" is true of a navigation with no URL and
+    nonsense about a wait. A warning that describes the wrong problem sends a
+    reviewer looking in the wrong place."""
+    from agent.distil import _steps
+
+    warnings: list[str] = []
+    _steps(
+        [
+            a_call(1, "browser_wait_for", "wait", {}),
+            a_call(2, "browser_navigate_back", "navigate", {}, page_url=""),
+        ],
+        {},
+        warnings,
+    )
+
+    assert "nothing to wait for" in warnings[0]
+    assert "nowhere to go" in warnings[1]
+
+
+# --- the session that came back with no steps at all ----------------------
+#
+# Found in production, and the worst shape a failure can take: the agent
+# signed in, solved the task, signed out, and the draft had nothing in it. The
+# person saw a perfect transcript beside an empty use case.
+#
+# The chain: `mark_as_secret` was refused because the ref resolved to a
+# locator matching three elements, so the slot was never declared. The step
+# that typed `{{secret.secretword}}` stayed. One undeclared reference fails
+# validation -- and the recovery then dropped `secrets`, which left *every*
+# `{{secret.x}}` undeclared, failed again, and ran out at an empty document.
+
+
+def _typed_but_unmarked():
+    """A value typed as a placeholder whose mark did not go through."""
+    from agent.marks import Described, Marks
+    from agent.session import ToolCallRecord
+    from usecase import Locator
+
+    ladder = [
+        Locator(strategy="role", role="textbox", name="Username").model_dump(
+            mode="json", exclude_none=True
+        )
+    ]
+
+    def call(seq, action, name, **kw):
+        return ToolCallRecord(seq=seq, name=name, ok=True, action=action, **kw)
+
+    calls = [
+        call(1, "navigate", "browser_navigate", arguments={"url": "https://ixl.test/signin"}),
+        call(2, "fill", "browser_type", arguments={"target": "e1", "text": "{{secret.login}}"},
+             locators=ladder, element='role=textbox name="Username"'),
+        call(3, "", "mark_as_secret", arguments={"ref": "e1", "slot": "login"}),
+        # Typed. The mark came back "matches 3 elements" and was refused, so
+        # nothing declared the slot.
+        call(4, "fill", "browser_type", arguments={"target": "e2", "text": "{{secret.secretword}}"},
+             locators=ladder, element='role=textbox name="Secret word"'),
+        call(5, "", "mark_setup_complete", arguments={}),
+        call(6, "", "begin_row", arguments={"key": "row-1"}),
+        call(7, "fill", "browser_type", arguments={"target": "e3", "text": "490"},
+             locators=ladder, element='role=textbox name="answer"'),
+        call(8, "click", "browser_click", arguments={"target": "e4"},
+             locators=ladder, element='role=button name="Submit"'),
+        call(9, "", "end_row", arguments={}),
+    ]
+
+    marks = Marks()
+    described = Described(
+        ref="e1", role="textbox", name="Username",
+        ladder=[Locator.model_validate(ladder[0])],
+    )
+    marks.mark_value("mark_as_secret", 3, "e1", "login", described)
+    marks.setup_complete(5)
+    marks.begin_row(6, "row-1")
+    marks.end_row(9)
+    return calls, marks
+
+
+def _draft_of(calls, marks):
+    from agent.distil import distil
+
+    return distil(
+        calls, marks, name="IXL", task="solve one problem",
+        start_url="https://ixl.test", allowed_domains=("ixl.test",),
+    )
+
+
+def test_a_typed_secret_whose_mark_was_refused_does_not_empty_the_draft():
+    """The regression, stated as the thing the person actually lost."""
+    draft = _draft_of(*_typed_but_unmarked())
+
+    assert len(draft.use_case.setup_steps) == 3
+    assert len(draft.use_case.row_steps) == 2
+
+
+def test_the_slot_is_declared_from_the_step_that_types_it():
+    """A step typing `{{secret.x}}` is the recording saying it needs a slot
+    called x. A mark is refused for reasons that have nothing to do with
+    whether the value is a credential."""
+    draft = _draft_of(*_typed_but_unmarked())
+
+    assert [s.name for s in draft.use_case.secrets] == ["login", "secretword"]
+
+
+def test_and_the_reviewer_is_told_which_slot_to_bind():
+    """A declared slot nobody fills is refused later by name, which is a
+    minute's work. A draft with no steps is not."""
+    draft = _draft_of(*_typed_but_unmarked())
+
+    said = " ".join(draft.warnings)
+    assert "secretword" in said
+    assert "Bind a credential" in said
+
+
+def test_dropping_secrets_can_never_be_the_recovery_for_a_reference():
+    """The rung that turned one bad reference into an empty document. Dropping
+    the declarations leaves every remaining `{{secret.x}}` undeclared, which is
+    a worse document than the one that failed."""
+    from agent.distil import _build
+
+    calls, marks = _typed_but_unmarked()
+    draft = _draft_of(calls, marks)
+    fields = draft.use_case.model_dump(mode="json", by_alias=True)
+    fields["secrets"] = []
+
+    rebuilt = _build(fields, [])
+
+    # Either the steps survive with their slots, or the steps that needed a
+    # slot are the only thing dropped. What must not happen is everything
+    # going.
+    assert rebuilt.setup_steps or rebuilt.row_steps

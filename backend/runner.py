@@ -41,7 +41,7 @@ from events import (
     dump_event,
 )
 from lifecycle import RunLifecycle, Terminal
-from llm import LLMClient
+from llm import LLMClient, ModelChoice
 from credentials import Vault, VaultError
 from jobs import ClaimedJob, JobQueue
 from logging_setup import bind_run_id
@@ -243,6 +243,9 @@ class ExecutionRequest:
 
     headless: bool | None = None
     browser: str | None = None
+    #: Which model this run may heal with, when it is not the configured one.
+    #: On the request because comparing two models means running two at once.
+    model: "ModelChoice | None" = None
     #: The tenant this execution belongs to, and who asked for it.
     workspace_id: str = ""
     owner_id: str | None = None
@@ -304,6 +307,7 @@ class ReplayManager:
         usecase_id: str | None = None,
         *,
         mode: "Mode | None" = None,
+        model: "ModelChoice | None" = None,
     ) -> Any:
         """A healer, or None when this use case runs strictly.
 
@@ -329,8 +333,15 @@ class ReplayManager:
             return None
         from healing import HealingBudget, StepHealer
 
+        # `llm_factory` is the model pool, which answers for a choice. A
+        # factory that ignored the argument would silently heal on the
+        # configured model while the dashboard said otherwise, which is the
+        # one failure mode a model picker must not have.
+        chooser = getattr(self.llm_factory, "for_choice", None)
+        client = chooser(model) if chooser is not None else self.llm_factory()
+
         return StepHealer(
-            self.llm_factory(),
+            client,
             HealingBudget(
                 max_attempts=self.settings.replay_heal_max_attempts,
                 max_tokens=self.settings.replay_heal_max_tokens,
@@ -561,6 +572,12 @@ class ReplayManager:
                     "headless": request.headless,
                     "browser": request.browser,
                     "owner_email": request.owner_email,
+                    # The model the person chose, carried into the queue.
+                    # Without it a worker heals on whatever *that* process was
+                    # configured for, so a batch would quietly use a different
+                    # model from the one the dashboard said it would.
+                    "model_provider": request.model.provider if request.model else None,
+                    "model_id": request.model.model if request.model else None,
                 },
                 workspace_id=request.workspace_id,
                 owner_id=request.owner_id,
@@ -629,6 +646,13 @@ class ReplayManager:
             only_rows=only_rows,
             headless=payload.get("headless"),
             browser=payload.get("browser"),
+            model=(
+                ModelChoice(
+                    str(payload["model_provider"]), str(payload.get("model_id") or "")
+                )
+                if payload.get("model_provider")
+                else None
+            ),
             workspace_id=job.workspace_id,
             owner_id=job.owner_id,
             owner_email=str(payload.get("owner_email") or ""),
@@ -848,6 +872,7 @@ class ReplayManager:
                     healer=self.make_healer(
                         request.workspace_id,
                         request.usecase.id,
+                        model=request.model,
                         mode=request.usecase.mode,
                     ),
                     baselines=baselines,
@@ -949,6 +974,10 @@ class BatchRequest:
     dataset_id: str | None = None
     headless: bool | None = None
     browser: str | None = None
+    #: Which model this batch may heal with. Serialised into the job payload,
+    #: so a worker in another process heals with the model the person chose
+    #: rather than with whatever that process was configured for.
+    model: "ModelChoice | None" = None
     #: Row indices to run. ``None`` means all of them; a resume passes the
     #: indices that are not yet ``succeeded``.
     only_rows: list[int] | None = None
@@ -1067,7 +1096,10 @@ async def _drive_batch(
                 env=env,
                 screenshots=manager.settings.replay_screenshots,
                 healer=manager.make_healer(
-                    request.workspace_id, usecase.id, mode=usecase.mode
+                    request.workspace_id,
+                    usecase.id,
+                    mode=usecase.mode,
+                    model=request.model,
                 ),
                 baselines=baselines,
                 read_artifact=sink.read_artifact,

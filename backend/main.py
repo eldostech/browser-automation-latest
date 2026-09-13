@@ -22,7 +22,8 @@ from auth.service import AuthService
 from bus import build_bus
 from config import Settings, get_settings
 from credentials import Vault
-from llm import RepairModel
+from catalog import ModelCatalogue
+from llm import ModelPool
 from jobs import JobQueue, Worker
 from logging_setup import configure_logging
 from agent.manager import AgentSessions
@@ -125,11 +126,15 @@ async def lifespan(app: FastAPI):
     await app.state.bus.start()
 
     app.state.vault = Vault(settings.credentials_key or None)
-    # One model, built on first use, shared by the two things that can spend a
-    # token: repairing a locator mid-replay, and driving an authoring session.
-    # Sharing it keeps Bedrock configured in one place, which is the reason
-    # there is only one provider at all.
-    app.state.repair_model = RepairModel(settings)
+    # The models this process has been asked for, built on first use and cached
+    # per choice. It used to be one client, because there was one model; a
+    # person comparing two of them has two in flight by definition, so the
+    # pool is keyed by (provider, model) and a run names which it wants.
+    app.state.repair_model = ModelPool(settings)
+    # What the picker offers. Held on app state rather than built per request
+    # because reading it means asking OpenRouter for several hundred models,
+    # and that belongs behind a cache rather than in front of a page load.
+    app.state.model_catalogue = ModelCatalogue(settings)
 
     # The healer is the only route from a replay to a model, and it is handed
     # over lazily and only when healing is switched on.

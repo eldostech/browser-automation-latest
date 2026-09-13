@@ -204,6 +204,78 @@ async def test_a_model_that_declines_is_not_an_error():
 #  page to look at" -- it is reported rather than raised.)
 
 
+# --- the page as it was, beside the page as it is --------------------------
+#
+# `Step.recorded_page` reached healing first and repair second, and repair is
+# the path that needs it more: healing runs seconds after the failure, a repair
+# can happen weeks later and be driven by somebody who was never there when it
+# was recorded.
+
+
+AS_RECORDED = """### Page
+- Page URL: https://example.com/contact
+### Snapshot
+```yaml
+- textbox "Full name" [ref=e1]
+- textbox "Work email" [ref=e2]
+- button "Request a demo" [ref=e3]
+```"""
+
+
+def recorded(page: str) -> UseCase:
+    """The same use case, with the failing step remembering its own page."""
+    case = use_case()
+    case.row_steps[0].recorded_page = page
+    return case
+
+
+async def test_the_doctor_is_shown_the_page_as_it_was_when_the_step_worked():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded(AS_RECORDED), execution(), failure_events())
+    )
+
+    assert "when the step was recorded and working" in llm.last_message
+    assert 'textbox "Full name"' in llm.last_message, "the label that is gone"
+    assert 'textbox "Your name"' in llm.last_message, "and the one that replaced it"
+
+
+async def test_the_recorded_controls_are_offered_without_indices():
+    """The numbered list is the one a fix picks from. Numbering a control that
+    is no longer on the page would invite `element_index` pointing at it."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded(AS_RECORDED), execution(), failure_events())
+    )
+
+    was = llm.last_message.split("when the step was recorded and working", 1)[1]
+    assert '- textbox "Full name"' in was
+    assert '0. textbox "Full name"' not in was
+
+
+async def test_a_step_with_no_recorded_page_asks_as_it_did_before():
+    """Every use case recorded before this existed takes this path, and the
+    prompt must not grow an empty section for them."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(gather_context(use_case(), execution(), failure_events()))
+
+    assert "when the step was recorded" not in llm.last_message
+
+
+async def test_an_unparseable_recorded_page_is_ignored_rather_than_fatal():
+    """Context is a bonus. Losing the repair over it would be the wrong trade."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    proposal = await UseCaseDoctor(llm).diagnose(
+        gather_context(recorded("this is not a snapshot at all"), execution(), failure_events())
+    )
+
+    assert proposal.diagnosis == "d"
+
+
 # --- applying ---------------------------------------------------------------
 
 
@@ -675,3 +747,107 @@ def test_an_unknown_field_name_is_refused():
         offered(),
     )
     assert "SKIPPED" in applied[0] and "'Nope'" in applied[0]
+
+
+# --- what each step was for -----------------------------------------------
+
+
+async def test_the_doctor_is_told_what_the_failing_step_was_for():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+    case = use_case()
+    case.row_steps[0].intent = "finds the customer the row names"
+
+    await UseCaseDoctor(llm).diagnose(gather_context(case, execution(), failure_events()))
+
+    assert "what it is for: finds the customer the row names" in llm.last_message
+
+
+async def test_the_purpose_of_the_steps_around_it_is_shown_too():
+    """A repair judges one step against the flow it sits in. A list of
+    mechanics with no purposes on it is what made "which of these forty
+    controls" the only question available."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+    case = use_case()
+    case.row_steps[1].intent = "saves the change"
+
+    await UseCaseDoctor(llm).diagnose(gather_context(case, execution(), failure_events()))
+
+    assert "      for: saves the change" in llm.last_message
+
+
+async def test_a_use_case_with_no_purposes_reads_as_it_always_did():
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(gather_context(use_case(), execution(), failure_events()))
+
+    assert "what it is for" not in llm.last_message
+    assert "      for:" not in llm.last_message
+
+
+# --- what the browser tried, and what stopped it --------------------------
+#
+# The failure that kept coming back. A recorded click on a column header
+# failed with "TimeoutError: Locator.click: Timeout 30000ms exceeded" and
+# nothing else, because the engine kept the first line of Playwright's error
+# and dropped the call log. The element had been found; something was covering
+# it. Given only a timeout and a locator, a repair proposed the same locator
+# with `exact` turned off -- the only change it could express -- and the next
+# run happened to work, so the diagnosis was never made.
+
+
+COVERED = """Call log:
+  - waiting for get_by_role("columnheader", name="Make")
+  -   locator resolved to <th class="sortable">Make</th>
+  - attempting click action
+  -   <div id="onetrust-consent-sdk">…</div> intercepts pointer events
+  - retrying click action"""
+
+
+def covering_events(snapshot: str = PAGE) -> list:
+    return [
+        ErrorEvent(
+            run_id="run-1",
+            seq=1,
+            step=1,
+            kind="step_failed",
+            message="TimeoutError: Locator.click: Timeout 30000ms exceeded.",
+            recoverable=True,
+            detail={
+                "step_id": "s10",
+                "page_url": "https://example.com/contact",
+                "snapshot": snapshot,
+                "call_log": COVERED,
+            },
+        )
+    ]
+
+
+def test_the_call_log_is_recovered_from_the_failure_event():
+    context = gather_context(use_case(), execution(), covering_events())
+
+    assert "intercepts pointer events" in context.call_log
+
+
+async def test_the_doctor_is_shown_what_stopped_the_action(client=None):
+    """So it can tell "cannot find it" from "found it and could not click
+    it" -- which need different answers and got the same one."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(use_case(), execution(), covering_events())
+    )
+
+    assert "What the browser tried" in llm.last_message
+    assert "onetrust-consent-sdk" in llm.last_message
+
+
+async def test_a_failure_with_no_call_log_asks_exactly_as_it_did_before():
+    """Every run recorded before this existed, and every failure that was not
+    an action -- an assertion, a URL off the allowlist."""
+    llm = ProposingLLM({"diagnosis": "d", "fixes": []})
+
+    await UseCaseDoctor(llm).diagnose(
+        gather_context(use_case(), execution(), failure_events())
+    )
+
+    assert "What the browser tried" not in llm.last_message

@@ -32,6 +32,7 @@ from snapshot import Snapshot, parse as parse_snapshot
 
 from .guardrails import DISTILS_TO, GuardContext, PERCEPTION, guard, offered
 from .marks import Described, Marks, describe_element
+from .ran import ran_code
 from .providers.base import BrowserProvider, MCPSession, ToolResult, ToolSpec
 from .tools import TOOLS, ToolDef
 
@@ -61,6 +62,14 @@ OBSERVATION_SCHEMA: dict[str, Any] = {
     ),
 }
 
+#: How much of the page each call keeps, for a repair to read later.
+#:
+#: The interactive controls a repair needs are near the top of an
+#: accessibility tree, and the tail of a long page is navigation chrome and
+#: footer links. Eight thousand characters is the same budget the engine's own
+#: failure context uses, for the same reason.
+RECORDED_PAGE_CHARS = 8_000
+
 #: How many times the same acting call may be made before it is refused.
 #:
 #: The stale-ref rule above covers the loop where a *dead* reference is
@@ -69,6 +78,22 @@ OBSERVATION_SCHEMA: dict[str, Any] = {
 #: is not having the effect the model expected. Two attempts is a fair reading
 #: of "it might not have registered"; a third is a loop.
 MAX_IDENTICAL_CALLS = 2
+
+#: How many times one session will object to a position-only recording.
+#:
+#: Measured rather than chosen: a real session on a grid of identically named
+#: "answer" textboxes drew seven of these, one per box, each costing a model
+#: turn at about twelve thousand tokens -- and on that page position genuinely
+#: was the only thing telling the boxes apart, so every objection was answered
+#: by repeating the call. The session's token bill doubled and the recording
+#: was no better for it. Two is enough: after the second, the page has told us
+#: what kind of page it is.
+MAX_POSITIONAL_REFUSALS = 2
+
+#: Written as constants because these strings are assembled inside long
+#: refusal messages, where an inline escape is the easiest thing to get wrong.
+QUOTE = '"'
+PARAGRAPH = "\n\n"
 
 
 @dataclass(slots=True)
@@ -107,6 +132,17 @@ class ToolCallRecord:
     locators: list[dict[str, Any]] = field(default_factory=list)
     #: How a person would read that locator, for the review screen.
     element: str = ""
+    #: What the element said at record time, for a replay to check that a
+    #: positional rung still finds the same control -- see `Step.expect_text`.
+    expect_text: str = ""
+    #: The Playwright statement the server reported running, verbatim.
+    #:
+    #: The one piece of evidence about which **DOM element** received the
+    #: action. Everything else here is derived from the accessibility tree,
+    #: and the two disagree more often than is comfortable: a styled radio is
+    #: a tree node with a name and a DOM input nobody can click, and the
+    #: server clicks its label. See `agent/ran.py`.
+    ran: str = ""
     #: Where the browser was when this call finished. Read off the server's own
     #: reply, which carries it. Needed because `browser_navigate_back` records
     #: no destination -- the page it landed on is the only thing that says
@@ -123,6 +159,17 @@ class ToolCallRecord:
     #: screen, rather than leaving it to be discovered days later when a batch
     #: fails on a step nobody flagged.
     match_count: int = 1
+    #: The page this call was made against, as the accessibility tree.
+    #:
+    #: Kept because a repair months later has only the page as it is *now* and
+    #: has to work out what changed from that alone. With the page as it was,
+    #: the question stops being "which of these forty controls did somebody
+    #: probably mean" and becomes "this control was here and is not any more" --
+    #: which is a question with one answer.
+    #:
+    #: Capped: this is review material, not the recording, and an uncapped
+    #: blob per step would put a megabyte of markup into every definition.
+    page: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -232,7 +279,11 @@ class AgentToolSession:
         #: call and its arguments. Only calls that *act* are counted: a repeated
         #: `browser_snapshot` is how an agent is supposed to work, and refusing
         #: one would break the very loop the ref discipline asks for.
-        self._attempts: dict[tuple[str, str], int] = {}
+        self._attempts: dict[tuple[Any, ...], int] = {}
+        #: How many position-only recordings this session has objected to.
+        #: Capped, because a page of identical controls makes the objection
+        #: cost a turn each and answer nothing -- see MAX_POSITIONAL_REFUSALS.
+        self._positional_refusals = 0
 
     # -- lifecycle ----------------------------------------------------------
     async def __aenter__(self) -> "AgentToolSession":
@@ -427,6 +478,14 @@ class AgentToolSession:
                 observation=observation,
             )
 
+        undescribable = self._cannot_be_described(name, target_ref, described)
+        if undescribable:
+            return await self._finish(
+                name, arguments, ToolResult.failed(undescribable),
+                verdict, started, refused=True, described=described,
+                observation=observation,
+            )
+
         # `arguments` -- the placeholder-bearing version -- is what gets
         # recorded, redacted and shown back to the model. `dispatched` is a
         # copy with every `{{secret.x}}` turned into the real value, and it is
@@ -533,6 +592,105 @@ class AgentToolSession:
             return Described(ref=ref, role="", name="", matches=0)
         return describe_element(self._snapshot, ref)
 
+    def _cannot_be_described(
+        self, name: str, target_ref: str, described: "Described | None"
+    ) -> str:
+        """Why acting on this element would record a step nothing can replay.
+
+        The asymmetry this exists for: an agent acts on ``ref=e12``, an index
+        into a snapshot seconds old that always names exactly one element. A
+        replay acts on a *description* -- role and accessible name. So the
+        recording cannot fail the way the replay fails, and the moment a
+        badly-describable element gets clicked is the moment the information
+        is cheapest to act on and the last moment anybody has it: the page is
+        on screen, the agent can see a labelled control next to the one it
+        picked, and choosing again costs nothing.
+
+        Left alone, that click was recorded silently and surfaced much later
+        as a draft warning nobody could act on -- `role=generic [24]`, "the
+        25th anonymous div", published and then failed twice.
+
+        **Refused once, then allowed.** Not a hard refusal, deliberately: the
+        click itself is fine, it is the *recording* of it that is not, and
+        blocking it outright would stop the agent completing a task it can
+        plainly do. So the first attempt comes back with what is wrong and
+        what to do instead; a second identical attempt is the agent saying
+        there is nothing better, and it goes through with the warning intact.
+        The same shape as `_too_many_attempts`, for the same reason.
+        """
+        if name in PERCEPTION or not target_ref or described is None:
+            return ""
+        if not described.unreliable:
+            return self._only_a_position(target_ref, described)
+        key = ("undescribable", target_ref)
+        if self._attempts.get(key):
+            return ""
+        self._attempts[key] = 1
+        return (
+            f"'{target_ref}' can be clicked, but it cannot be *recorded*: it is "
+            f"{described.describe_first()}, one of {described.matches} identical "
+            "wrappers with no name on any of them. A replay has no refs -- it "
+            "finds an element by role and name -- so a step recorded against "
+            "this has nothing to match on and will fail on every row.\n\n"
+            "Look at the snapshot again and act on something inside or beside "
+            "it that has a real name: a button, a link, a heading, a labelled "
+            "input. If there is genuinely nothing, repeat this exact call and "
+            "it will go through -- the step will carry a warning saying a "
+            "person has to fix it."
+        )
+
+    def _only_a_position(self, target_ref: str, described: "Described") -> str:
+        """Why a step recorded against this would be held together by counting.
+
+        The same moment and the same argument as the refusal above, one rung
+        less severe. This element *has* a name; the trouble is that several
+        others share it, so the only thing distinguishing the one the agent
+        picked is how many like it come first. `Locator.nth` carries that, and
+        a replay honours it -- but a position is a claim about ordering that
+        the next release can quietly falsify, and when it does the step acts on
+        a different record's control and reports success.
+
+        There is almost always something better on the page, and the page is
+        still on screen: a control inside the row, card or dialog that the
+        agent means. `Locator.within` and `has_text` exist to say exactly that,
+        and a rung that says *where* is the difference between a recording that
+        survives a redesign and one that survives until the list is sorted
+        differently.
+
+        Refused once, then allowed, like the other one -- and for the same
+        reason. Eleven identical "Chat" buttons is a real page, the third one
+        may genuinely be the one meant, and a hard refusal would stop a task
+        the agent can plainly do.
+        """
+        leading = described.ladder[0] if described.ladder else None
+        if leading is None or not leading.nth:
+            return ""
+        if leading.within is not None or leading.has_text:
+            return ""
+        # A page of identical controls answers this once and then costs a turn
+        # per control. See `MAX_POSITIONAL_REFUSALS`.
+        if self._positional_refusals >= MAX_POSITIONAL_REFUSALS:
+            return ""
+        key = ("positional", target_ref)
+        if self._attempts.get(key):
+            return ""
+        self._attempts[key] = 1
+        self._positional_refusals += 1
+        return (
+            f"'{target_ref}' can be clicked, but the step it would record is held "
+            f"together by counting: {described.describe_first()} matches "
+            f"{described.matches} elements on this page, and the recording would "
+            "say " + QUOTE + "the one at that position" + QUOTE + ". A replay "
+            "honours that, and the position stops being true the moment the list "
+            "is sorted or filtered differently -- at which point the step acts on "
+            "the wrong record and reports success." + PARAGRAPH +
+            "Look for something that says *which* one you mean: a control inside "
+            "the row, card or dialog for this record, rather than one that appears "
+            "in every row. Act on that instead, or on the element that names the "
+            "record itself. If position is genuinely the only thing that "
+            "distinguishes them, repeat this exact call and it will go through."
+        )
+
     def _too_many_attempts(self, name: str, arguments: dict[str, Any]) -> str:
         """Why this exact call may not be made again, or "".
 
@@ -600,7 +758,10 @@ class AgentToolSession:
                 for loc in (described.ladder if described else [])
             ],
             element=described.describe_first() if described and described.ladder else "",
+            expect_text=described.text if described else "",
+            ran=ran_code(result.text),
             page_url=self._snapshot.page_url if self._snapshot else "",
+            page=(self._snapshot.raw[:RECORDED_PAGE_CHARS] if self._snapshot else ""),
             match_count=described.matches if described else 1,
         )
         self.calls.append(record)

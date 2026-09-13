@@ -42,11 +42,26 @@ from langchain_core.messages import (
 log = logging.getLogger(__name__)
 
 
-def chat_model(settings: Any, model: str | None = None, **overrides: Any):
-    """Build the configured Bedrock chat model.
+def chat_model(
+    settings: Any,
+    model: str | None = None,
+    provider: str | None = None,
+    **overrides: Any,
+):
+    """Build a chat model for ``provider``.
 
-    ``model`` overrides the driver model so one process can run several -- a
-    fast driver for the agent loop, a more capable one for repair.
+    ``model`` overrides the configured one so one process can run several --
+    which is now the ordinary case rather than a leftover: a person comparing
+    models has two open at once by definition.
+    """
+    chosen = provider or settings.llm_provider
+    if chosen == "openrouter":
+        return _openrouter_model(settings, model, **overrides)
+    return _bedrock_model(settings, model, **overrides)
+
+
+def _bedrock_model(settings: Any, model: str | None, **overrides: Any):
+    """Claude on Bedrock.
 
     Credentials are left entirely to the AWS chain: environment variables,
     ``~/.aws``, an attached IAM role, or ``AWS_BEARER_TOKEN_BEDROCK``. That is
@@ -66,6 +81,52 @@ def chat_model(settings: Any, model: str | None = None, **overrides: Any):
     if settings.aws_profile:
         kwargs["credentials_profile_name"] = settings.aws_profile
     return ChatBedrockConverse(**kwargs)
+
+
+def _openrouter_model(settings: Any, model: str | None, **overrides: Any):
+    """Anything OpenRouter fronts, over its OpenAI-compatible endpoint.
+
+    ``ChatOpenAI`` rather than a client written here: OpenRouter speaks the
+    OpenAI wire format deliberately, and the part of a provider integration
+    that rots is the wire format.
+
+    Two things are deliberately *not* carried over from the Bedrock path.
+    Extended thinking is an Anthropic-shaped request parameter and means
+    nothing to most of what OpenRouter fronts -- a model that reasons does it
+    on its own terms. And the prompt cache is Bedrock's; see
+    ``LangChainLLM.run_turn`` for why the flag cannot simply be sent anyway.
+    """
+    if not settings.openrouter_api_key:
+        raise ValueError(
+            "OpenRouter was selected and OPENROUTER_API_KEY is not set, so there is "
+            "nothing to authenticate with. Add it to the environment (or .env) and "
+            "restart the backend."
+        )
+    resolved = model or settings.openrouter_model
+    if not resolved:
+        raise ValueError(
+            "OpenRouter was selected with no model named, and there is no default: "
+            "OPENROUTER_MODEL is blank. Pick a model in the dashboard, or set one."
+        )
+
+    from langchain_openai import ChatOpenAI
+
+    # OpenRouter reads these for its activity page, which is how an operator
+    # tells this application's spend apart from everything else on one key.
+    headers = {"X-Title": settings.openrouter_app_name}
+    if settings.openrouter_app_url:
+        headers["HTTP-Referer"] = settings.openrouter_app_url
+
+    kwargs: dict[str, Any] = {
+        "model": resolved,
+        "api_key": settings.openrouter_api_key,
+        "base_url": settings.openrouter_base_url,
+        "max_tokens": settings.llm_max_tokens,
+        "temperature": settings.llm_temperature,
+        "default_headers": headers,
+        **overrides,
+    }
+    return ChatOpenAI(**kwargs)
 
 
 def _apply_thinking(kwargs: dict[str, Any], settings: Any) -> None:

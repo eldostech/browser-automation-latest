@@ -22,12 +22,18 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from events import ApprovalRequired, ApprovalResolved, RunFinished, RunStarted
+from events import ApprovalRequired, ApprovalResolved, RunFinished, RunStarted, Thinking
 from llm import LLMClient
 from prompt_loader import AUTHOR_TASK, render
 from redaction import Redactor
 
 from .author import AuthorRequest, Wiring
+from .brief import (
+    TaskBrief,
+    apply_walkthrough,
+    write_brief,
+    write_walkthrough,
+)
 from .budget import Spend
 from .distil import Draft, distil
 from .guardrails import guard
@@ -37,6 +43,8 @@ from .tools.finish import NAME as FINISH
 from .verify import Replayer, Verification, verify
 
 log = logging.getLogger(__name__)
+
+NEWLINE = "\n"
 
 
 @dataclass
@@ -57,6 +65,10 @@ class AuthorResult:
     trajectory: list[dict[str, Any]] = field(default_factory=list)
     #: What the agent declared about the shape of the use case.
     marks: list[dict[str, Any]] = field(default_factory=list)
+    #: The request, restated before the browser opened: goal, per-row values,
+    #: what proves a row worked, and what the request did not say. None when
+    #: no scribe was injected, which is every caller that had none before.
+    brief: dict[str, Any] | None = None
     #: Set when the session cannot be distilled and why. Reported rather than
     #: discovered on the review screen with nothing to do about it.
     unfinished: str = ""
@@ -80,6 +92,7 @@ class AuthorResult:
             "spend": self.spend,
             "trajectory": self.trajectory,
             "marks": self.marks,
+            "brief": self.brief,
             "unfinished": self.unfinished,
             "use_case": self.use_case,
             "draft_warnings": self.draft_warnings,
@@ -113,6 +126,9 @@ class AgentSession:
         checkpointer: Any = None,
         thread_id: str = "",
         replay: Replayer | None = None,
+        healer: Any = None,
+        scribe: Any = None,
+        verify_draft: bool = True,
         name: str = "",
         extra: dict[str, BrowserProvider] | None = None,
     ) -> None:
@@ -120,6 +136,23 @@ class AgentSession:
         self.request = request
         self.secrets = dict(secrets or {})
         self.replay = replay
+        #: Mends a draft that does not replay, after which the draft is
+        #: replayed again without it. None keeps the old single-pass
+        #: behaviour, which is what a deployment with healing off should get.
+        self.healer = healer
+        #: Writes the brief before the browser opens and the walkthrough after
+        #: the steps exist. Injected, like the healer, and for the same two
+        #: reasons: a caller that passes none makes no extra model calls, and a
+        #: deployment turns the passes off by not passing one.
+        self.scribe = scribe
+        #: Kept from `start` so the walkthrough pass can be shown what the
+        #: recording was trying to achieve, not only what it did.
+        self._brief: TaskBrief | None = None
+        #: Whether to replay the finished draft once, cold. See
+        #: `Settings.agent_verify_draft`: the replay spends no tokens, so what
+        #: turning it off buys is wall-clock time, and what it costs is finding
+        #: out on the first real run instead of before publishing.
+        self.verify_draft = verify_draft
         self.name = name
         self.thread_id = thread_id or request.run_id
         self._checkpointer = checkpointer
@@ -196,14 +229,53 @@ class AgentSession:
                 tools=[spec.name for spec in self.tools.tools] + [FINISH],
             )
         )
+        # Before the first snapshot, and before the model is asked to do
+        # anything: the request restated as an outcome, the per-row values, and
+        # what proves a row worked. See `brief.py` for why this is not a plan
+        # of clicks.
+        self._brief = await self._write_brief()
         task_message = render(
             AUTHOR_TASK,
+            brief=self._brief.as_prompt() if self._brief else "",
             task=self.request.task,
             start_url=self.request.start_url,
             secrets=", ".join(self.request.secrets) or "(none)",
             sample=json.dumps(self.request.sample) if self.request.sample else "(none given)",
         )
         return await self._run({"messages": [HumanMessage(content=task_message)]})
+
+    async def _write_brief(self) -> TaskBrief | None:
+        """The pre-recording pass, or nothing at all.
+
+        Emitted as prose on the run's own event stream rather than logged,
+        because the point of naming what the request left unsaid is that a
+        person reads it -- and they are watching this stream while the browser
+        works. It arrives before the first tool call, which is the only moment
+        at which correcting an assumption is cheap.
+        """
+        if self.scribe is None:
+            return None
+        brief = await write_brief(
+            self.scribe,
+            task=self.request.task,
+            start_url=self.request.start_url,
+            allowed_domains=self.request.allowed_domains,
+            secrets=self.request.secrets,
+            sample=self.request.sample,
+        )
+        if brief is None:
+            return None
+        self.wiring.spend.turn(brief.usage, getattr(self.scribe, "model", ""))
+        await self.wiring.emit(
+            Thinking(
+                run_id=self.request.run_id,
+                seq=0,
+                step=0,
+                text="Before opening the browser:" + NEWLINE + NEWLINE + brief.as_prompt(),
+                done=True,
+            )
+        )
+        return brief
 
     async def resume(self, decision: str) -> AuthorResult:
         """Continue after a person answered. Same browser, same checkpoint."""
@@ -277,6 +349,10 @@ class AgentSession:
             name=self.name,
             replay=self.replay,
             secrets=self.secrets,
+            healer=self.healer,
+            scribe=self.scribe,
+            brief=self._brief,
+            verify_draft=self.verify_draft,
         )
 
 
@@ -291,6 +367,9 @@ async def run_agent_session(
     checkpointer: Any = None,
     thread_id: str = "",
     replay: Replayer | None = None,
+    healer: Any = None,
+    scribe: Any = None,
+    verify_draft: bool = True,
     name: str = "",
     extra: dict[str, BrowserProvider] | None = None,
 ) -> AuthorResult:
@@ -309,6 +388,9 @@ async def run_agent_session(
         checkpointer=checkpointer,
         thread_id=thread_id,
         replay=replay,
+        healer=healer,
+        scribe=scribe,
+        verify_draft=verify_draft,
         name=name,
         extra=extra,
     ) as session:
@@ -324,6 +406,10 @@ async def _draft_and_verify(
     name: str,
     replay: Replayer | None,
     secrets: dict[str, str],
+    healer: Any = None,
+    scribe: Any = None,
+    brief: TaskBrief | None = None,
+    verify_draft: bool = True,
 ) -> AuthorResult:
     """Turn the session into a draft, then prove the draft replays.
 
@@ -356,18 +442,108 @@ async def _draft_and_verify(
         start_url=request.start_url,
         allowed_domains=request.allowed_domains,
     )
-    result.use_case = draft.use_case.model_dump(mode="json", by_alias=True)
+    # Before the dump, and before verification: the walkthrough writes onto
+    # the same object verification then copies, so the prose travels with the
+    # mended definition instead of having to be stitched onto both.
     result.draft_warnings = list(draft.warnings)
+    if scribe is not None:
+        result.draft_warnings.extend(
+            await _write_walkthrough(scribe, draft, wiring, request=request, brief=brief)
+        )
+    result.use_case = draft.use_case.model_dump(mode="json", by_alias=True)
+    if brief is not None:
+        result.brief = brief.as_dict()
+
+    not_worth_it = _why_not_verify(result, draft, verify_draft=verify_draft)
+    if not_worth_it:
+        result.verification = Verification(ran=False, skipped=not_worth_it).as_dict()
+        return result
 
     report: Verification = await verify(
-        draft.use_case, draft.sample_inputs, secrets, replay=replay
+        draft.use_case,
+        draft.sample_inputs,
+        secrets,
+        replay=replay,
+        healer=healer,
     )
     result.verification = report.as_dict()
-    if report.ran and not report.ok:
+
+    # The mended draft replaces the recorded one, because it is the version
+    # that has been proved to run. Keeping the original and reporting the
+    # repair separately would hand somebody a recording known not to work
+    # alongside a note saying how to fix it -- which is the thing this whole
+    # pass exists to stop doing.
+    if report.patched is not None:
+        result.use_case = report.patched
+
+    if report.ran and (not report.ok or report.repairs):
         # Said on the draft as well as in the report, because this is the line
         # a reviewer reads first and it must not be somewhere else.
         result.draft_warnings.insert(0, report.as_text())
     return result
+
+
+def _why_not_verify(
+    result: AuthorResult,
+    draft: Draft,
+    *,
+    verify_draft: bool,
+) -> str:
+    """Why replaying this draft would tell nobody anything, or "".
+
+    Two cases, and the second is the one that was being paid for repeatedly.
+
+    A session that **stopped early without finishing a record** -- out of
+    budget, out of time, stopped by a person -- has already reported that it
+    did not get through. Replaying what it managed spends a browser launch,
+    and a whole flow's wall clock, to confirm the thing the session's own
+    message says. Four real sessions in a row hit their token ceiling
+    mid-record and each one was then replayed anyway.
+
+    And the deployment may simply not want it. Off is a legitimate choice:
+    what it buys is time, and what it costs is finding out on the first real
+    run rather than before publishing. Saying which of the two happened
+    matters, because "not verified" with no reason reads as a failure.
+    """
+    if not verify_draft:
+        return (
+            "verification is switched off for this deployment (AGENT_VERIFY_DRAFT). "
+            "Nothing has replayed this draft, so the first real run is the first "
+            "time anybody will know whether it works."
+        )
+    if result.stopped_by and not draft.rows_recorded:
+        return (
+            "the session stopped before it finished a record, so there is nothing "
+            f"whole to replay: {result.stopped_by}"
+        )
+    return ""
+
+
+async def _write_walkthrough(
+    scribe: Any,
+    draft: Draft,
+    wiring: Wiring,
+    *,
+    request: AuthorRequest,
+    brief: TaskBrief | None,
+) -> list[str]:
+    """Describe the recording in plain language, onto the draft itself.
+
+    Runs here rather than on the review screen because this is the last moment
+    the session's own context is still assembled -- the task, the brief, and a
+    step list that has just been cut on the agent's declared boundaries. A
+    person opening the draft tomorrow has the steps and nothing else.
+    """
+    walkthrough = await write_walkthrough(
+        scribe,
+        draft.use_case,
+        task=request.task,
+        brief=brief,
+    )
+    if walkthrough is None:
+        return []
+    wiring.spend.turn(walkthrough.usage, getattr(scribe, "model", ""))
+    return apply_walkthrough(draft.use_case, walkthrough)
 
 
 def _result(

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from auth.rbac import Permission
@@ -30,7 +30,13 @@ from deps import (
 )
 from credentials import Vault
 from routers.schemas import BatchRequestBody, ExecuteRequest
-from runner import BatchNotPossible, BatchRequest, ExecutionRequest, ReplayManager
+from llm import ModelChoice
+from runner import (
+    BatchNotPossible,
+    BatchRequest,
+    ExecutionRequest,
+    ReplayManager,
+)
 from services import (
     load_runnable_usecase,
     require_missing_nothing,
@@ -60,6 +66,7 @@ async def active_execution(
 async def execute_usecase(
     usecase_id: str,
     body: ExecuteRequest,
+    request: Request,
     data: WorkspaceData,
     vault: VaultDep,
     replays: Replays,
@@ -83,6 +90,7 @@ async def execute_usecase(
                 base_url=body.base_url,
                 headless=body.headless,
                 browser=body.browser,
+                model=_chosen_model(request, body),
                 workspace_id=principal.workspace_id,
                 owner_id=principal.user_id,
                 owner_email=principal.email,
@@ -172,6 +180,7 @@ async def rows_for_batch(body: BatchRequestBody, data: WorkspaceStore) -> Datase
 async def start_batch(
     usecase_id: str,
     body: BatchRequestBody,
+    request: Request,
     data: WorkspaceData,
     vault: VaultDep,
     replays: Replays,
@@ -232,6 +241,7 @@ async def start_batch(
                 dataset_id=body.dataset_id,
                 headless=body.headless,
                 browser=body.browser,
+                model=_chosen_model(request, body),
                 workspace_id=principal.workspace_id,
                 owner_id=principal.user_id,
                 owner_email=principal.email,
@@ -468,3 +478,20 @@ async def estimate(
         healing_enabled=settings.replay_healing_enabled,
         remaining_usd=spend.get("remaining_usd"),
     ).as_dict()
+
+
+def _chosen_model(request: Request, body: Any) -> "ModelChoice | None":
+    """The model this request asked for, or ``None`` for the configured one.
+
+    ``None`` rather than the resolved default, deliberately: a run that did not
+    ask carries no choice at all, so nothing downstream has to tell "the person
+    picked the default" apart from "the person did not pick".
+    """
+    provider = getattr(body, "provider", None)
+    model = getattr(body, "model", None)
+    if not provider and not model:
+        return None
+    try:
+        return ModelChoice.resolve(request.app.state.settings, provider, model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

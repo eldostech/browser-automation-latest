@@ -8,6 +8,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from agent.brief import apply_walkthrough, write_walkthrough
 from auth.rbac import Permission
 from auth.service import Principal
 from browser import BrowserError
@@ -21,6 +22,8 @@ from deps import (
     usecase_or_404,
 )
 from engine import probe_locators
+from export import as_playwright_python, suggested_filename
+from llm import ModelChoice
 from policy import check_navigation
 from repair import (
     locator_changes,
@@ -33,6 +36,7 @@ from repair import (
     validate_patched,
 )
 from routers.schemas import (
+    DescribeRequest,
     DistillRequest,
     LocatorCheckRequest,
     RenameRequest,
@@ -325,6 +329,131 @@ async def set_scripts(
     return {"usecase_id": usecase_id, "scripts_enabled": body.enabled, "by": principal.email}
 
 
+@router.get("/usecases/{usecase_id}/export/python")
+async def export_python(
+    usecase_id: str,
+    data: WorkspaceData,
+    _: Annotated[Principal, Depends(require(Permission.USECASE_READ))],
+    version: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    """This use case as a Playwright script, for somebody to read and run.
+
+    A one-way export, and the docstring in `export.py` says why that is the
+    whole design rather than a limitation: the document is what TRACE runs and
+    what healing and repair edit, so a source file the platform depended on
+    would be a second source of truth that drifts.
+
+    Read-only. No version is written, nothing is executed, and the reply is
+    text -- this endpoint is the only one in this router that changes nothing.
+    """
+    definition = await data.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="No such use case.")
+    try:
+        use_case = UseCase.model_validate(definition)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"The stored use case is invalid: {exc}"
+        ) from exc
+
+    return {
+        "usecase_id": usecase_id,
+        "filename": suggested_filename(use_case),
+        "script": as_playwright_python(use_case, version=version or use_case.version),
+    }
+
+
+@router.post("/usecases/{usecase_id}/describe", status_code=201)
+async def describe_usecase(
+    usecase_id: str,
+    body: DescribeRequest,
+    request: Request,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USECASE_CREATE))],
+) -> dict[str, Any]:
+    """Write down what this use case does, in plain language. One LLM call.
+
+    An agent recording gets this automatically at the end of its session. This
+    is the same pass, on demand, and it exists for the two cases that one does
+    not cover: a workflow recorded with codegen, which has no model in it and
+    therefore no account of itself at all, and a use case recorded before any
+    of this existed.
+
+    **Saved at the status it already had**, unlike a repair. A repair changes
+    what runs and so must land as a draft for somebody to approve; this writes
+    prose that nothing on the replay path reads. Forcing a published use case
+    back to draft to gain a description would mean nobody ever described a
+    published one, which is most of them.
+    """
+    definition = await usecase_or_404(usecase_id, data)
+    try:
+        use_case = UseCase.model_validate(definition)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail=f"The stored use case is invalid: {exc}"
+        ) from exc
+
+    if not use_case.all_steps:
+        raise HTTPException(
+            status_code=422,
+            detail="This use case has no steps, so there is nothing to describe.",
+        )
+
+    try:
+        choice = ModelChoice.resolve(request.app.state.settings, body.provider, body.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    walkthrough = await write_walkthrough(
+        request.app.state.repair_model.for_choice(choice),
+        use_case,
+        task=use_case.description,
+    )
+    if walkthrough is None:
+        # `write_walkthrough` swallows its own failures by design -- a session
+        # must not be lost to one. Here there is no session to lose, so the
+        # person pressing the button is told rather than left looking at an
+        # unchanged screen.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The model did not describe this use case. Nothing was changed. "
+                "Trying again, or with a different model, is safe."
+            ),
+        )
+
+    warnings = apply_walkthrough(use_case, walkthrough)
+    described = use_case.model_dump(mode="json", by_alias=True)
+    _, version = await data.save_usecase(
+        described, created_by="describe", created_by_id=principal.user_id
+    )
+    await data.audit(
+        "usecase.describe",
+        actor_id=principal.user_id,
+        actor_email=principal.email,
+        resource_type="usecase",
+        resource_id=usecase_id,
+        detail={
+            "version": version,
+            "purposes": len(walkthrough.purposes),
+            "tokens": walkthrough.tokens,
+        },
+    )
+    log.info(
+        "described a use case",
+        extra={"usecase_id": usecase_id, "version": version},
+    )
+    return {
+        "usecase_id": usecase_id,
+        "version": version,
+        "status": use_case.status,
+        "instructions": use_case.instructions,
+        "steps_described": len(walkthrough.purposes),
+        "warnings": warnings,
+        "llm_tokens": walkthrough.tokens,
+    }
+
+
 @router.post("/usecases/{usecase_id}/locator-check")
 async def check_locators(
     usecase_id: str,
@@ -559,7 +688,18 @@ async def repair_usecase(
     except Exception:  # noqa: BLE001 - a repair must not fail for want of recall
         log.warning("healing memory is unavailable to this repair", exc_info=True)
         recall = None
-    doctor = UseCaseDoctor(request.app.state.repair_model.client, memory=recall)
+    # The model this browser asked for, if it asked. Repair is a single
+    # judgement call written back into the use case, so which model made it is
+    # exactly the thing somebody comparing models wants to control.
+    try:
+        choice = ModelChoice.resolve(
+            request.app.state.settings, body.provider, body.model
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    doctor = UseCaseDoctor(
+        request.app.state.repair_model.for_choice(choice), memory=recall
+    )
     try:
         proposal = await doctor.diagnose(context)
     except RepairError as exc:

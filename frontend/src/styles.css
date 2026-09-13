@@ -821,6 +821,30 @@ table.runs .task-cell button:hover {
   padding: 1px 5px;
 }
 
+/* The flow in plain language. Prose, so it gets a reading measure and a line
+   height rather than the dense metric the rest of this screen uses. */
+.usecase-instructions {
+  margin: 0;
+  max-width: 78ch;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+/* What a step is for, in the recorder's own words. Set apart from the
+   mechanics above it by a rule rather than a colour: it is the one line on a
+   step that is prose, and a reviewer reads down the column of them. */
+.step-intent {
+  margin: 6px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 70ch;
+}
+
 .step-detail {
   display: flex;
   gap: 8px;
@@ -2069,6 +2093,39 @@ table.mapping .examples {
   z-index: 20;
 }
 
+/* Anchored to the window, not to the element it was rendered inside. An
+   overlay centres itself in its host; when the host is a whole page view that
+   is the middle of the document, so the screen dimmed and the spinner sat a
+   few hundred pixels below the fold -- present, correct, and invisible unless
+   you scrolled to it. Fixed positioning is what makes "I clicked Run" and "I
+   can see that it is running" the same moment. */
+.brand-spinner.blocking {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  position: fixed;
+  inset: 0;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  /* Above everything: this is the state where nothing else is actionable. */
+  z-index: 100;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+}
+
+@supports (backdrop-filter: blur(2px)) {
+  .brand-spinner.blocking {
+    backdrop-filter: blur(2px);
+  }
+}
+
+.brand-spinner.blocking .spinner-label {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
 .spinner-label {
   font-size: 13px;
   color: var(--text-dim);
@@ -2366,4 +2423,157 @@ code.locator.rejected {
   color: var(--text-faint);
   border-style: dashed;
   text-decoration: line-through;
+}
+
+/* ---------------------------------------------------------------------------
+   Choosing a model
+   ---------------------------------------------------------------------------
+   The badge sits in the chrome because a person comparing models has to see
+   which one is in play without going to look for it. The picker is a sheet
+   under the header rather than a modal: you read it against the page you were
+   already on, and nothing it does needs to trap focus. */
+
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  max-width: 200px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.model-badge:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.model-picker-shell {
+  padding: 12px 20px 0;
+}
+
+.model-picker .body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.model-providers {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.model-tab {
+  padding: 4px 12px;
+  font-size: 13px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  text-transform: capitalize;
+}
+
+.model-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.model-tab:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+
+.model-tab-note {
+  font-size: 11px;
+  text-transform: none;
+}
+
+.model-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.model-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The one currently in play. A left rule rather than a fill: the list is long
+   and a filled row at the top of a scroll looks like a header. */
+.model-row.active {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-dim);
+}
+
+.model-row-main {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex: 1 1 340px;
+  min-width: 0;
+}
+
+.model-name {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent-ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.model-name:hover {
+  text-decoration: underline;
+}
+
+.model-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.model-ok {
+  color: var(--ok);
+}
+
+.model-bad {
+  color: var(--danger);
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

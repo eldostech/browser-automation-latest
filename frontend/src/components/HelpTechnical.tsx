@@ -342,6 +342,47 @@ export function HelpTechnical() {
         <code>verify.py</code> replays it once, cold, before anyone sees a draft.
       </p>
 
+      <p>
+        Two single calls bracket that session, in <code>agent/brief.py</code>. Before
+        it: the request restated as a goal, the values expected to vary per row, and
+        what proves a row worked — and deliberately no clicks, because nothing has seen
+        the site yet and a plan made of invented buttons sends the recorder hunting for
+        a control that does not exist. After it: the distilled steps described in plain
+        language onto <code>UseCase.instructions</code>, with a purpose per step onto{' '}
+        <code>Step.intent</code>. That second field is what healing and repair read: a
+        step&apos;s <code>description</code> renders its own locator, so the question
+        used to be &ldquo;which of these controls resembles a link named
+        Billing&rdquo; rather than &ldquo;which of these opens the customer&apos;s
+        billing tab&rdquo;. Neither pass can add, remove or alter a step, and{' '}
+        <code>POST /usecases/:id/describe</code> runs the second one on demand for a
+        codegen recording, which has no model in it and so no account of itself.
+      </p>
+
+      <h2 id="borrowed">Three checks borrowed, and one way out</h2>
+      <p>
+        A locator that says only <em>where</em> to look can match one element and
+        still be the wrong one, which is worse than failing because it records as a
+        success. Each step therefore carries <code>Step.expect_text</code>, the words
+        its element had when recorded, and <code>engine.py</code> compares before
+        acting — but only when the winning rung does not itself match on text
+        (<code>Locator.matches_on_text</code>), since a role-and-name rung has already
+        proved the wording. <code>Step.when</code> is the other half of a gap:{' '}
+        <code>optional</code> says a failure is survivable, which never said &ldquo;this
+        step is not always needed&rdquo;. It is an <code>Assertion</code>, evaluated once
+        with no retry, so an absent cookie banner costs nothing per row. And{' '}
+        <code>attribute_contains</code> lets a check read an href rather than the words
+        on screen.
+      </p>
+      <p>
+        <code>export.py</code> renders a use case back into a Playwright Python script —
+        the inverse of <code>codegen.py</code>, and the same rule in both directions:
+        generated Python is data, and nothing here runs it. The export carries the
+        leading rung of each step with the rest as comments, because a script that fell
+        through a ladder would be the engine reimplemented in generated code.{' '}
+        <code>GET /usecases/:id/export/python</code> writes no version and changes
+        nothing.
+      </p>
+
       <h2 id="autonomy-technical">Autonomy levels, mapped to code</h2>
       <p>
         The three levels a use case can choose are not a UI-only idea — each one names

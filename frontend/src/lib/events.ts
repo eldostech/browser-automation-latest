@@ -220,6 +220,34 @@ export interface Target {
   updated_by: string;
 }
 
+/** One model the picker can offer, as `GET /api/models` reports it. */
+export interface ModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  /** USD per million tokens. `null` where the provider does not publish a
+   *  price, which is different from free and is rendered differently. */
+  input_per_million: number | null;
+  output_per_million: number | null;
+  context: number | null;
+}
+
+export interface ModelCatalogue {
+  providers: string[];
+  models: ModelInfo[];
+  /** Per provider: why it cannot be reached. A provider missing without a
+   *  reason is a gap somebody fills in with a guess. */
+  problems: Record<string, string>;
+  default: { provider: string; model: string };
+}
+
+/** What the picker holds, and what travels on a request that spends tokens.
+ *  Null means "whatever the deployment is configured for". */
+export interface ModelChoice {
+  provider: string;
+  model: string;
+}
+
 export interface ServerConfig {
   defaults: {
     browser: string;
@@ -292,7 +320,15 @@ export interface LocatorCheckReport {
 }
 
 export interface Assertion {
-  kind: 'url_contains' | 'text_present' | 'element_visible' | 'element_count' | 'title_contains';
+  kind:
+    | 'url_contains'
+    | 'text_present'
+    | 'element_visible'
+    | 'element_count'
+    | 'title_contains'
+    | 'attribute_contains';
+  /** attribute_contains only: which attribute is read. */
+  attribute?: string;
   value?: string | null;
   count?: number | null;
   locator?: Locator | null;
@@ -311,6 +347,14 @@ export interface UseCaseStep {
   id: string;
   action: string;
   description: string;
+  /**
+   * What the step is *for*, in the recorder's own words.
+   *
+   * `description` renders the locator, which says what the step does and
+   * nothing about why. Read by people and by the two prompts that ask a model
+   * where a control went; never by anything that runs.
+   */
+  intent: string;
   locators: Locator[];
   url?: string | null;
   value?: string | null;
@@ -319,6 +363,16 @@ export interface UseCaseStep {
   code?: string | null;
   assert?: Assertion | null;
   wait_for?: Record<string, unknown> | null;
+  /** Run this step only when this check holds. null means always. */
+  when: Assertion | null;
+  /**
+   * What the element said when the step was recorded.
+   *
+   * Checked before acting, and only when the locator that matched does not
+   * itself match on text: a CSS path or a bare role has proved that something
+   * sits in that position, not that it is the same control.
+   */
+  expect_text: string;
   optional: boolean;
   on_failure: 'abort' | 'continue' | 'heal';
   timeout_ms: number;
@@ -381,6 +435,8 @@ export interface UseCase {
   authored_by: 'person' | 'agent';
   /** The origin this was recorded against, used when no target is named. */
   base_url: string;
+  /** The whole flow in plain language, written after recording. */
+  instructions: string;
   warnings: string[];
   /** Recorded calls that did NOT become steps, and why. */
   dropped: string[];
@@ -639,7 +695,18 @@ export interface StartAgentSession {
 /** What a session cost so far. */
 export interface AgentSpend {
   steps: number;
+  /** Every token the provider was sent or returned, cache reads included. */
   tokens: number;
+  /** How many of those were a prompt prefix recognised from cache. */
+  cache_read_tokens: number;
+  /**
+   * What the token ceiling is enforced against: `tokens` less the cache reads.
+   *
+   * A session recorded 405,305 tokens and cost 44 cents, nearly all of it one
+   * prefix re-read on every turn. Counting that against a runaway ceiling
+   * stopped it mid-record with half its money unspent.
+   */
+  fresh_tokens: number;
   usd: number;
   llm_calls: number;
   seconds: number;
@@ -676,6 +743,16 @@ export interface AgentSessionDetail {
   spend: Partial<AgentSpend>;
   steps: number;
   marks: { kind: string; name: string; after_call: number }[];
+  /** How the request was read before the browser opened: the goal, the values
+   *  expected to vary per row, what proves a row worked, and what the request
+   *  did not say. null when the deployment runs no brief pass. */
+  brief: {
+    goal: string;
+    per_row: { name: string; means: string }[];
+    done_when: string[];
+    cautions: string[];
+    unclear: string[];
+  } | null;
   unfinished: string;
   use_case: UseCase | null;
   draft_warnings: string[];

@@ -1307,3 +1307,61 @@ def test_a_draft_may_hold_anything_while_it_is_being_worked_on():
             Step(id="s5", action="click", locators=[Locator(strategy="role", role="link", name="Sign out")]),
         ]
     )
+
+
+# --- asserting on an attribute ---------------------------------------------
+#
+# The gap this fills, found by reading what other recorders can check: the
+# identifier a later step needs is often in a link rather than in the words a
+# person sees, so "the row's link points at account A-1001" was a check
+# nothing here could express. `extract` could already read an attribute; only
+# asserting on one was missing.
+
+
+def test_an_attribute_assertion_needs_a_locator_an_attribute_and_a_value():
+    from usecase import Assertion
+
+    for missing in (
+        {"locator": None, "attribute": "href", "value": "/x"},
+        {"locator": {"strategy": "role", "role": "link"}, "attribute": "", "value": "/x"},
+        {"locator": {"strategy": "role", "role": "link"}, "attribute": "href", "value": ""},
+    ):
+        with pytest.raises(ValidationError):
+            Assertion(kind="attribute_contains", **missing)
+
+
+def test_an_attribute_assertion_reads_as_a_person_would_say_it():
+    from usecase import Assertion
+
+    check = Assertion(
+        kind="attribute_contains",
+        locator={"strategy": "role", "role": "link", "name": "Receipt"},
+        attribute="href",
+        value="/receipt/",
+    )
+
+    assert check.describe() == "role=link name=\"Receipt\" has href='/receipt/'"
+
+
+# --- which rungs prove what an element says --------------------------------
+
+
+def test_a_rung_that_matched_a_name_has_proved_the_wording():
+    from usecase import Locator
+
+    assert Locator(strategy="role", role="button", name="Save").matches_on_text
+    assert Locator(strategy="text", text="Save").matches_on_text
+    assert Locator(strategy="role", role="row", has_text="Acme").matches_on_text
+
+
+def test_a_rung_that_says_only_where_to_look_has_not():
+    """These are the rungs `Step.expect_text` is checked against, and the
+    reason it exists: they match a position, not a control."""
+    from usecase import Locator
+
+    assert not Locator(strategy="css", selector="div > svg").matches_on_text
+    assert not Locator(strategy="role", role="button").matches_on_text
+    assert not Locator(strategy="nth", nth=3).matches_on_text
+    # A test id survives the control behind it being replaced -- which is the
+    # whole point of one, and why it is not proof of wording.
+    assert not Locator(strategy="test_id", text="save-button").matches_on_text

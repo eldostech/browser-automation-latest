@@ -172,6 +172,18 @@ export function AgentSessionView({ onSaved, onCancel }: Props) {
                 </option>
               ))}
             </select>
+            {credentials.length === 0 ? (
+              <span className="hint">
+                Nothing saved yet. <a href="#/credentials">Create a credential</a> and it
+                will be here for every recording and every batch. Do not put a password in
+                the task: that text is stored with the run and sent to the model.
+              </span>
+            ) : (
+              <span className="hint">
+                The recorder is given the slot names and types the values itself. It never
+                sees them.
+              </span>
+            )}
           </label>
           <label className="field" style={{ flex: 1 }}>
             <span>Call it</span>
@@ -330,7 +342,18 @@ function Working({
           </h2>
           <span className="meter">
             <span>{session.steps} steps</span>
-            <span>{(spend.tokens ?? 0).toLocaleString()} tokens</span>
+            <span
+              title={
+                spend.cache_read_tokens
+                  ? `${(spend.cache_read_tokens ?? 0).toLocaleString()} of these were a prompt prefix read from cache, at a tenth of the price. The token limit counts the rest.`
+                  : undefined
+              }
+            >
+              {(spend.tokens ?? 0).toLocaleString()} tokens
+              {spend.cache_read_tokens
+                ? ` (${(spend.fresh_tokens ?? 0).toLocaleString()} new)`
+                : ''}
+            </span>
             <span className="cost">${(spend.usd ?? 0).toFixed(2)}</span>
           </span>
         </div>
@@ -371,6 +394,33 @@ function Working({
           </div>
         )}
       </div>
+
+      {/* How the request was read, before the browser opened. Its most useful
+          part is the last one: an assumption listed here can be corrected for
+          the price of restarting, and the same assumption found after the
+          recording costs the recording. */}
+      {session.brief && (
+        <div className="card">
+          <h3>How this was read</h3>
+          <p className="usecase-instructions">{session.brief.goal}</p>
+          {session.brief.per_row.length > 0 && (
+            <p className="hint">
+              Expected to vary per record:{' '}
+              {session.brief.per_row.map((item) => item.name).join(', ')}
+            </p>
+          )}
+          {session.brief.unclear.length > 0 && (
+            <>
+              <p className="hint">The task did not say:</p>
+              <ul className="warnings">
+                {session.brief.unclear.map((item, i) => (
+                  <li key={i}>{item}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="card">
         <h3>What it did</h3>

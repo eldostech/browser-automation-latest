@@ -60,9 +60,32 @@ Three phases, and only one of them can spend tokens:
 | Phase | Modules | Model cost |
 |---|---|---|
 | Record | `recorder.py` (codegen subprocess) → `codegen.py` (`ast` parse) | none |
+| Export | `export.py` (a `UseCase` → a Playwright Python script) | none |
 | Map | `ingest.py` (pandas) → `mapping.py` (heuristics first) | fallback only |
 | Replay | `runner.py` → `batch.py` → `engine.py` → `browser.py` | **none, ever** |
 | Heal | `healing.py` + `memory.py` (pgvector recall) | one budgeted call, off by default |
+
+**Two passes bracket an agent recording** (`agent/brief.py`), each one model
+call, both *injected* so a caller that passes no `scribe` makes neither. Before:
+the request is restated as a goal, the values expected to vary per row, what
+proves a row worked, and what the request did not say -- and **no clicks**,
+because a model that has never seen the site inventing an "Advanced search"
+link sends the recorder hunting for something that does not exist. After: the
+distilled steps are described in plain language onto `UseCase.instructions`,
+with a purpose per step onto `Step.intent`. Neither pass can add, remove or
+alter a step; both are failure-tolerant, because the recording is the expensive
+part and prose is not allowed to cost one.
+
+**Two model providers, chosen per request.** `llm.ModelChoice` is a
+`(provider, model)` pair; `llm.ModelPool` caches a client per choice. Bedrock is
+a configured list, OpenRouter is a live catalogue (`catalog.py`, fetched and
+cached, prices included). The choice is *not* server state — it lives in the
+browser (`frontend/src/lib/model.ts`) and travels on every request that can
+spend a token, because comparing two models means running two at once and a
+shared setting would serialise exactly that. `GET /api/models` lists what can be
+reached; `POST /api/models/check` makes one tiny call to prove it. The Bedrock
+prompt-cache flag is sent only to Bedrock — `ChatOpenAI` rejects an unknown
+keyword, so sending it everywhere would fail every OpenRouter call.
 
 `usecase.py` is the contract between phases. A `UseCase` splits steps three ways —
 `setup_steps` (once per session), `row_steps` (once per input row), `row_reset`
@@ -111,9 +134,129 @@ to catch up after a reconnect.
   genuinely cross-tenant work (startup reaping, health, workspace creation) stays unscoped.
 - **Authorization is a dependency, not an `if`.** Declare `require(Permission.X)`
   on the route so the check is visible in the route definition and in the OpenAPI.
+- **The token ceiling counts fresh tokens, not cache reads.** `Spend.tokens`
+  stays the true total, and `Spend.fresh_tokens` is what `exceeded()` compares.
+  A real session recorded 405,305 tokens, cost 44 cents, and was stopped
+  mid-record by a 400,000 ceiling with over half its dollar budget unspent --
+  nearly all of it one prompt prefix re-read every turn, which is the thing
+  caching exists to make cheap. `usd` is the limit that governs; the token cap
+  is there for a genuine runaway, and a recognised prefix is not one.
+- **A draft is not replayed when replaying it can say nothing.** `run._why_not_verify`:
+  a session that stopped before finishing a record has already reported that,
+  and `AGENT_VERIFY_DRAFT=false` turns the pass off for a deployment that would
+  rather have the wall clock. The replay itself spends **no tokens** -- it is the
+  engine, which has no path to a model -- so what is being saved is a browser
+  launch, and what is given up is learning that a draft does not replay before
+  somebody publishes it. The reason is always carried on
+  `Verification.skipped`: "not verified" with no reason reads as a failure.
+- **Verification mends, then proves.** `agent/verify.py` replays a draft twice:
+  once with a healer attached, and again with none at all once anything has been
+  mended. The second pass is the evidence — the first only proves a *model* can
+  get through. What was mended lands in `Verification.repairs`, the proved
+  definition in `.patched`, and `run.py` keeps that as the draft. Without a
+  healer it is one pass and one verdict, exactly as before.
+- **Keep what the MCP server says it ran.** Every acting reply carries the
+  Playwright statement the server executed, and `agent/ran.py` parses it into a
+  rung that `distil.py` appends behind the semantic ones. It is the only
+  evidence of which **DOM element** received the action, and the tree and the
+  DOM disagree: a styled radio is a tree node with an accessible name and an
+  input nobody can click, and the server clicks its label. A real recording of
+  one produced `role=radio name="Nayra Asati"` from the tree while the server
+  had run `locator('label').filter({hasText: 'Nayra Asati'})`; replay found the
+  radio and spent thirty seconds failing to click it, twice.
+- **Consent banners are rejected, and that rule lives in the prompts.**
+  `author.md`, `recover.md` and `explore.md` all carry it, and `heal.md` treats
+  a banner as the problem rather than a candidate. Deliberately not code: a list
+  of button labels in Python would be a judgement about a page made in the place
+  with the least context, and `tests/test_prompts.py` asserts no such list
+  exists in the engine or the recorder. Two reasons in one rule -- accepting
+  consents on behalf of somebody who is not in the conversation and cannot be
+  undone from inside a run, and an undismissed banner is an overlay that
+  intercepts every click underneath it, which arrives as a timeout on an
+  element that was found.
+- **Playwright's call log is the only place the cause of a timeout is written
+  down, so it is kept.** `engine._reason` used to keep the first line on the
+  stated grounds that it "carries the actual cause" -- true of every error
+  except the one that matters. `Locator.click: Timeout 30000ms exceeded` names
+  a locator and nothing else; the log says the element was found and something
+  was covering it, or it would not hold still, or it was disabled.
+  `_cause_in` reads that and puts it on the end of the message, naming the
+  offending element; `call_log_of` keeps the log on the `step_failed` event, and
+  `repair.gather_context` carries it into the repair prompt. Without it a
+  repair answers a timeout by re-spelling the locator, which is what happened:
+  a covered column header was "fixed" by turning `exact` off, and the next run
+  happened to pass, so the diagnosis was never made and the failure came back.
+- **A rung that resolves but cannot be acted on falls through to the next one.**
+  `engine._do_element_action` walks the ladder over *actions*, not only over
+  resolution, giving each attempt a share of the step's timeout. Safe because
+  Playwright's actionability timeout means the action never dispatched. A step
+  that fails every rung says they were all found, because "no element matched"
+  said of three rungs that all matched sends somebody after a problem they do
+  not have.
+- **The asymmetry to keep in mind whenever touching the recorder.** An agent acts
+  on `ref=e12`, an index into a snapshot seconds old that always names exactly
+  one element. A replay acts on a *description*. So recording cannot fail the way
+  replay fails, and anything that makes a step describable-but-wrong is invisible
+  until the first replay. `session._cannot_be_described` refuses such a click
+  once, with what to do instead, then allows a repeat — the click is fine, the
+  *recording* of it is not, and a hard refusal would block a task the agent can
+  do. `session._only_a_position` is the same gesture one rung down: the element
+  has a name, several others share it, and the only thing left distinguishing it
+  is `nth`. A position is a claim about ordering that the next release can
+  falsify, and when it does the step acts on a different record and *succeeds*
+  — so the agent is asked, while the page is still on screen, for something
+  that says which row it means.
+- **`Step.recorded_page` is evidence, never executed.** The page a step was
+  recorded against, capped, carried in the definition so a repair in UAT can
+  compare then against now rather than guess from now alone. `healing.py` and
+  `repair.py` both render it; the listing itself is `snapshot.named_controls`,
+  shared because the two copies drifted once already -- the field was wired
+  into healing and *reported* as wired into repair when it was not.
+- **`Step.intent` and `UseCase.instructions` are evidence too.** A step's
+  `description` renders its locator, which says what the step does and nothing
+  about why, so healing and repair were being asked "which of these forty
+  controls resembles a link named Billing" when the answerable question is
+  "which of these opens the customer's billing tab". The sentence already
+  existed: the authoring agent must write one before every tool call
+  (`session.py`'s `observation`) and `distil.py` dropped it. Both fields narrow
+  a candidate list and can never add to it, and both prompts say so.
+- **Accuracy is measured, not asserted.** `tests/test_eval_replay.py` (`RUN_EVAL=1`)
+  runs every case several times and reports step success, false refusals, wrong
+  element, and run-to-run spread. Four numbers because they pull against each
+  other: a bolder resolver cuts refusals and raises wrong clicks, and one rate
+  hides that entirely.
+- **A recorder reports what it cannot represent; it never raises.** The codegen
+  path has always turned an unparseable line into an `Unsupported` entry and kept
+  the rest. `agent/distil.py` used to let a `ValidationError` out of `_steps`, so
+  one call the schema refused destroyed a whole authoring session — and the only
+  thing a person could do with it was delete it. Both paths now warn per call and
+  carry on. Adding a `Step` field with a required companion (`wait`/`wait_for`)
+  means teaching `_step` to build it, or every session using that tool dies.
 - **Codegen output is data, never code.** Parse with `ast`; never `exec`, `eval`
   or import it. Unrecognised lines become `Unsupported` entries shown to the user —
-  never a guessed-at step.
+  never a guessed-at step. **And in the other direction too:** `export.py` renders a
+  use case *back* into a Playwright script, returns a string, and nothing runs it.
+  The document stays the source of truth, because a file the platform read back
+  would be a second one that drifts. An export carries only the leading rung of
+  each ladder, with the rest as comments -- a script that fell through a ladder
+  would be the engine, reimplemented in generated code.
+- **A rung that says only *where* to look is checked against what the element
+  says.** `Step.expect_text` holds the words the recorded element carried, and
+  `engine._still_says_what_it_said` compares before acting -- but only when the
+  winning rung does not itself match on text (`Locator.matches_on_text`). A
+  role-and-name rung has already proved the wording; a CSS path, a bare role or a
+  test id has proved only that something sits in that position, and those are the
+  rungs that land on a different control and *succeed*. A step that succeeds
+  against the wrong control is the worst outcome here: it is recorded as success
+  and repeats on every row. Containment either way, not equality -- a wrapper's
+  text includes its children's, so equality would refuse correct steps.
+- **`Step.when` decides whether a step runs; `optional` decides whether its
+  failure matters.** They are different statements and conflating them is why a
+  cookie banner that appears on one row in four still cost a timeout and left a
+  failure to read. A `when` is an `Assertion` -- the same locally-evaluated check
+  as everywhere else, nothing to execute -- and it is evaluated **once**, with no
+  retry: a condition asks what is on the page now, and waiting would make "the
+  banner is absent" cost the full timeout on every row.
 - **Two gates, and which one a defect belongs to is the whole design.**
   `unreplayable_reasons` blocks *publishing* and holds only what can never work on
   any record — today, a step whose every rung is an unnamed structural role
@@ -171,6 +314,19 @@ to catch up after a reconnect.
   confident wrong answer every time that site broke again.
 - **Secrets are registered with the redactor before any event is emitted**, and
   batches take a stored credential id, never inline values.
+- **A credential pasted into a task is caught at the boundary, not redacted
+  downstream.** The redactor only knows values it was told about, and a task
+  reading "Password : x" is the run row, the `run_started` event, the audit
+  detail, the use case's description and the first message to a model -- none of
+  which know that string is a password. `redaction.scrub_credentials` recognises
+  it by shape (a label, a `:` or `=`, and a value; prose *about* a password has
+  no separator and is untouched) and replaces it with `{{secret.slot}}` when a
+  bound credential has a slot for it, which is the literal the recorder is
+  already told to type. With nothing bound, the session is **refused** rather
+  than started: it could not sign in anyway. `scripts/purge_secrets.py` cleans
+  rows written before this existed -- it speaks Postgres now, having spoken
+  sqlite long after the backend stopped, which is how real credentials survived
+  in a live database.
 - **`.env.example` is checked against the `Settings` model by `tests/test_config.py`.**
   Adding, renaming or removing a setting means editing both.
 - **Every prompt lives in `backend/prompts/*.md`**, loaded by `prompt_loader.py`

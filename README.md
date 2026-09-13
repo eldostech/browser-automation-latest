@@ -566,6 +566,166 @@ when the site changes. Each rung says what to look for and, optionally, where:
 | position | Which of several matches. `0` means none given, and a rung matching several is refused rather than guessed at. |
 | inside frames | CSS selectors for the iframes to descend through. An element inside a frame is not on the page as far as every other rung is concerned. |
 
+#### The draft is proved before you see it
+
+An AI recording is driven by refs — `e12`, an index into the page as it was a
+moment ago, which always names exactly one element. A replay has no refs. It
+finds an element by role and name. So **recording cannot fail the way replaying
+fails**, and that gap is why a session that went perfectly could produce a
+recording that did not run.
+
+Three things close it.
+
+While recording, clicking something that cannot be *described* — an anonymous
+wrapper with no name anywhere on it — comes back refused, once, while the page
+is still on screen and a labelled control next to it is one snapshot away.
+Repeat the same click and it goes through, because sometimes there genuinely is
+nothing better; the step then carries a warning saying so.
+
+When the session ends, the draft is replayed from a cold browser. That replay
+spends **no tokens** -- it is the ordinary engine and the engine has no path to
+a model -- so what it costs is a browser launch and one pass through the flow.
+It is skipped when the session stopped before finishing a record, because
+replaying half a recording only confirms what the session already said, and a
+deployment that would rather have the time back can turn it off with
+`AGENT_VERIFY_DRAFT=false`. Either way the draft says which of those happened,
+since "not verified" with no reason reads as a failure. If a step does
+not resolve, it is re-found against the real page and **the draft is replayed
+again with no model involved at all**. Only that second pass decides. A repair
+nobody re-ran is a guess, and the whole point is not to hand you guesses. If
+anything was mended you are told which steps and what they now look for, because
+the recording needing help is worth knowing even when what you get works.
+
+Each step also keeps the page it was recorded against. Months later, a repair
+can compare the page as it was with the page as it is, instead of choosing
+between forty plausible controls on the new one.
+
+#### Two passes around the recording
+
+The session is bracketed by one model call each side. Neither touches a browser
+and neither can change a step.
+
+**Before it starts**, your request is restated: what it has to achieve, which
+values are expected to change from record to record, what the page will show
+once a record is done, and — most usefully — what your request did not say.
+That last list is the point. An assumption you can correct before the recording
+costs a restart; the same assumption found afterwards costs the recording.
+
+It deliberately plans no clicks. Nothing has seen your site yet, and a plan made
+of invented buttons sends the recorder hunting for an "Advanced search" link
+that does not exist. Goal, data, proof. The route is found on the page.
+
+**After it finishes**, the recording is written down in plain language: what the
+workflow does, what varies per row, how a row shows it worked, and a line
+saying what each step is *for*. Written in the language your task was written
+in.
+
+That last part is not documentation. It is what the two model touchpoints in
+this system read. Healing and repair used to be asked "which of these forty
+controls resembles a link named Billing", because a step's description is a
+rendering of its own locator. Now they are asked "which of these opens the
+customer's billing tab", which is the question a person answers without
+thinking. The sentence costs nothing to produce: the recorder already has to
+write one before every action it takes, and it used to be thrown away.
+
+#### Three things borrowed from other recorders
+
+Read against what the well-starred browser-automation projects do, three of their
+ideas were worth taking and are now in.
+
+**A step is refused at record time if only its position would find it.** An
+element with a name that three others share is recorded as "the one at that
+position", and a position is a claim about ordering that the next sort or
+filter falsifies -- at which point the step acts on a different record and
+reports success. So the agent is asked, while the page is still on screen, for
+something that says which row it means. Repeat the same click and it goes
+through, because eleven identical buttons is a real page.
+
+**Consent banners are refused, never accepted.** When a recording meets a
+cookie or privacy banner it takes the reject path, and if the only button that
+clears it would accept, it closes the banner instead and tells you. Accepting
+would consent on your behalf to whatever that site's banner covers, and it
+cannot be undone from inside a run. The rule is in the prompts the recorder
+reads, not in a list of button labels in the code, so it applies to a page
+nobody has seen before.
+
+It is also the difference between a recording that replays and one that does
+not: an undismissed banner is an overlay over the whole page, so a click
+underneath it is intercepted and fails thirty seconds later as a timeout on an
+element that was found.
+
+**A failure says why, not only that.** A click that times out has been found
+and not acted on, and the reason is in the browser's own log: something is
+covering it, it will not hold still, it is disabled. That log used to be
+discarded and the record kept one line saying "timeout", which is why the same
+failure could come back repeatedly without anybody being able to diagnose it.
+The reason now arrives on the end of the message, naming the element in the
+way, and the full log is kept for the repair to read.
+
+**A step keeps the locator the browser itself used.** The accessibility tree
+and the page's own markup do not always agree about which element an action
+landed on. A styled radio button is a good example: the tree knows a radio with
+a person's name on it, the thing you can actually click is the label wrapped
+around it, and a recording that only knew the tree found the radio on replay
+and waited thirty seconds. Every action the recorder takes now also keeps the
+expression the browser reported running, as the last rung of the ladder, and a
+rung that is found but cannot be clicked falls through to the next one instead
+of failing the step.
+
+**A step checks that it found the same control.** A locator that says only
+*where* to look — a CSS path, a bare role, a test id — can match exactly one
+element and still be the wrong one after a page is rebuilt. Before this, that
+step clicked it and reported success, which is worse than failing: it gets
+recorded as a success and repeats on every row. Each step now carries what its
+element said when it was recorded, and a positional locator is checked against
+that before acting. A locator that matched on the accessible name is not
+re-checked, because it has already proved the wording.
+
+**A step can carry a condition.** `Only run this when…`, as the same kind of
+check used everywhere else. A cookie banner that appears on one row in four, a
+dialog only some records show, a save button that exists only when something
+changed. Marking a step optional says a failure is survivable, which is a
+different statement: an optional step still runs, still waits out its timeout,
+and still leaves a failure for somebody to read. A condition is evaluated once
+against the page as it is, never waited for.
+
+**A check can read an attribute.** The identifier a later step needs is often in
+a link rather than in the words on screen, so `the row's link points at
+/receipt/A-1001` is now a check you can record.
+
+#### Taking a script away with you
+
+`Export as Playwright Python` turns a published use case into a readable script:
+one function for the sign-in, one for a row, values read from a CSV, credentials
+read from the environment. Run it in your own pipeline.
+
+It goes one way only, and that is the design rather than a shortcut. TRACE runs
+the use case, not the file — healing and repair edit the document, so a script
+the platform read back would be a second source of truth drifting from the
+first. The export also carries only the leading locator of each step, with the
+rest of the ladder written beside it as comments, because a script that fell
+through a ladder would be the engine reimplemented in generated code. It is a
+good starting point and a worse runner than the engine, and the file says so at
+the top where somebody will read it.
+
+#### Credentials
+
+Save a sign-in once, under **Credentials**, and pick it under "Sign in as" when
+you record or run. Values are encrypted at rest and no screen or endpoint ever
+shows one again; what reaches the recorder is the *slot name*, and the value is
+substituted at the moment of typing.
+
+**Do not put a password in the task.** That text is stored with the run, shown
+in the timeline, written to the audit log and sent to the model, and none of
+those can tell it is a password. A task with one in it is now refused, with a
+pointer to the credential screen. If a credential is bound, the value is
+replaced by the slot that holds it, so the task keeps working and reads
+`Password : {{secret.password}}`.
+
+If something already leaked, `backend/scripts/purge_secrets.py --scan` finds it
+by shape and `--pasted --apply` removes it from every run, event and audit row.
+Rotate the credential anyway: it was stored, and backups predate the cleanup.
+
 #### What publishing refuses
 
 Most of what a draft says is advice. Two things are refusals, because they are
@@ -746,11 +906,39 @@ Every setting is documented in [`.env.example`](.env.example), which is checked
 against the settings model by a test — so it cannot drift. The ones you are most
 likely to touch:
 
+### Choosing a model
+
+Two providers. **Bedrock** needs no key: credentials come from the AWS chain, and
+it is what an existing installation keeps getting. **OpenRouter** needs one key
+and fronts several hundred models, which is the whole point of it — comparing
+models for accuracy means being able to reach them.
+
+Set `OPENROUTER_API_KEY` and the provider appears in the dashboard, beside your
+email. Pick a provider, filter the list, and everything that browser starts from
+then on uses it: recording with AI, repairing a step, and healing during a run.
+Each model shows the price the provider publishes, and **Check** makes one tiny
+call to prove this deployment can actually use it — a key without credit, a
+model needing its own agreement, and a retired id all look identical in a
+catalogue and identical to a broken workflow three steps into a run.
+
+The choice lives in your browser, not on the server. That is deliberate:
+comparing two models means running two at once, so a shared "current model"
+setting would serialise the thing it exists to support, and two people would
+overwrite each other. `LLM_PROVIDER` and `LLM_REPAIR_MODEL` remain the default
+for anyone who has not chosen.
+
 ### The model
 
 | Variable | Default | Notes |
 |---|---|---|
-| `LLM_REPAIR_MODEL` | a Claude inference profile | Used for repair, healing, and the agent's authoring loop. |
+| `LLM_PROVIDER` | `bedrock` | `bedrock` or `openrouter`. The default; a person can choose another for their own browser. |
+| `LLM_REPAIR_MODEL` | a Claude inference profile | The Bedrock default. Used for repair, healing, and the agent's authoring loop. |
+| `BEDROCK_MODELS` | three Claude profiles | Comma-separated; what the picker offers for Bedrock. |
+| `OPENROUTER_API_KEY` | unset | Without it, OpenRouter is offered nowhere and says why. |
+| `OPENROUTER_MODEL` | blank | The OpenRouter default. Blank means the picker has to choose. |
+| `OPENROUTER_BASE_URL` | OpenRouter's API | Change only for a proxy. |
+| `OPENROUTER_APP_NAME`, `OPENROUTER_APP_URL` | `TRACE`, blank | Attribution headers, so this application's spend is identifiable on their activity page. |
+| `OPENROUTER_CATALOG_TTL_SECONDS` | `900` | How long the fetched model list is reused. |
 | `AWS_REGION`, `AWS_PROFILE` | unset | Usually best left to the credential chain. |
 | `AGENT_ENABLED` | `false` | Turns on "Describe it" recording. Needs `requirements-agent.txt` installed and Node on `PATH`. |
 | `AGENT_MCP_VERSION` | pinned | Which `@playwright/mcp` release the agent drives — bumping it is deliberate; `agent/guardrails/catalog.py` is written against it. |
@@ -801,6 +989,7 @@ Bearer token on every route except `/healthz` and `/api/auth/login`.
 | **Recording — describe it** | `POST /api/agent-sessions`, `GET /api/agent-sessions/{id}`, `POST /{id}/decide`, `/save`, `/cancel` (needs the agent extra installed) |
 | **Agent tool servers** | `GET/POST /api/agent-tool-servers`, `DELETE /{id}`, `POST /preview` — what an agent session may reach for beyond the browser |
 | **Use cases** | `GET/PUT/PATCH/DELETE /api/usecases/{id}`, `/publish`, `/repair`, `/scripts`, `/activity`, `/locator-check` |
+| **Models** | `GET /api/models`, `POST /api/models/check` — what can be reached, and whether it really can |
 | **Data** | `POST /api/datasets` (multipart), `GET /api/datasets`, `POST /api/usecases/{id}/mapping` |
 | **Running** | `POST /api/usecases/{id}/execute`, `/batch`, `GET /api/batches/{id}`, `/resume`, `/cancel`, `/results.csv` |
 | **Watching** | `GET /api/runs/{id}`, `/events`, `/steps`, `WS /api/runs/{id}/stream`, `GET /api/artifacts/{id}` |
@@ -865,11 +1054,14 @@ want a running PostgreSQL and use their own schema (`browser_test`), so they
 never touch your development data. Nothing in the default run calls AWS or
 opens a browser.
 
-Three opt-in tiers, each pricier than the last:
+Four opt-in tiers, each pricier than the last:
 
 ```bash
 # real Chromium, replay end to end — no AWS, no Node
 cd backend && RUN_E2E=1 ../.venv/Scripts/python -m pytest -q -m e2e
+
+# how accurate, as four numbers rather than an impression
+cd backend && RUN_EVAL=1 ../.venv/Scripts/python -m pytest -q -s -m eval
 
 # real npx @playwright/mcp + Chromium, driving the agent's tool layer
 cd backend && RUN_MCP=1 ../.venv/Scripts/python -m pytest -q tests/test_agent_mcp_live.py
@@ -882,6 +1074,16 @@ The `RUN_E2E` tests serve a two-page site from a temp directory, record a
 codegen script against it, parse it, and replay it — nothing stubbed. They
 check parameterisation per row, the setup/row split, locator drift, assertions,
 extraction, screenshots, traces and the allowlist.
+
+`RUN_EVAL` asks a different question: not "is this correct" but "how often".
+It runs every case several times and reports **step success**, **false
+refusals** (a step refused as ambiguous where a person would say one candidate
+was obviously right), **wrong element** (a step that succeeded against the
+wrong control), and **run-to-run spread**. Four numbers because they pull
+against each other — a bolder resolver cuts refusals and raises wrong clicks,
+and a single success rate hides that completely. The spread is the one that
+answers "can I trust it", because the same input giving different answers is
+what not trusting it means.
 
 The `RUN_LLM` tier exists because a scripted fake model can only prove the
 *graph* is correct — the interrupt, the budget, the tool dispatch — not that a

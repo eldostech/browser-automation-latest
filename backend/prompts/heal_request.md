@@ -3,12 +3,15 @@ The step that failed:
 - what it does: $step
 - action: $action
 - element it used to find: $wanted
+$purpose
 
 Current page: $page_url
 
 Controls on the page now:
 
 $candidates
+
+$was_working
 
 Fixes already made on this site:
 

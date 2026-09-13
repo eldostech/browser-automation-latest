@@ -44,14 +44,39 @@ CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25
 
 
-def rates_for(model: str) -> tuple[float, float]:
+def known_rates_for(model: str) -> tuple[float, float] | None:
+    """The rates for a model this table actually lists, or ``None``.
+
+    Separate from :func:`rates_for` because the two answer different
+    questions. Costing a turn needs *a* number and a default is better than
+    zero; showing a price in a picker needs the truth, and rendering the
+    default as though it were this model's price is how somebody budgets a
+    four-thousand-row batch against a figure nobody checked.
+    """
     for known, rates in PRICES.items():
         if known in (model or ""):
             return rates
-    return DEFAULT_PRICE
+    return None
 
 
-def price_of(model: str, usage: dict[str, Any]) -> float:
+def rates_for(model: str, override: tuple[float, float] | None = None) -> tuple[float, float]:
+    """What to charge a turn on this model.
+
+    ``override`` is the provider's own figure, which beats the table above
+    whenever there is one. That matters for OpenRouter: it fronts several
+    hundred models and the table lists five, so without this every session on
+    anything but Claude would be costed from `DEFAULT_PRICE` -- a number that
+    happens to be Sonnet's and is wrong by two orders of magnitude at both
+    ends of OpenRouter's range.
+    """
+    if override is not None:
+        return override
+    return known_rates_for(model) or DEFAULT_PRICE
+
+
+def price_of(
+    model: str, usage: dict[str, Any], rates: tuple[float, float] | None = None
+) -> float:
     """Dollars for one turn, from its own input/output split.
 
     ``input_tokens`` already includes any cache read and cache write -- see
@@ -60,7 +85,7 @@ def price_of(model: str, usage: dict[str, Any]) -> float:
     made every session look no cheaper than before it was turned on: the same
     total token count, priced as if none of it had been a cache hit.
     """
-    read, written = rates_for(model)
+    read, written = rates_for(model, rates)
     tokens_in = int(usage.get("input_tokens") or 0)
     tokens_out = int(usage.get("output_tokens") or 0)
     cache_read = int(usage.get("cache_read_tokens") or 0)
@@ -74,7 +99,13 @@ def price_of(model: str, usage: dict[str, Any]) -> float:
     ) / 1_000_000
 
 
-def price_of_total(model: str, tokens: int, *, output_share: float = 0.2) -> float:
+def price_of_total(
+    model: str,
+    tokens: int,
+    *,
+    output_share: float = 0.2,
+    rates: tuple[float, float] | None = None,
+) -> float:
     """Dollars for a token count whose split was not kept.
 
     A worse answer than :func:`price_of` and used only where the split is
@@ -83,10 +114,17 @@ def price_of_total(model: str, tokens: int, *, output_share: float = 0.2) -> flo
     answer -- and it is deliberately generous, since a governance number that
     under-reports is the one that lets a bill through.
     """
-    read, written = rates_for(model)
+    read, written = rates_for(model, rates)
     tokens = max(0, int(tokens))
     out = tokens * output_share
     return ((tokens - out) * read + out * written) / 1_000_000
 
 
-__all__ = ["DEFAULT_PRICE", "PRICES", "price_of", "price_of_total", "rates_for"]
+__all__ = [
+    "DEFAULT_PRICE",
+    "PRICES",
+    "known_rates_for",
+    "price_of",
+    "price_of_total",
+    "rates_for",
+]

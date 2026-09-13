@@ -118,9 +118,63 @@ def test_a_prompt_may_use_a_placeholder_called_name():
         "failed_step_id": "s1",
         "failed_action": "fill",
         "wanted": "w",
+        "purpose": "p",
+        "call_log": "c",
         "page_url": "u",
         "allowed_domains": "d",
         "steps": "x",
         "candidates": "c",
+        "was_working": "b",
         "past_fixes": "p",
     }).startswith("Use case: Book a demo")
+
+
+# --- one policy, in the prompts rather than in the code -------------------
+#
+# Asked for explicitly, and asked for *as a prompt*: a consent banner is
+# rejected, never accepted. Hard-coding it would mean matching button text in
+# Python, which is a worse place for a judgement about a page than the prompt
+# of the thing looking at the page.
+#
+# It is also the failure from a real run: a banner still up when the next click
+# happened, so the click was intercepted and the step timed out on an element
+# it had found.
+
+
+def test_every_prompt_that_drives_a_browser_says_reject_never_accept():
+    from prompt_loader import AUTHOR, EXPLORE, RECOVER, load
+
+    for name in (AUTHOR, RECOVER, EXPLORE):
+        text = load(name)
+        assert "Reject, never accept" in text, name
+        assert "Reject all" in text, name
+        assert "cannot be undone" in text or "cannot be taken back" in text, name
+
+
+def test_the_recorder_is_told_to_clear_it_before_anything_else():
+    """Both halves matter: refusing is the consent decision, clearing it first
+    is what stops the recording being made against a page nobody can act on."""
+    from prompt_loader import AUTHOR, load
+
+    text = load(AUTHOR)
+    assert "before anything else" in text
+    assert "intercepted" in text
+
+
+def test_the_healer_treats_a_banner_as_the_problem_not_a_candidate():
+    from prompt_loader import HEAL, load
+
+    text = load(HEAL)
+    assert "not the answer, it is the problem" in text
+
+
+def test_no_consent_policy_is_hard_coded_in_the_engine_or_the_recorder():
+    """The rule lives in the prompts. A list of banner button labels in Python
+    would be this judgement made twice, in the place with less context."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for module in ("engine.py", "agent/session.py", "agent/distil.py", "agent/marks.py"):
+        source = (root / module).read_text(encoding="utf-8")
+        assert "Reject all" not in source, module
+        assert "Accept all" not in source, module

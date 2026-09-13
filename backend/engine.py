@@ -338,6 +338,20 @@ class UseCaseExecutor:
         #: Rungs that matched more than one element on the last resolve, and
         #: how many. Read only to explain a failure.
         self._ambiguous: dict[str, int] = {}
+        #: Playwright's own account of the last failed action: what it waited
+        #: for, and what stopped it. The only place the cause of a timeout is
+        #: written down -- see `_reason`.
+        self._last_call_log: str = ""
+        #: Rungs that matched exactly one element which is not the element the
+        #: step was recorded against. Kept for the failure message: "no
+        #: element matched" said of a rung that matched something else sends
+        #: somebody looking for a locator problem rather than a page change.
+        self._mismatched: dict[str, str] = {}
+        #: The row being processed, for rendering a template into a locator, an
+        #: assertion or a condition. Empty rather than unset: a session check
+        #: and a setup step are evaluated outside any row, and reading this
+        #: before the first row must give "no values" rather than raise.
+        self._row_values: dict[str, Any] = {}
         #: Rungs deeper than the first, per step id. Surfaced as drift.
         self.locator_drift: dict[str, int] = {}
         #: Repairs accepted this session, for the version bump afterwards.
@@ -483,7 +497,7 @@ class UseCaseExecutor:
         if self.usecase.session_check is None:
             return True
         await self._refresh_snapshot()
-        ok, _ = await self._evaluate(self.usecase.session_check)
+        ok, _ = await self._evaluate(self._for_this_row(self.usecase.session_check))
         return ok
 
     # -- one step -----------------------------------------------------------
@@ -497,6 +511,7 @@ class UseCaseExecutor:
     ) -> StepOutcome:
         self.step_number += 1
         started = time.monotonic()
+        self._row_values = values
 
         await self.sink.emit(
             StepStarted(
@@ -511,7 +526,13 @@ class UseCaseExecutor:
         )
 
         try:
-            outcome = await self._perform(step, values, outputs if outputs is not None else {})
+            skip = await self._condition_says_skip(step)
+            if skip is not None:
+                outcome = skip
+            else:
+                outcome = await self._perform(
+                    step, values, outputs if outputs is not None else {}
+                )
         except (StepFailed, ScriptBlocked):
             raise
         except (BrowserError, asyncio.CancelledError):
@@ -562,6 +583,40 @@ class UseCaseExecutor:
         await self._capture_failure()
         await self._write_step_row(step, outcome, phase)
         raise StepFailed(step.id, f"step {step.id!r} ({step.summary()}) failed: {outcome.message}")
+
+    async def _condition_says_skip(self, step: Step) -> StepOutcome | None:
+        """``None`` to run the step, or the outcome recording that it was not.
+
+        Evaluated **once**, with no retry loop, against the page as it stands.
+        That is the opposite of how `assert` is evaluated and the difference is
+        deliberate: an assertion is a claim that something *will* be true and
+        is worth waiting for, while a condition asks what is on the page now.
+        Retrying would make "the cookie banner is absent" cost the full
+        timeout on every row of a batch -- the cheapest possible way to make a
+        thousand rows slow.
+
+        A skip is a success with a reason, not a failure. It is written to the
+        step row and the event stream exactly like the skip an optional step
+        produces, so the run view already knows how to show it.
+        """
+        if step.when is None:
+            return None
+        # The snapshot is refreshed after every action, so at step start it is
+        # already the current page -- except for the very first step of a run,
+        # which has never had one taken.
+        if self._last_snapshot is None:
+            await self._refresh_snapshot()
+        check = self._for_this_row(step.when)
+        held, detail = await self._evaluate(check)
+        if held:
+            return None
+        return StepOutcome(
+            step_id=step.id,
+            ok=True,
+            duration_ms=0,
+            message=f"skipped: {check.describe()} did not hold{detail}",
+            skipped=True,
+        )
 
     async def _heal(
         self, step: Step, values: dict[str, Any], outputs: dict[str, Any]
@@ -698,20 +753,82 @@ class UseCaseExecutor:
         return StepOutcome(step.id, ok, duration, message)
 
     async def _do_element_action(self, step: Step, values: dict[str, Any]) -> StepOutcome:
-        locator = None
-        rung: int | None = None
-        described: str | None = None
+        """One action, through the first rung that can actually perform it.
+
+        Resolving used to be the end of the ladder's job: the first rung
+        matching one visible element won, the action ran against it, and a
+        failure there failed the step. That is wrong for a whole class of page,
+        and the class is common.
+
+        A profile picker was recorded from the accessibility tree as
+        `role=radio name="Nayra Asati"`. The rung resolves -- there is exactly
+        one such radio -- and then `click` waits thirty seconds and gives up,
+        because the site draws a styled radio whose input is not clickable and
+        whose label is. The server had clicked the label; the tree knew only
+        about the radio. Nothing was wrong with *finding* the element and the
+        step failed anyway, twice, and a repair offered a differently spelled
+        name because the error said "timeout" and named a locator.
+
+        So an action that fails is a reason to try the next rung, not a reason
+        to stop. It is safe: Playwright's actionability timeout means the
+        action never dispatched, so there is nothing to have happened twice.
+        """
+        timeout = int(self.step_timeout * 1000)
 
         # `press` sends a key to whatever has focus and `upload` answers an open
         # file chooser; neither needs a target, and neither is recorded with
         # one. Every other element action does.
-        if step.locators or step.action not in OPTIONAL_LOCATOR_ACTIONS:
-            resolved = await self._resolve(step.locators, step.id)
-            if resolved is None:
-                return StepOutcome(step.id, False, 0, self._not_found_message(step))
-            locator, rung, described = resolved
+        if not step.locators and step.action in OPTIONAL_LOCATOR_ACTIONS:
+            return await self._act_on(step, values, None, None, None, timeout)
 
-        timeout = int(self.step_timeout * 1000)
+        attempts: list[tuple[str, str]] = []
+        tried: set[int] = set()
+        while True:
+            resolved = await self._resolve(
+                step.locators, step.id, expect_text=step.expect_text, skip=tried
+            )
+            if resolved is None:
+                break
+            locator, rung, described = resolved
+            tried.add(rung)
+            # Each attempt gets a share of the step rather than the whole of
+            # it. Three rungs at thirty seconds each is a ninety-second step,
+            # which turns one slow failure into three.
+            share = max(2_000, timeout // max(1, len(step.locators)))
+            outcome = await self._act_on(step, values, locator, rung, described, share)
+            if outcome.ok:
+                if attempts:
+                    log.info(
+                        "a later rung performed what an earlier one could not",
+                        extra={"step_id": step.id, "rung": rung, "tried": len(attempts)},
+                    )
+                return outcome
+            attempts.append((described or "", outcome.message))
+
+        if not attempts:
+            return StepOutcome(step.id, False, 0, self._not_found_message(step))
+        if len(attempts) == 1:
+            described, message = attempts[0]
+            return StepOutcome(step.id, False, 0, message, matched_locator=described)
+        detail = "; ".join(f"{where}: {why}" for where, why in attempts)
+        return StepOutcome(
+            step.id,
+            False,
+            0,
+            f"every recorded locator was found and none could be acted on -- {detail}",
+            matched_locator=attempts[0][0],
+        )
+
+    async def _act_on(
+        self,
+        step: Step,
+        values: dict[str, Any],
+        locator: Any,
+        rung: int | None,
+        described: str | None,
+        timeout: int,
+    ) -> StepOutcome:
+        """The action itself, against one already-resolved rung."""
         arguments: dict[str, Any] = {"target": described}
         if step.description:
             arguments["element"] = step.description
@@ -812,9 +929,9 @@ class UseCaseExecutor:
             await self._refresh_snapshot()
 
     async def _do_assert(self, step: Step) -> StepOutcome:
-        check = step.assertion
-        if check is None:
+        if step.assertion is None:
             return StepOutcome(step.id, True, 0, "no assertion")
+        check = self._for_this_row(step.assertion)
 
         # If the allowlist makes this check impossible, say so instead of
         # waiting out the timeout and then blaming the page.
@@ -1046,7 +1163,13 @@ class UseCaseExecutor:
         return await self._resolve(locators, step_id)
 
     async def _resolve(
-        self, locators: list[Locator], step_id: str, *, single: bool = True
+        self,
+        locators: list[Locator],
+        step_id: str,
+        *,
+        single: bool = True,
+        expect_text: str = "",
+        skip: set[int] | None = None,
     ):
         """Walk the ladder and return ``(locator, rung, description)``.
 
@@ -1085,6 +1208,7 @@ class UseCaseExecutor:
         """
         self._last_node = None
         self._ambiguous = {}
+        self._mismatched = {}
         if not locators:
             return None
 
@@ -1094,7 +1218,14 @@ class UseCaseExecutor:
         # That is the answer to the standing objection to templating a
         # locator at all: "when it stops matching you cannot tell whether the
         # site changed or the input did." A failure names the rendered form.
-        ordered = self._rungs([self._render_locator(spec) for spec in locators])
+        ordered = [
+            pair
+            for pair in self._rungs([self._render_locator(spec) for spec in locators])
+            # Rungs an earlier attempt already resolved and failed to act on.
+            # Walked by index rather than removed from the list, so the number
+            # reported as drift stays the recording's own ordering.
+            if not skip or pair[0] not in skip
+        ]
         deadline = time.monotonic() + self.step_timeout
         #: The best rung that matched exactly one element nobody can see yet.
         held: tuple[Any, int, str] | None = None
@@ -1115,6 +1246,10 @@ class UseCaseExecutor:
                 # `extract_rows` passes single=False, because matching many is
                 # the whole point there.
                 if count == 1 or (count > 1 and not single):
+                    if not await self._still_says_what_it_said(
+                        narrowed or locator, spec, expect_text
+                    ):
+                        continue
                     if rung > 0:
                         self._note_drift(step_id, rung)
                     return (narrowed or locator), rung, spec.describe()
@@ -1142,6 +1277,53 @@ class UseCaseExecutor:
                     return held
                 return None
             await asyncio.sleep(POLL_INTERVAL)
+
+    async def _still_says_what_it_said(
+        self, locator: Any, spec: Locator, expect_text: str
+    ) -> bool:
+        """Whether the element found is still the one that was recorded.
+
+        Asked only of a rung that did **not** match on text. A rung that found
+        its element by accessible name has already proved the wording; a CSS
+        path, a test id or a bare role has proved only that something occupies
+        that position, and those are the rungs that quietly land on a
+        different control when a page is rebuilt. A step that "succeeds"
+        against the wrong control is the worst outcome this system has: it is
+        recorded as a success and does the wrong thing on every row after it.
+
+        Borrowed from how locator caches elsewhere decide a cached path is
+        still good -- check that the element there still says what it said --
+        and narrowed to the case where it cannot produce a false refusal.
+
+        Containment either way, not equality, and casefolded. A wrapper's text
+        includes its children's, a button may have gained an icon's label or a
+        count beside it, and a recorded name is often a trimmed version of
+        what the DOM holds. Equality here would refuse correct steps, which is
+        the failure this must not introduce.
+
+        A read that raises, or an element with nothing to read, passes. The
+        check exists to catch a control that is demonstrably something else,
+        not to add a second way for a step to fail.
+        """
+        if not expect_text or spec.matches_on_text:
+            return True
+        try:
+            found = (await locator.first.inner_text(timeout=1_000) or "").strip()
+        except Exception:  # noqa: BLE001 - see the docstring
+            return True
+        if not found:
+            return True
+
+        wanted = expect_text.strip().casefold()
+        seen = " ".join(found.split()).casefold()
+        if wanted in seen or seen in wanted:
+            return True
+        self._mismatched[spec.describe()] = found[:120]
+        log.info(
+            "a positional rung matched something else",
+            extra={"rung": spec.describe(), "recorded": expect_text, "found": found[:120]},
+        )
+        return False
 
     def _rungs(self, locators: list[Locator]) -> list[tuple[int, Locator]]:
         """The ladder in the order it is walked, semantic rungs first.
@@ -1189,6 +1371,16 @@ class UseCaseExecutor:
         log.info("locator fell through", extra={"step_id": step_id, "rung": rung})
 
     def _not_found_message(self, step: Step) -> str:
+        if self._mismatched:
+            found = "; ".join(
+                f"{described} now holds {text!r}" for described, text in self._mismatched.items()
+            )
+            return (
+                f"the element found is not the one that was recorded: {found}, but this step "
+                f"was recorded against {step.expect_text!r}. A locator that says only where "
+                "to look has landed on something else, which is how a batch acts on the "
+                "wrong control. Re-record this step, or repair it to name what it wants."
+            )
         if self._ambiguous:
             # Naming the count is most of the fix: two matches on a name means
             # the page holds a second control whose name contains this one, and
@@ -1214,6 +1406,18 @@ class UseCaseExecutor:
         return f"no element matched. Tried: {tried}.{available}"
 
     # -- assertions ---------------------------------------------------------
+    def _for_this_row(self, check: Assertion) -> Assertion:
+        """One check with its templates made real for the row in hand.
+
+        At the edge rather than inside `_evaluate`, so everything downstream --
+        the evaluation, the locator it builds, and the message a failure
+        carries -- is about what this row actually looked for. That is the same
+        rule `_resolve` follows for a locator rung, and the same reason: "it
+        did not hold" printed against a template tells nobody whether the site
+        changed or the input did.
+        """
+        return check.render(lambda value: self._render(value, self._row_values))
+
     async def _evaluate(self, check: Assertion) -> tuple[bool, str]:
         snapshot = self._last_snapshot
         value = check.value or ""
@@ -1236,6 +1440,19 @@ class UseCaseExecutor:
             found = await self._count(check.locator)
             held = found == (check.count or 0)
             detail = f" (found {found})" if not held else ""
+        elif check.kind == "attribute_contains":
+            actual = await self._attribute(check.locator, check.attribute)
+            held = actual is not None and value in actual
+            # The distinction matters to whoever reads the failure: an element
+            # that was not there at all is a different problem from one whose
+            # href changed, and "does not contain" said of nothing is the
+            # message that sends somebody to check the wrong thing.
+            if actual is None:
+                detail = " (no element matched, so the attribute could not be read)"
+            elif not held or check.negate:
+                detail = f" ({check.attribute} is {actual!r})"
+            else:
+                detail = ""
         else:  # pragma: no cover - the schema constrains `kind`
             return False, f" (unknown assertion kind {check.kind!r})"
 
@@ -1264,6 +1481,23 @@ class UseCaseExecutor:
             return await locator.first.is_visible()
         except Exception:  # noqa: BLE001 - mid-navigation reads as "not there"
             return False
+
+    async def _attribute(self, spec: Locator | None, name: str) -> str | None:
+        """One attribute of the first match, or ``None`` if there is no match.
+
+        ``None`` rather than the empty string, because an attribute that is
+        absent and an element that is absent are different failures and an
+        empty string cannot tell them apart.
+        """
+        locator = self._build(spec) if spec is not None else None
+        if locator is None or not name:
+            return None
+        try:
+            if await locator.count() == 0:
+                return None
+            return await locator.first.get_attribute(name) or ""
+        except Exception:  # noqa: BLE001 - mid-navigation reads as "not there"
+            return None
 
     async def _count(self, spec: Locator | None) -> int:
         """How many elements this locator matches, for ``element_count``."""
@@ -1306,6 +1540,10 @@ class UseCaseExecutor:
             message = (await action()) or ""
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             ok, message = False, _reason(exc)
+            # Held for `_record_failure_context`, which runs after the outcome
+            # has travelled back up through three functions that have no reason
+            # to carry a diagnostic string.
+            self._last_call_log = call_log_of(exc)
 
         duration = int((time.monotonic() - started) * 1000)
         await self.sink.emit(
@@ -1484,6 +1722,11 @@ class UseCaseExecutor:
                     # Capped: a huge page must not bloat the event log, and the
                     # interactive nodes a repair needs are near the top.
                     "snapshot": self.redactor.text(aria[:FAILURE_SNAPSHOT_CHARS]),
+                    # What Playwright tried and what stopped it. A repair
+                    # proposed without this answers a timeout by re-spelling
+                    # the locator, because a locator is the only thing the
+                    # message it was given mentions.
+                    "call_log": self.redactor.text(self._last_call_log),
                 },
             )
         )
@@ -1846,16 +2089,86 @@ def _host_of(pattern: str) -> str:
     return host or pattern
 
 
+#: What Playwright's call log says, and what it means in a sentence.
+#:
+#: The log is the only place the *cause* of a timeout is written down, and this
+#: is the list of causes it actually reports. Order matters: interception is
+#: checked before visibility because a covered element is often reported as
+#: both, and "covered by something" is the one a person can act on.
+_CALL_LOG_CAUSES: tuple[tuple[str, str], ...] = (
+    ("intercepts pointer events", "something else on the page is covering it"),
+    ("element is not stable", "it kept moving, so a click was never safe to send"),
+    ("element is not enabled", "the control is disabled"),
+    ("element is not visible", "it is in the page but not visible"),
+    ("element is not editable", "the field is read-only"),
+    ("element does not receive pointer events", "it cannot be clicked where it is"),
+)
+
+#: How much of Playwright's call log is kept on the failure event. Enough for
+#: the interception line and the few before it; not the whole retry history,
+#: which repeats the same three lines for thirty seconds.
+CALL_LOG_CHARS = 2_000
+
+
+def _cause_in(text: str) -> str:
+    """The plain-language cause out of a Playwright call log, or "".
+
+    Where the interception line names the offending element, that name comes
+    with it: "something else is covering it" sends somebody looking, and
+    "a div with id onetrust-consent-sdk is covering it" sends them to the
+    cookie banner.
+    """
+    lowered = text.casefold()
+    for phrase, meaning in _CALL_LOG_CAUSES:
+        if phrase not in lowered:
+            continue
+        if phrase == "intercepts pointer events":
+            for line in text.splitlines():
+                if "intercepts pointer events" in line.casefold():
+                    culprit = line.strip().split(" intercepts")[0].strip("- ").strip()
+                    if culprit:
+                        return f"{meaning}: {culprit[:160]}"
+            return meaning
+        return meaning
+    return ""
+
+
 def _reason(exc: Exception) -> str:
     """A step failure in one line a person can act on.
 
-    Playwright's own errors are several paragraphs of call log, which is
-    excellent in a terminal and useless in a results CSV with a thousand rows.
-    The first line carries the actual cause.
+    Playwright's own errors are a first line and then several paragraphs of
+    call log. This used to keep the first line only, on the stated grounds
+    that it "carries the actual cause" -- which is true of every error except
+    the one that matters most. For a timeout the first line says
+    ``Locator.click: Timeout 30000ms exceeded`` and the cause is in the log:
+    the element was found, and something was covering it, or it would not hold
+    still, or it was disabled.
+
+    A real recording failed this way on a column header and the stored reason
+    said only "timeout". Nobody could act on that, a repair answered it by
+    re-spelling the locator, and the next run happened to work -- so the
+    diagnosis was never made and the same failure came back. The cause is now
+    read out of the log and put on the end of the line, and the log itself is
+    kept on the failure event for a repair to read.
     """
     text = str(exc).strip()
     first = text.splitlines()[0] if text else type(exc).__name__
-    return f"{type(exc).__name__}: {first}"[:500]
+    cause = _cause_in(text)
+    line = f"{type(exc).__name__}: {first}"
+    if cause:
+        line = f"{line} -- {cause}"
+    return line[:500]
+
+
+def call_log_of(exc: Exception) -> str:
+    """Playwright's own account of what it tried, capped.
+
+    Kept verbatim rather than summarised: the lines are already terse, and a
+    summary of a diagnosis is a second place for the diagnosis to be wrong.
+    """
+    text = str(exc).strip()
+    lines = text.splitlines()
+    return "\n".join(lines[1:]).strip()[:CALL_LOG_CHARS] if len(lines) > 1 else ""
 
 
 async def emit_replay_error(

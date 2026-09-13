@@ -5,11 +5,23 @@ substitute a scripted implementation and never touch the network. That seam is
 the reason the provider underneath could be swapped for LangChain without
 touching distillation, healing or repair.
 
-Claude on Amazon Bedrock via ``langchain-aws``, and only that. **No API key
-required:** credentials resolve through the standard AWS chain -- environment,
-``~/.aws``, an attached role, or ``AWS_BEARER_TOKEN_BEDROCK`` -- so the same
-build runs on a laptop and under an IAM role unchanged. A second provider is a
-second code path to keep working, and nothing here needs one.
+Two providers, and the second one earned its place. **Bedrock** via
+``langchain-aws`` needs no API key: credentials resolve through the standard AWS
+chain -- environment, ``~/.aws``, an attached role, or
+``AWS_BEARER_TOKEN_BEDROCK`` -- so the same build runs on a laptop and under an
+IAM role unchanged. **OpenRouter** via ``langchain-openai`` needs one key and
+fronts most of the models anybody would want to compare.
+
+This file used to say "a second provider is a second code path to keep working,
+and nothing here needs one". That was right about a deployment and wrong about
+the reason a second one gets asked for: choosing a model *is* the work when you
+are measuring accuracy, and you cannot choose between models you cannot reach.
+OpenRouter is the cheap version of that -- one wire format for hundreds of
+models rather than one integration each.
+
+A model is therefore a :class:`ModelChoice`, not a string, and a process holds
+as many clients as it is asked for (:class:`ModelPool`). Which one a run uses
+can be decided per request, because comparing two models means having both.
 
 Streaming matters here for UX, not for tokens: the dashboard shows the model's
 prose as it is produced, so a 6-second turn does not look like a hang.
@@ -19,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
@@ -32,34 +45,110 @@ TextDeltaHandler = Callable[[str], Awaitable[None]]
 PROVIDER = "bedrock"
 
 
-class RepairModel:
-    """The one model this application still uses, built once and cached.
+#: The providers this build can reach.
+PROVIDERS: tuple[str, ...] = ("bedrock", "openrouter")
 
-    There used to be three roles -- a driver for the agent loop, a distiller
-    for turning a recording into a use case, and this one. The first two went
-    with the agent: a workflow is recorded by watching someone do it now, and a
-    codegen script is parsed rather than interpreted.
 
-    What is left is the model that looks at a page when a step breaks. It is
-    held here rather than on a manager so that the thing which owns *runs* is
-    not also the thing which owns a model client -- that coupling is how the
-    replay path ended up one attribute away from an LLM.
+@dataclass(frozen=True, slots=True)
+class ModelChoice:
+    """Which model, from which provider.
+
+    Frozen and hashable so it can key the pool: two runs asking for the same
+    model share one client, and a run asking for a different one does not wait
+    for somebody else's.
+    """
+
+    provider: str
+    model: str
+
+    @classmethod
+    def default(cls, settings: Any) -> "ModelChoice":
+        provider = settings.llm_provider
+        if provider == "openrouter":
+            return cls("openrouter", settings.openrouter_model)
+        return cls("bedrock", settings.llm_repair_model)
+
+    @classmethod
+    def resolve(
+        cls, settings: Any, provider: str | None, model: str | None
+    ) -> "ModelChoice":
+        """What a request asked for, filled in from the defaults.
+
+        Either half may be omitted. Naming a provider without a model is the
+        useful case for Bedrock, where there is a configured default; on
+        OpenRouter it fails with that as the reason, because a provider
+        fronting hundreds of models has no sensible default to pick for you.
+        """
+        if not provider and not model:
+            return cls.default(settings)
+        chosen = provider or settings.llm_provider
+        if chosen not in PROVIDERS:
+            raise ValueError(
+                f"{chosen!r} is not a provider this build can reach. "
+                f"Available: {', '.join(PROVIDERS)}."
+            )
+        if model:
+            return cls(chosen, model)
+        fallback = cls.default(settings)
+        return cls(chosen, fallback.model if fallback.provider == chosen else "")
+
+    def describe(self) -> str:
+        return f"{self.provider}:{self.model}"
+
+
+class ModelPool:
+    """The clients this process has been asked for, built once each.
+
+    This was ``RepairModel``, which held exactly one client because there was
+    exactly one model. Now a person comparing two models has two in flight, so
+    the cache is keyed by the choice rather than being a single slot -- and a
+    client is still built lazily, because building one validates credentials
+    and a process that never calls a model should never have to have them.
     """
 
     def __init__(self, settings, client: "LLMClient | None" = None) -> None:
         self._settings = settings
-        #: A test injects a scripted client here.
+        #: A test injects a scripted client here, by name -- `_client` is an
+        #: established seam (`# noqa: SLF001 - test seam` at its call sites)
+        #: and renaming it would silently start making real provider calls in
+        #: every test that uses it.
+        #:
+        #: It answers for *every* choice, deliberately, for the same reason: a
+        #: pool that honoured the injection only for the default would make a
+        #: real call the moment a test named another model.
         self._client = client
+        self._clients: dict[ModelChoice, LLMClient] = {}
+
+    @property
+    def default_choice(self) -> ModelChoice:
+        return ModelChoice.default(self._settings)
 
     @property
     def client(self) -> "LLMClient":
-        if self._client is None:
-            self._client = build_llm(self._settings, self._settings.llm_repair_model)
-        return self._client
+        """The configured default. What everything used before this existed."""
+        return self.for_choice(self.default_choice)
+
+    def for_choice(self, choice: "ModelChoice | None") -> "LLMClient":
+        if self._client is not None:
+            return self._client
+        resolved = choice or self.default_choice
+        if resolved not in self._clients:
+            self._clients[resolved] = build_llm(
+                self._settings, resolved.model, resolved.provider
+            )
+        return self._clients[resolved]
+
+    def factory(self, choice: "ModelChoice | None" = None):
+        """A zero-argument callable, for anything that wants one."""
+        return lambda: self.for_choice(choice)
 
     def __call__(self) -> "LLMClient":
         """So it can be passed anywhere a zero-argument factory is wanted."""
         return self.client
+
+
+#: The old name, kept so nothing that imports it breaks on the way through.
+RepairModel = ModelPool
 
 
 class LLMAccessError(RuntimeError):
@@ -135,10 +224,10 @@ class LangChainLLM:
     failures translated into something an operator can act on.
     """
 
-    def __init__(self, model: Any, model_name: str) -> None:
+    def __init__(self, model: Any, model_name: str, provider: str = PROVIDER) -> None:
         self._model = model
         self.model = model_name
-        self.provider = PROVIDER
+        self.provider = provider
 
     @property
     def raw(self) -> Any:
@@ -183,10 +272,17 @@ class LangChainLLM:
         # prefix, which is also most of what a slow turn is spending time on.
         # `ChatBedrockConverse` inserts the cache breakpoints; this only says
         # to use them.
+        # ...and only Bedrock inserts them. `ChatOpenAI` rejects an unknown
+        # keyword outright, so sending it to OpenRouter would fail every call
+        # rather than merely miss a saving.
+        options: dict[str, Any] = (
+            {"cache_control": {"ttl": "5m"}} if self.provider == "bedrock" else {}
+        )
+
         started = time.monotonic()
         try:
             final: Any = None
-            async for chunk in model.astream(history, cache_control={"ttl": "5m"}):
+            async for chunk in model.astream(history, **options):
                 if on_text_delta is not None:
                     piece = text_of(chunk)
                     if piece:
@@ -223,7 +319,10 @@ class LangChainLLM:
         return translate_access_error(exc, model=self.model, provider=self.provider)
 
     def describe(self) -> dict[str, Any]:
-        return {"provider": PROVIDER, "model": self.model, "auth": bedrock_auth_status()}
+        described: dict[str, Any] = {"provider": self.provider, "model": self.model}
+        if self.provider == "bedrock":
+            described["auth"] = bedrock_auth_status()
+        return described
 
     async def check_access(self) -> dict[str, Any]:
         """Can this client actually call its model? One tiny request.
@@ -280,8 +379,20 @@ def _status_from_message(message: str) -> int | None:
     botocore raises ``AccessDeniedException`` / ``ValidationException`` rather
     than anything carrying a status code, so the access check would miss the
     very failure it exists to catch.
+
+    The OpenAI SDK -- which is how OpenRouter is reached -- puts the status in
+    the message as ``Error code: 401``, and wraps it in exception types that do
+    not always survive LangChain's own re-raising. Reading it out of the text
+    is what makes "your key was rejected" an actionable message rather than a
+    stack trace ending in a 401.
     """
     lowered = message.lower()
+
+    coded = re.search(r"error code:\s*(\d{3})", lowered)
+    if coded:
+        return int(coded.group(1))
+    if "no auth credentials" in lowered or "invalid api key" in lowered:
+        return 401
     if "accessdenied" in lowered or "not available for this account" in lowered:
         return 403
     if "unrecognizedclient" in lowered or "invalid" in lowered and "token" in lowered:
@@ -369,13 +480,18 @@ def llm_health(settings: Any) -> dict[str, Any]:
     }
 
 
-def build_llm(settings: Any, model: str | None = None) -> LLMClient:
-    """The configured model, wrapped in this codebase's client protocol.
-
-    ``model`` overrides the configured one, which is what let a single process
-    run several at once when there were several roles to run.
-    """
+def build_llm(
+    settings: Any, model: str | None = None, provider: str | None = None
+) -> LLMClient:
+    """One model, wrapped in this codebase's client protocol."""
     from chat import chat_model
+
+    chosen = provider or settings.llm_provider
+    if chosen == "openrouter":
+        resolved = model or settings.openrouter_model
+        return LangChainLLM(
+            chat_model(settings, resolved, "openrouter"), resolved, "openrouter"
+        )
 
     resolved = model or settings.llm_repair_model
 
@@ -389,4 +505,4 @@ def build_llm(settings: Any, model: str | None = None) -> LLMClient:
             "with the IAM profile, or clear AWS_PROFILE to use the Bedrock API key."
         )
 
-    return LangChainLLM(chat_model(settings, resolved), resolved)
+    return LangChainLLM(chat_model(settings, resolved, "bedrock"), resolved, "bedrock")

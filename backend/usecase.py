@@ -474,6 +474,25 @@ class Locator(BaseModel):
         return self
 
     @property
+    def matches_on_text(self) -> bool:
+        """Whether this rung finds its element *by* what the element says.
+
+        The question `Step.expect_text` needs answered. A rung that matched on
+        an accessible name has already proved the wording; one that matched a
+        CSS path, a test id or a bare role has proved only that something sits
+        in that position, and that is the rung that lands on a different
+        control after a redesign without anybody noticing.
+
+        `NAMED_STRATEGIES` rather than `STRING_STRATEGIES`, because `test_id`
+        is in the second and is not text a person reads -- a test id survives
+        the control behind it being replaced, which is the whole point of one.
+        """
+        value = self.name if self.strategy == "role" else self.text
+        if self.has_text:
+            return True
+        return self.strategy in NAMED_STRATEGIES and bool(value)
+
+    @property
     def semantic(self) -> bool:
         """Whether this rung describes meaning rather than markup.
 
@@ -573,10 +592,25 @@ class Assertion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["url_contains", "text_present", "element_visible", "element_count", "title_contains"]
+    kind: Literal[
+        "url_contains",
+        "text_present",
+        "element_visible",
+        "element_count",
+        "title_contains",
+        "attribute_contains",
+    ]
     value: str | None = None
     #: element_count only.
     count: int | None = None
+    #: attribute_contains only: which attribute to read.
+    #:
+    #: The gap this fills, found by reading what other recorders can check:
+    #: the identifier a later step needs is often in a link rather than in the
+    #: words a person sees, so "the row's link points at account A-1001" was a
+    #: check nothing here could express. `extract` could already *read* an
+    #: attribute; only asserting on one was missing.
+    attribute: str = Field(default="", max_length=100)
     locator: Locator | None = None
     negate: bool = False
     timeout_ms: int = Field(default=10_000, ge=0, le=300_000)
@@ -589,7 +623,40 @@ class Assertion(BaseModel):
             raise ValueError(f"assertion {self.kind!r} requires a locator")
         if self.kind == "element_count" and self.count is None:
             raise ValueError("assertion 'element_count' requires a count")
+        if self.kind == "attribute_contains":
+            if self.locator is None:
+                raise ValueError("assertion 'attribute_contains' requires a locator")
+            if not self.attribute:
+                raise ValueError(
+                    "assertion 'attribute_contains' requires an attribute to read"
+                )
+            if not self.value:
+                raise ValueError("assertion 'attribute_contains' requires a value")
         return self
+
+    def render(self, render: Any) -> "Assertion":
+        """This check with ``{{input.x}}`` made real, through ``render``.
+
+        The same shape as `Locator.render`, and needed for the same reason: a
+        check about the record being processed is the obvious thing to write.
+        `Step.references` has always counted an assertion's value as a real
+        template reference, so the schema said this worked -- while the
+        executor compared the template text against the page, where it could
+        never hold. Rendering before evaluating also means a failure names the
+        value the row actually looked for rather than the template.
+
+        Returns ``self`` when there is nothing to substitute, which is every
+        check of every recording that does not use one.
+        """
+        rendered_value = (
+            render(self.value) if self.value and has_template(self.value) else self.value
+        )
+        rendered_locator = self.locator.render(render) if self.locator is not None else None
+        if rendered_value == self.value and rendered_locator is self.locator:
+            return self
+        return self.model_copy(
+            update={"value": rendered_value, "locator": rendered_locator}
+        )
 
     def unsatisfiable_reason(self, allowed_domains: list[str]) -> str | None:
         """Why this assertion can never hold, or ``None`` if it might.
@@ -650,6 +717,10 @@ class Assertion(BaseModel):
             "text_present": f"page shows {self.value!r}",
             "element_visible": f"{self.locator.describe() if self.locator else '?'} is visible",
             "element_count": f"{self.locator.describe() if self.locator else '?'} appears {self.count} time(s)",
+            "attribute_contains": (
+                f"{self.locator.describe() if self.locator else '?'} has "
+                f"{self.attribute}={self.value!r}"
+            ),
         }[self.kind]
         return f"NOT {body}" if self.negate else body
 
@@ -754,6 +825,40 @@ class Step(BaseModel):
     assertion: Assertion | None = Field(default=None, alias="assert")
     wait_for: WaitFor | None = None
 
+    #: Run this step only when this holds. ``None`` means always.
+    #:
+    #: The gap a person hits within a day of using this: a cookie banner that
+    #: is there on the first row and not the fourth, a dialog that appears
+    #: only for some records, a save button that only exists when something
+    #: changed. `optional` covers "failing is survivable", which is a
+    #: different statement -- an optional step still runs, still waits out its
+    #: timeout, and still reports a failure somebody has to read.
+    #:
+    #: An `Assertion` rather than an expression, deliberately. It is the same
+    #: check the executor already evaluates locally with no model and no
+    #: judgement, it is reviewable on the same screen as everything else, and
+    #: there is nothing in it to execute. A `when` with an expression language
+    #: in it would be a script step wearing a smaller name.
+    when: Assertion | None = None
+
+    #: What the element this step acts on said when it was recorded.
+    #:
+    #: Checked before acting, and *only* when the rung that matched does not
+    #: itself match on text -- see `Locator.matches_on_text`. A rung that found
+    #: its element by accessible name has already proved the wording; a CSS
+    #: path, a test id or a bare role has proved only that something sits in
+    #: that position. Those are the rungs that quietly land on a different
+    #: control, and a step that "succeeds" against the wrong control is the
+    #: worst outcome this system has -- it gets recorded as a success and does
+    #: the wrong thing on every row.
+    #:
+    #: Borrowed from how other recorders validate a cached locator: before
+    #: trusting a stored path, check the element there still says what it said.
+    #: The comparison is deliberately lenient, containment either way rather
+    #: than equality, because a wrapper's text includes its children's and an
+    #: exact match would refuse correct steps.
+    expect_text: str = Field(default="", max_length=200)
+
     optional: bool = False
     on_failure: FailureMode = "abort"
     timeout_ms: int = Field(default=30_000, ge=0, le=300_000)
@@ -761,6 +866,41 @@ class Step(BaseModel):
     #: Locator rungs the recorder saw fail. Kept for the review UI so a person
     #: can see what was tried, never executed.
     rejected_locators: list[Locator] = Field(default_factory=list)
+
+    #: What this step is *for*, in the recorder's own words.
+    #:
+    #: `description` is a rendering of the locator -- "click role=button
+    #: name='Save'" -- which says what the step does mechanically and nothing
+    #: about why. Healing and repair were being asked "which of these forty
+    #: controls resembles a link named Billing" when the answerable question is
+    #: "which of these opens the customer's billing tab". This is that
+    #: question's other half.
+    #:
+    #: It already existed and was being thrown away. The authoring agent must
+    #: write one sentence before every tool call saying what it sees, what it
+    #: expects the call to do and how it will know -- `agent/session.py`'s
+    #: `observation` -- and distillation dropped it on the floor.
+    #:
+    #: Evidence, never executed, like `recorded_page`. It says what to look
+    #: for; it can never authorise a control that is not among the candidates
+    #: a repair is offered, and the prompts say so.
+    intent: str = Field(default="", max_length=1_000)
+
+    #: The page this step was recorded against, as an accessibility tree.
+    #:
+    #: Never executed, and never read by the engine. It exists for the one
+    #: question a repair cannot otherwise answer: a locator stopped matching,
+    #: and the only evidence available was the page as it is *now*. Choosing a
+    #: replacement from that alone is guessing which of forty controls somebody
+    #: meant. With the page as it was, the two can be compared, and "this
+    #: control was here and is not any more" has one answer rather than forty.
+    #:
+    #: Capped by whoever writes it (see `agent/session.py`). Travels with the
+    #: definition rather than living in its own table, because a use case
+    #: promoted to another environment should carry its own evidence -- a
+    #: repair in UAT is done by somebody who was not there when it was
+    #: recorded in dev.
+    recorded_page: str = Field(default="", max_length=20_000)
 
     @model_validator(mode="after")
     def _action_has_what_it_needs(self) -> "Step":
@@ -1065,151 +1205,6 @@ def strip_data_locators(
             f"{{{{input.your_column}}}}."
         )
     return notes
-
-
-# ---------------------------------------------------------------------------
-# Steps
-# ---------------------------------------------------------------------------
-
-
-class Step(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    id: str = Field(default_factory=lambda: f"s{uuid.uuid4().hex[:6]}")
-    action: Action
-    #: Human-readable, shown in the timeline and in failure messages.
-    description: str = ""
-
-    locators: list[Locator] = Field(default_factory=list)
-    #: navigate
-    url: str | None = None
-    #: fill / select / press / upload
-    value: str | None = None
-    #: fill_form
-    fields: list[FormField] = Field(default_factory=list)
-    #: extract_rows -- what to read out of each row the locator matches.
-    columns: list[ExtractColumn] = Field(default_factory=list)
-    #: extract -- read this attribute rather than the element's text. An href
-    #: is the usual reason: the identifier a later pass needs is in the link,
-    #: not in the words a person sees.
-    attribute: str = ""
-    #: extract -- the key this step's value lands under in the row's outputs.
-    output: str | None = None
-    #: script -- raw JavaScript. Refused unless the use case opts in.
-    code: str | None = None
-
-    assertion: Assertion | None = Field(default=None, alias="assert")
-    wait_for: WaitFor | None = None
-
-    optional: bool = False
-    on_failure: FailureMode = "abort"
-    timeout_ms: int = Field(default=30_000, ge=0, le=300_000)
-
-    #: Locator rungs the recorder saw fail. Kept for the review UI so a person
-    #: can see what was tried, never executed.
-    rejected_locators: list[Locator] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _action_has_what_it_needs(self) -> "Step":
-        if self.action in ELEMENT_ACTIONS and not self.locators:
-            raise ValueError(f"step {self.id!r}: action {self.action!r} requires at least one locator")
-        if self.action == "navigate" and not self.url:
-            raise ValueError(f"step {self.id!r}: 'navigate' requires a url")
-        if self.action == "assert" and self.assertion is None:
-            raise ValueError(f"step {self.id!r}: 'assert' requires an assertion")
-        if self.action == "extract" and not self.output:
-            raise ValueError(f"step {self.id!r}: 'extract' requires an output name")
-        if self.action == "script" and not self.code:
-            raise ValueError(f"step {self.id!r}: 'script' requires code")
-        if self.action == "fill_form" and not self.fields:
-            raise ValueError(f"step {self.id!r}: 'fill_form' requires at least one field")
-        if self.action == "extract_rows" and not self.columns:
-            raise ValueError(
-                f"step {self.id!r}: 'extract_rows' requires at least one column. "
-                "Without one it would find the rows and read nothing out of them."
-            )
-        if self.action == "download" and not self.output:
-            raise ValueError(
-                f"step {self.id!r}: 'download' requires an output name. The file is the "
-                "point of the step, and the name is how a later row finds it."
-            )
-        if self.action == "extract_rows" and not self.output:
-            raise ValueError(
-                f"step {self.id!r}: 'extract_rows' requires an output name to land under"
-            )
-        if self.action == "wait" and self.wait_for is None:
-            raise ValueError(f"step {self.id!r}: 'wait' requires wait_for")
-        if self.action == "press" and not self.value:
-            raise ValueError(f"step {self.id!r}: 'press' requires a key")
-        if self.action == "upload" and not self.value:
-            raise ValueError(f"step {self.id!r}: 'upload' requires a file path")
-        return self
-
-    @model_validator(mode="after")
-    def _selectors_are_never_templated(self) -> "Step":
-        """A templated *selector* is a selector-injection hole.
-
-        A templated accessible name is not, and the difference is which of them
-        is a query language -- see :data:`TEMPLATABLE_LOCATOR_FIELDS` for the
-        whole argument. ``selector`` and ``frames`` are CSS and stay closed;
-        the fields Playwright matches as plain strings are open, because a
-        search whose dropdown is filled from the row has no replayable locator
-        without them.
-        """
-        everywhere = [
-            *self.locators,
-            *self.rejected_locators,
-            *[loc for field in self.fields for loc in field.locators],
-        ]
-        for locator in everywhere:
-            offending = locator.templated_selector()
-            if offending:
-                raise ValueError(
-                    f"step {self.id!r}: templating is not allowed in a locator's "
-                    f"{offending} -- it is a CSS selector, and a row whose value "
-                    f"contained selector syntax would address a different element "
-                    f"({locator.describe()}). Match on a name, a label or a text "
-                    "filter instead, which are compared as plain strings."
-                )
-        return self
-
-    def references(self) -> set[tuple[str, str]]:
-        """Every ``(kind, name)`` this step's value-bearing fields reference."""
-        return template_refs(
-            {
-                "url": self.url,
-                "value": self.value,
-                "fields": [f.value for f in self.fields],
-                # Locators count too, now that a name may be templated. A step
-                # that finds its element by "{{input.customer_name}}" and does
-                # not declare that input would otherwise pass review and then
-                # look for the literal text on every row.
-                "locators": [loc.template_values() for loc in self.locators],
-                "field_locators": [
-                    loc.template_values() for f in self.fields for loc in f.locators
-                ],
-                "assert": self.assertion.value if self.assertion else None,
-                "wait": self.wait_for.value if self.wait_for else None,
-                # Script code counts. It used to be excluded because nothing
-                # substituted into it, so an input referenced there could never
-                # be filled -- which meant a recording that drove a form via
-                # JavaScript produced a use case with no inputs at all, asking
-                # for nothing and typing "{{input.full_name}}" into the page.
-                # render_code() makes the reference real, so it is now counted.
-                "code": self.code,
-            }
-        )
-
-    def summary(self) -> str:
-        if self.description:
-            return self.description
-        if self.action == "navigate":
-            return f"navigate to {self.url}"
-        if self.action == "assert" and self.assertion:
-            return f"assert {self.assertion.describe()}"
-        if self.locators:
-            return f"{self.action} {self.locators[0].describe()}"
-        return self.action
 
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +1671,20 @@ class UseCase(BaseModel):
     teardown_steps: list[Step] = Field(default_factory=list)
 
     outputs: list[str] = Field(default_factory=list)
+
+    #: The whole flow in plain language, written after recording.
+    #:
+    #: A step list says what happens and in which order. It does not say what
+    #: the workflow is *for*, which is what a reviewer deciding whether to
+    #: publish needs, and what a repair months later needs before it can judge
+    #: whether a replacement control makes sense. Written by one model call
+    #: over the distilled steps (`agent/brief.py`), in the language the task
+    #: was written in.
+    #:
+    #: Prose, deliberately. Anything a replay acts on is a `Step`; this is read
+    #: by people and by the two prompts that ask a model where a control went.
+    instructions: str = Field(default="", max_length=10_000)
+
     #: Seconds to wait between rows, overriding the deployment default.
     #:
     #: Politeness is a property of the site, not of the installation. One
@@ -1828,11 +1837,16 @@ class UseCase(BaseModel):
         """
         found: list[tuple[str, str]] = []
         for step in self.all_steps:
-            if step.assertion is None:
-                continue
-            reason = step.assertion.unsatisfiable_reason(self.allowed_domains)
-            if reason:
-                found.append((step.id, reason))
+            for what, check in (("", step.assertion), (" condition", step.when)):
+                if check is None:
+                    continue
+                reason = check.unsatisfiable_reason(self.allowed_domains)
+                if reason:
+                    # A `when` that can never hold does not fail a row, it
+                    # skips the step on every row -- so the symptom is a
+                    # workflow that quietly does less than it was recorded
+                    # doing, which is harder to notice than a failure.
+                    found.append((step.id + what, reason))
         if self.session_check is not None:
             reason = self.session_check.unsatisfiable_reason(self.allowed_domains)
             if reason:

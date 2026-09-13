@@ -466,3 +466,81 @@ async def test_confirming_without_a_memory_is_harmless():
     repair = await healer.repair(broken_step(), parse_snapshot(RENAMED))
 
     await healer.confirm(repair, True)
+
+
+# --- the page as it was, beside the page as it is --------------------------
+
+
+AS_RECORDED = """### Page
+- Page URL: https://example.com/signin
+### Snapshot
+```yaml
+- textbox "Username" [ref=e1]
+- textbox "Password" [ref=e2]
+- button "Sign in" [ref=e3]
+```"""
+
+
+async def test_the_healer_is_shown_the_page_as_it_was_when_the_step_worked():
+    """Given only the current page, a repair chooses between plausible
+    controls. Given both, a renamed control is obvious side by side and close
+    to invisible from the new page alone."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.recorded_page = AS_RECORDED
+
+    await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert "when the step was recorded and working" in llm.last_user_message
+    assert 'button "Sign in"' in llm.last_user_message, "the control that is gone"
+    assert 'button "Log in"' in llm.last_user_message, "and the one that replaced it"
+
+
+async def test_a_step_with_no_recorded_page_asks_exactly_as_it_did_before():
+    """Every recording made before this existed takes this path, and the
+    prompt must not grow an empty section for them."""
+    llm = ChoosingLLM(index=2)
+
+    await StepHealer(llm).repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert "when the step was recorded" not in llm.last_user_message
+
+
+async def test_an_unparseable_recorded_page_is_ignored_rather_than_fatal():
+    """Context is a bonus. Losing the repair over it would be the wrong trade."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.recorded_page = "this is not a snapshot at all"
+
+    repair = await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert repair is not None
+
+
+# --- what the step was for ------------------------------------------------
+
+
+async def test_the_healer_is_told_what_the_step_was_for():
+    """The question changes from "which of these forty controls resembles a
+    link named Billing" to "which of these opens the customer's billing tab",
+    and the second is the one a person answers without thinking.
+
+    The sentence is not new work for anybody: the authoring agent already has
+    to write one before every tool call. It was being thrown away."""
+    llm = ChoosingLLM(index=2)
+    step = broken_step()
+    step.intent = "opens the customer's billing tab"
+
+    await StepHealer(llm).repair(step, parse_snapshot(RENAMED))
+
+    assert "what it is for: opens the customer's billing tab" in llm.last_user_message
+
+
+async def test_a_step_with_no_purpose_leaves_no_empty_bullet():
+    """Every codegen recording and everything recorded before `Step.intent`
+    existed takes this path."""
+    llm = ChoosingLLM(index=2)
+
+    await StepHealer(llm).repair(broken_step(), parse_snapshot(RENAMED))
+
+    assert "what it is for" not in llm.last_user_message

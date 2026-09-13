@@ -42,6 +42,15 @@ from .run import AgentSession, AuthorResult
 
 log = logging.getLogger(__name__)
 
+#: How many locators verification may re-find before giving up on a draft.
+#:
+#: Small on purpose. One or two bad locators in a recording is ordinary -- the
+#: agent acted on refs and described what it acted on, and description is the
+#: lossy step. Ten is not a recording that needs mending, it is one that needs
+#: redoing, and spending a model call on each to reach that conclusion is the
+#: expensive way to find out.
+VERIFY_REPAIR_ATTEMPTS = 4
+
 
 class AgentUnavailable(RuntimeError):
     """This deployment cannot run an agent, and the message says why."""
@@ -63,6 +72,10 @@ class Session:
     result: AuthorResult | None = None
     #: Set while the graph is suspended: the call a person is being asked about.
     awaiting: dict[str, Any] | None = None
+    #: Which model drove this session, as "provider:model". Reported rather
+    #: than inferred: the whole point of choosing one is being able to tell
+    #: afterwards which one produced the recording you are looking at.
+    model: str = ""
     _task: asyncio.Task | None = field(default=None, repr=False)
     _session: AgentSession | None = field(default=None, repr=False)
     _finished: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
@@ -78,6 +91,7 @@ class Session:
             "task": self.task,
             "start_url": self.start_url,
             "status": self.status,
+            "model": self.model,
             "error": self.error or None,
             "awaiting": self.awaiting,
             "summary": result.summary if result else "",
@@ -85,6 +99,11 @@ class Session:
             "spend": result.spend if result else {},
             "steps": result.steps if result else 0,
             "marks": result.marks if result else [],
+            # What the request was taken to mean, before the browser opened.
+            # On the summary as well as on the event stream, because the
+            # session screen is reloadable and an assumption worth correcting
+            # must not be a message that scrolled past.
+            "brief": result.brief if result else None,
             "unfinished": result.unfinished if result else "",
             "use_case": result.use_case if result else None,
             "draft_warnings": result.draft_warnings if result else [],
@@ -121,6 +140,15 @@ class AgentSessions:
         #: start Chromium to check that the router saves a draft.
         self.replay = replay
         self._sessions: dict[str, Session] = {}
+
+    @property
+    def verify_draft(self) -> bool:
+        """Whether a finished recording is replayed before anybody sees it.
+
+        Read from settings each time rather than captured, so an operator who
+        changes it does not have to restart to find out whether they meant it.
+        """
+        return bool(getattr(self.settings, "agent_verify_draft", True))
 
     # -- availability -------------------------------------------------------
     def check_available(self) -> None:
@@ -193,6 +221,7 @@ class AgentSessions:
         owner_id: str | None = None,
         owner_email: str = "",
         headless: bool | None = None,
+        model: Any = None,
     ) -> Session:
         self.check_available()
         budget = await self._within_the_ceiling(workspace_id, budget or Budget())
@@ -221,10 +250,40 @@ class AgentSessions:
             run_id=run_id,
             workspace_id=workspace_id,
         )
+        record.model = _describe_model(model, self.llm_factory)
         record._task = asyncio.create_task(
-            self._drive(record, request, dict(secrets or {}), name, headless)
+            self._drive(record, request, dict(secrets or {}), name, headless, model)
         )
         return record
+
+    def _healer_for(self, model: Any) -> Any:
+        """A healer for verification, or None when nothing can heal.
+
+        Its own small budget rather than the session's. A draft that needs
+        three locators re-found is worth three calls; the session's remaining
+        step allowance is about driving a browser and says nothing about that.
+        """
+        if self.llm_factory is None:
+            return None
+        try:
+            from healing import HealingBudget, StepHealer
+        except Exception:  # noqa: BLE001 - healing is part of the same extra
+            return None
+        return StepHealer(
+            _client_for(self.llm_factory, model),
+            HealingBudget(max_attempts=VERIFY_REPAIR_ATTEMPTS, max_tokens=40_000),
+        )
+
+    def _scribe_for(self, model: Any) -> Any:
+        """The client for the brief and walkthrough passes, or None.
+
+        Two calls per session against a session that makes dozens, so this is
+        not budgeted separately the way the healer is -- both are charged to
+        the session's own spend, because both are part of recording.
+        """
+        if self.llm_factory is None:
+            return None
+        return _client_for(self.llm_factory, model)
 
     async def _within_the_ceiling(self, workspace_id: str, budget: Budget) -> Budget:
         """Fold the workspace's monthly ceiling into this session's own budget.
@@ -291,6 +350,7 @@ class AgentSessions:
         secrets: dict[str, str],
         name: str,
         headless: bool | None,
+        model: Any = None,
     ) -> None:
         """Run the session, writing its events where every run writes them."""
         data = self.store.workspace(record.workspace_id)
@@ -308,12 +368,35 @@ class AgentSessions:
             ) as run:
                 async with AgentSession(
                     request,
-                    llm=self.llm_factory(),
+                    # The model this session was started with. `llm_factory`
+                    # is the pool, which answers for a choice; calling it bare
+                    # would drive on the configured model while the dashboard
+                    # said otherwise, which is the one thing a model picker
+                    # must not do.
+                    llm=_client_for(self.llm_factory, model),
                     provider=self.provider(headless),
                     emit=_stamped(run.sink),
                     secrets=secrets,
                     name=name,
                     replay=self.replay,
+                    # Built from *this session's* model, so a draft is mended
+                    # by whatever the person chose to record with rather than
+                    # by the deployment default. Budgeted separately from the
+                    # session: mending a recording is not what the session's
+                    # steps were for.
+                    healer=self._healer_for(model),
+                    # The two passes that bracket the recording: the request
+                    # restated before the browser opens, the flow written down
+                    # after the steps exist. Same model the person chose to
+                    # record with, because a brief in one model's words feeding
+                    # another model's session is a translation nobody asked for.
+                    scribe=self._scribe_for(model),
+                    # A cold replay of the finished draft, unless the
+                    # deployment has turned it off. It spends no tokens; what
+                    # it costs is a browser launch and one pass through the
+                    # flow, and what it buys is knowing the recording runs
+                    # before somebody publishes it.
+                    verify_draft=self.verify_draft,
                     extra=await self._registered_providers(data),
                 ) as session:
                     record._session = session
@@ -467,6 +550,24 @@ async def _flush(sink: Any) -> None:
     flush = getattr(sink, "flush", None)
     if flush is not None:
         await flush()
+
+
+def _client_for(factory: Any, model: Any) -> Any:
+    """The client for this session's chosen model, or the configured one."""
+    chooser = getattr(factory, "for_choice", None)
+    return chooser(model) if chooser is not None else factory()
+
+
+def _describe_model(model: Any, factory: Any) -> str:
+    """"provider:model" for whatever this session will actually drive on.
+
+    Resolved at start rather than read off the client later, so the session
+    screen can say which model is running before the first turn comes back.
+    """
+    if model is not None:
+        return getattr(model, "describe", lambda: str(model))()
+    default = getattr(factory, "default_choice", None)
+    return default.describe() if default is not None else ""
 
 
 def _stamped(sink: Any):

@@ -102,7 +102,17 @@ def build(w: Wiring, checkpointer: Any = None):
         tools=tools,
         system_prompt=system_prompt(w.request),
         middleware=[
-            BudgetMiddleware(w.spend, model_name=w.llm.model, marks=w.tools.marks),
+            BudgetMiddleware(
+                w.spend,
+                model_name=w.llm.model,
+                marks=w.tools.marks,
+                # Read off the client rather than the settings: this session
+                # may have been started on a model the deployment does not
+                # default to, and the prompt-cache hint below is only valid
+                # for one of the two providers.
+                provider=getattr(w.llm, "provider", "bedrock"),
+                rates=getattr(w, "rates", None),
+            ),
             ThinkingMiddleware(w.emit, run_id=w.request.run_id, spend=w.spend),
             FinishMiddleware(w.tools),
             HumanInTheLoopMiddleware(interrupt_on=interrupt_on),

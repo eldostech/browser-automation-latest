@@ -17,6 +17,7 @@ from routers import (
     executions,
     health,
     memory,
+    models,
     targets,
     recordings,
     runs,
@@ -28,6 +29,7 @@ from routers import (
 ALL_ROUTERS = (
     health.router,
     auth.router,
+    models.router,
     admin.router,
     runs.router,
     usecases.router,

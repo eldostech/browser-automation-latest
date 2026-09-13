@@ -616,3 +616,170 @@ def test_a_scope_deeper_than_the_schema_allows_is_refused_on_save(client: TestCl
 
     response = client.put(f"/api/usecases/{usecase_id}", json=definition)
     assert response.status_code == 422
+
+
+# --- describing what a use case does ---------------------------------------
+#
+# The same pass an agent session runs at the end of its own recording, on
+# demand. It exists for the two cases that one does not reach: a codegen
+# recording, which has no model in it and therefore no account of itself, and
+# anything recorded before this existed.
+
+
+class WalkthroughLLM:
+    """Answers a describe request, and counts the calls."""
+
+    model = "fake"
+
+    def __init__(self, payload: dict | None) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    async def run_turn(self, *, system, messages, tools, on_text_delta=None, timeout=None):
+        self.calls += 1
+        if self.payload is None:
+            return LLMTurn(text="I would rather not")
+        return LLMTurn(
+            tool_calls=[ToolCallRequest(id="t1", name="walkthrough", input=self.payload)],
+            stop_reason="tool_use",
+        )
+
+
+WALKTHROUGH = {
+    "overview": "Signs in once, then opens the record each row names.",
+    "steps": [{"id": "s1", "purpose": "opens the record the row names"}],
+}
+
+
+def use_walkthrough_llm(client: TestClient, payload: dict | None = WALKTHROUGH) -> WalkthroughLLM:
+    llm = WalkthroughLLM(payload)
+    client.app.state.repair_model._client = llm  # noqa: SLF001 - test seam
+    return llm
+
+
+async def test_a_use_case_can_be_described_in_plain_language(client: TestClient):
+    usecase_id = await seed_usecase(client)
+    use_walkthrough_llm(client)
+
+    response = client.post(f"/api/usecases/{usecase_id}/describe", json={})
+
+    assert response.status_code == 201
+    assert "Signs in once" in response.json()["instructions"]
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    assert "Signs in once" in definition["instructions"]
+
+
+async def test_a_described_step_says_what_it_is_for(client: TestClient):
+    """The point of the pass. A repair reads this, and a step's description is
+    a rendering of its own locator -- which says nothing about why."""
+    usecase_id = await seed_usecase(client)
+    use_walkthrough_llm(client)
+
+    client.post(f"/api/usecases/{usecase_id}/describe", json={})
+
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    assert definition["row_steps"][0]["intent"] == "opens the record the row names"
+
+
+async def test_describing_a_published_use_case_leaves_it_published(client: TestClient):
+    """Unlike a repair, which changes what runs and must land as a draft.
+    Forcing a republish to gain a description would mean nobody ever described
+    a published use case, which is most of them."""
+    usecase_id = await seed_usecase(client)
+    client.post(f"/api/usecases/{usecase_id}/publish")
+    use_walkthrough_llm(client)
+
+    response = client.post(f"/api/usecases/{usecase_id}/describe", json={})
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ready"
+    assert client.get(f"/api/usecases/{usecase_id}").json()["definition"]["status"] == "ready"
+
+
+async def test_describing_appends_a_version_rather_than_rewriting_one(client: TestClient):
+    usecase_id = await seed_usecase(client)
+    use_walkthrough_llm(client)
+
+    client.post(f"/api/usecases/{usecase_id}/describe", json={})
+
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert [v["version"] for v in body["versions"]] == [2, 1]
+    original = client.get(f"/api/usecases/{usecase_id}", params={"version": 1}).json()
+    # Absent rather than empty: a stored definition keeps exactly the keys it
+    # was saved with, and the seed predates this field.
+    assert not original["definition"].get("instructions"), "v1 is immutable"
+
+
+async def test_a_model_that_declines_changes_nothing_and_says_so(client: TestClient):
+    """`write_walkthrough` swallows its own failures so a recording session
+    cannot be lost to one. Here there is no session to lose, and somebody is
+    waiting on a button."""
+    usecase_id = await seed_usecase(client)
+    use_walkthrough_llm(client, None)
+
+    response = client.post(f"/api/usecases/{usecase_id}/describe", json={})
+
+    assert response.status_code == 502
+    assert "Nothing was changed" in response.json()["detail"]
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert [v["version"] for v in body["versions"]] == [1]
+
+
+async def test_describing_an_unknown_use_case_is_a_404(client: TestClient):
+    use_walkthrough_llm(client)
+    assert client.post("/api/usecases/nope/describe", json={}).status_code == 404
+
+
+# --- exporting a script -----------------------------------------------------
+#
+# One way only, and read-only. The document is what TRACE runs and what a
+# repair edits, so a file the platform read back would be a second source of
+# truth that drifts from the first.
+
+
+async def test_a_use_case_can_be_exported_as_a_playwright_script(client: TestClient):
+    usecase_id = await seed_usecase(client)
+
+    body = client.get(f"/api/usecases/{usecase_id}/export/python").json()
+
+    assert body["filename"] == "sign_in_and_open_a_record.py"
+    assert "def setup(page):" in body["script"]
+    assert "def do_row(page, row):" in body["script"]
+    assert "one-way export" in body["script"]
+
+
+async def test_exporting_writes_no_version_and_changes_nothing(client: TestClient):
+    usecase_id = await seed_usecase(client)
+
+    client.get(f"/api/usecases/{usecase_id}/export/python")
+
+    body = client.get(f"/api/usecases/{usecase_id}").json()
+    assert [v["version"] for v in body["versions"]] == [1]
+
+
+async def test_a_secret_is_exported_as_an_environment_read_never_a_value(client: TestClient):
+    """The export is a file that gets committed and pasted into tickets."""
+    usecase_id = await seed_usecase(client)
+
+    script = client.get(f"/api/usecases/{usecase_id}/export/python").json()["script"]
+
+    assert 'os.environ["TRACE_SECRET_USERNAME"]' in script
+
+
+async def test_an_older_version_can_be_exported(client: TestClient):
+    """So a script can be regenerated from whatever version is actually
+    deployed, rather than only from the newest draft."""
+    usecase_id = await seed_usecase(client)
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+    definition["name"] = "Renamed"
+    client.put(f"/api/usecases/{usecase_id}", json=definition)
+
+    first = client.get(f"/api/usecases/{usecase_id}/export/python", params={"version": 1}).json()
+    latest = client.get(f"/api/usecases/{usecase_id}/export/python").json()
+
+    assert "Sign in and open a record" in first["script"]
+    assert "Renamed" in latest["script"]
+
+
+async def test_exporting_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.get("/api/usecases/nope/export/python").status_code == 404

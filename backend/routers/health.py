@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from config import Settings
 from deps import CurrentUser, get_config
-from llm import PROVIDER, llm_health
+from llm import ModelChoice, llm_health
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +125,13 @@ async def get_config_endpoint(
         # than one that says up front it is not available here. Recording with
         # codegen is unaffected either way -- it is a separate role.
         "agent": _agent_status(settings),
-        "model": settings.llm_repair_model,
-        "provider": PROVIDER,
+        # The deployment's default. A person may be running on another for
+        # their own browser -- that choice travels on the request rather than
+        # living here, so this is what somebody gets who has not chosen.
+        "model": _default_choice(settings).model,
+        "provider": _default_choice(settings).provider,
     }
+
+
+def _default_choice(settings: Any) -> ModelChoice:
+    return ModelChoice.default(settings)

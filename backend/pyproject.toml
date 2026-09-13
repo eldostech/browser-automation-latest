@@ -40,5 +40,10 @@ markers = [
   # Off by default because it spends money. No test should be able to bill
   # somebody by being run.
   "llm: calls a real Bedrock model (set RUN_LLM=1 -- this costs a few cents)",
+  # Not a pass/fail test so much as a measurement, and it runs every case
+  # several times against a real browser. Separate from `e2e` because the two
+  # answer different questions: e2e asks "is this correct", eval asks "how
+  # often", and only the second one can tell you whether a change helped.
+  "eval: measures accuracy and run-to-run variance (set RUN_EVAL=1)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]

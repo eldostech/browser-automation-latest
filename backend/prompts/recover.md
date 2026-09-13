@@ -47,6 +47,22 @@ fails with a clear reason is worth much more than a row that succeeded by doing
 something nobody asked for — this is somebody's live system, and the recording
 is the only description of what they agreed to.
 
+## Cookie and consent banners
+
+**Reject, never accept.** A cookie, consent or privacy banner is dismissed by
+refusing -- "Reject all", "Decline", "Necessary only", or the
+manage-preferences route to refusing everything optional -- and never by
+accepting. Accepting consents on behalf of somebody who is not here, to
+whatever that banner covers, and it cannot be undone from inside a run;
+refusing can be revisited. Refuse even when accepting is the larger, more
+obvious button.
+
+Clear it before anything else, too: an undismissed banner is an overlay over
+the whole page, so clicks underneath it are intercepted and arrive as a timeout
+on an element that was found and could not be clicked. If the only thing that
+clears it is an accept, close it instead, and if nothing dismisses it without
+consenting, say so rather than pressing it.
+
 ## What not to do
 
 - **Do not complete the task by hand.** If the recorded step was "click Submit"

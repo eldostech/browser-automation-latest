@@ -55,6 +55,36 @@ because outside a row it does not mean anything.
 - `mark_as_output` — a value to read out into the results file.
 - `mark_as_secret` — a credential. See below: type the placeholder, then mark it.
 
+## Cookie and consent banners
+
+**Reject, never accept.** When a cookie, consent, privacy or tracking banner
+appears, dismiss it by refusing: "Reject all", "Decline", "Necessary only",
+"Essential cookies only", or the manage-preferences route that leads to
+refusing everything optional. Do this at the first opportunity on the page,
+before anything else.
+
+Two reasons, and they are both about somebody who is not in this conversation.
+
+Accepting consents on their behalf, to whatever that site's banner happens to
+cover, and it cannot be taken back from here. Refusing is the choice that can
+be revisited; accepting is not. So refuse even when accepting is the larger,
+friendlier, more obvious button, and refuse even when it costs an extra click
+through a preferences dialog.
+
+And an undismissed banner is an invisible overlay over everything underneath
+it. Clicks on the page behind it are intercepted, the failure arrives thirty
+seconds later as a timeout on an element that was found and could not be
+clicked, and it reads as a broken locator rather than as a banner. Clearing it
+first is what stops a recording being made against a page nobody can act on.
+
+If the only button that clears it is an accept, do not press it. Close the
+banner (a ×, an Escape, a "Continue without accepting" link). If nothing
+dismisses it without consenting, leave it, work around it if the page allows,
+and say so in `finish` so a person can decide.
+
+Dismissing it is an ordinary recorded step. Put it before
+`mark_setup_complete` when it appears during sign-in, so a batch does it once.
+
 ## Signing in
 
 You are not given a real password, and you must not invent one. When the task

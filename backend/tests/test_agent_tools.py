@@ -919,3 +919,254 @@ async def test_a_call_with_no_observation_is_still_dispatched():
         result = await tools.call("browser_click", {"target": "e3"})
 
     assert not result.is_error
+
+
+# --- told while the page is still in front of it ---------------------------
+#
+# The asymmetry: an agent acts on `ref=e12`, which always names exactly one
+# element, and a replay acts on a description. So the moment a
+# badly-describable element gets clicked is both the cheapest moment to act on
+# that and the last moment anybody has the page. Left alone, the click was
+# recorded silently and surfaced as a draft warning nobody could act on.
+
+WRAPPERS = """### Page
+- Page URL: https://vendor.test/projects
+### Snapshot
+```yaml
+- list [ref=e1]:
+  - generic [ref=e2]
+  - generic [ref=e3]
+  - generic [ref=e4]
+```
+"""
+
+
+async def test_clicking_an_undescribable_wrapper_is_refused_the_first_time():
+    async with await session(replies={"browser_snapshot": WRAPPERS}) as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e3"})
+
+    assert result.is_error
+    assert "cannot be *recorded*" in result.text
+    assert "role and name" in result.text, "says why a replay cannot use it"
+    assert "button, a link, a heading" in result.text, "says what to do instead"
+
+
+async def test_repeating_it_goes_through():
+    """Not a hard refusal, deliberately. The click itself is fine -- it is the
+    recording of it that is not -- and blocking it outright would stop the
+    agent completing a task it can plainly do. A repeat is the agent saying
+    there is nothing better, and on this page there genuinely is not."""
+    async with await session(replies={"browser_snapshot": WRAPPERS}) as tools:
+        await tools.call("browser_snapshot", {})
+        first = await tools.call("browser_click", {"target": "e3"})
+        second = await tools.call("browser_click", {"target": "e3"})
+
+    assert first.is_error
+    assert not second.is_error
+
+
+async def test_a_nameable_element_is_never_refused():
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e3"})
+
+    assert not result.is_error
+
+
+async def test_looking_at_the_page_is_never_refused():
+    """Perception is how the agent finds something better. Refusing a snapshot
+    would break the very loop this asks for."""
+    async with await session(replies={"browser_snapshot": WRAPPERS}) as tools:
+        for _ in range(3):
+            assert not (await tools.call("browser_snapshot", {})).is_error
+
+
+async def test_the_refused_attempt_never_reaches_the_browser():
+    fake = FakeMCP({"browser_snapshot": WRAPPERS})
+    tools = AgentToolSession(fake, allowed_domains=("vendor.test",), may_write=True)
+    async with tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e3"})
+
+    assert [name for name, _ in fake.calls] == ["browser_snapshot"]
+
+
+# --- the page a step was recorded against ---------------------------------
+
+
+async def test_a_call_keeps_the_page_it_was_made_against():
+    """The evidence a repair months later has no other way to get: the page as
+    it *was*. Given only the page as it is now, choosing a replacement is
+    guessing which of forty controls somebody meant."""
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e3"})
+
+    click = next(record for record in tools.calls if record.name == "browser_click")
+    assert "+ Invite User" in click.page, "the tree it acted against"
+
+
+async def test_the_recorded_page_is_capped():
+    """Review material, not the recording. An uncapped blob per step would put
+    a megabyte of markup into every definition."""
+    from agent.session import RECORDED_PAGE_CHARS
+
+    huge = "### Page\n### Snapshot\n```yaml\n" + "\n".join(
+        f'- button "Button {n}" [ref=e{n}]' for n in range(4000)
+    ) + "\n```\n"
+
+    async with await session(replies={"browser_snapshot": huge}) as tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e3"})
+
+    click = next(record for record in tools.calls if record.name == "browser_click")
+    assert 0 < len(click.page) <= RECORDED_PAGE_CHARS
+
+
+# --- what the element said, for a replay to check against -----------------
+
+
+async def test_a_call_records_what_the_element_said():
+    """So a replay can tell that a rung which says only *where* to look has
+    landed on the same control. The recorder already knew this and threw it
+    away -- see `Step.expect_text`."""
+    async with await session() as tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e3"})
+
+    click = next(record for record in tools.calls if record.name == "browser_click")
+    assert click.expect_text, "the element's own words"
+    assert click.expect_text in click.page, "read off the page it acted against"
+
+
+async def test_an_unnamed_wrapper_records_the_text_of_the_control_inside_it():
+    """The rung is borrowed from a named descendant, so the expectation has to
+    be that descendant's words -- the wrapper's own name is empty, and checking
+    an empty expectation checks nothing."""
+    page = """### Page
+- Page URL: https://vendor.test/projects
+### Snapshot
+```yaml
+- generic [ref=e1]:
+  - radio "Nayra Patel" [ref=e2]
+```
+"""
+    async with await session(replies={"browser_snapshot": page}) as tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e1"})
+
+    click = next(record for record in tools.calls if record.name == "browser_click")
+    assert click.expect_text == "Nayra Patel"
+
+
+# --- a step held together by counting -------------------------------------
+#
+# One rung less severe than the undescribable refusal above, at the same
+# moment and for the same reason. The element has a name; several others share
+# it, so the only thing distinguishing the one picked is how many like it come
+# first. A replay honours that position, and the position stops being true the
+# moment the list is sorted differently -- at which point the step acts on a
+# different record and reports success.
+
+IDENTICAL_ROWS = """### Page
+- Page URL: https://vendor.test/accounts
+### Snapshot
+```yaml
+- table [ref=e1]:
+  - row [ref=e2]:
+    - cell "Acme Ltd" [ref=e3]
+    - button "Edit" [ref=e4]
+  - row [ref=e5]:
+    - cell "Globex" [ref=e6]
+    - button "Edit" [ref=e7]
+  - row [ref=e8]:
+    - cell "Initech" [ref=e9]
+    - button "Edit" [ref=e10]
+```
+"""
+
+
+async def test_clicking_one_of_several_identical_controls_is_refused_once():
+    async with await session(replies={"browser_snapshot": IDENTICAL_ROWS}) as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e7"})
+
+    assert result.is_error
+    assert "held together by counting" in result.text
+    assert "sorted or filtered differently" in result.text, "why a position stops being true"
+    assert "inside the row" in result.text, "and what to do instead"
+
+
+async def test_repeating_it_goes_through_because_the_page_may_offer_nothing_better():
+    async with await session(replies={"browser_snapshot": IDENTICAL_ROWS}) as tools:
+        await tools.call("browser_snapshot", {})
+        first = await tools.call("browser_click", {"target": "e7"})
+        second = await tools.call("browser_click", {"target": "e7"})
+
+    assert first.is_error
+    assert not second.is_error
+
+
+async def test_the_first_of_several_is_not_refused():
+    """`Locator.nth` reads 0 as "no position given", so the first match records
+    no position at all -- there is nothing for this to warn about, and warning
+    anyway would refuse a step that is exactly as good as it ever was."""
+    async with await session(replies={"browser_snapshot": IDENTICAL_ROWS}) as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e4"})
+
+    assert not result.is_error
+
+
+async def test_a_uniquely_named_control_is_never_refused():
+    async with await session(replies={"browser_snapshot": IDENTICAL_ROWS}) as tools:
+        await tools.call("browser_snapshot", {})
+        result = await tools.call("browser_click", {"target": "e6"})
+
+    assert not result.is_error
+
+
+async def test_the_refused_attempt_does_not_reach_the_browser_either():
+    fake = FakeMCP({"browser_snapshot": IDENTICAL_ROWS})
+    tools = AgentToolSession(fake, allowed_domains=("vendor.test",), may_write=True)
+    async with tools:
+        await tools.call("browser_snapshot", {})
+        await tools.call("browser_click", {"target": "e7"})
+
+    assert [name for name, _ in fake.calls] == ["browser_snapshot"]
+
+
+async def test_a_page_of_identical_controls_is_objected_to_twice_and_no_more():
+    """Measured on a real session: a grid of identically named "answer"
+    textboxes drew one objection per box, seven in all, each costing a model
+    turn at about twelve thousand tokens. On that page position genuinely was
+    the only thing telling them apart, so every objection was answered by
+    repeating the call and the recording was no better for it."""
+    from agent.session import MAX_POSITIONAL_REFUSALS
+
+    grid = """### Page
+- Page URL: https://vendor.test/worksheet
+### Snapshot
+```yaml
+- textbox "answer" [ref=e1]
+- textbox "answer" [ref=e2]
+- textbox "answer" [ref=e3]
+- textbox "answer" [ref=e4]
+- textbox "answer" [ref=e5]
+- textbox "answer" [ref=e6]
+```
+"""
+    refused = 0
+    async with await session(replies={"browser_snapshot": grid}) as tools:
+        await tools.call("browser_snapshot", {})
+        for ref in ("e2", "e3", "e4", "e5", "e6"):
+            result = await tools.call("browser_type", {"target": ref, "text": "1"})
+            # Counted by what the refusal says, not by `is_error`: a call that
+            # goes through re-renders the page in this fake, which makes the
+            # later refs stale, and a stale ref is refused for its own good
+            # reasons.
+            if result.is_error and "held together by counting" in result.text:
+                refused += 1
+
+    assert refused == MAX_POSITIONAL_REFUSALS

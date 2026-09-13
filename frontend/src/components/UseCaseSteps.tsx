@@ -6,6 +6,24 @@ import { LocatorEditor, describeLocator, isBrittle } from './LocatorEditor';
 // list and the thing that edits it cannot disagree about what a rung says.
 export { describeLocator };
 
+/** One check, as a person reads it. */
+export function describeAssertion(check: NonNullable<UseCaseStep['assert']>): string {
+  const target = check.locator ? describeLocator(check.locator) : '?';
+  const body =
+    check.kind === 'url_contains'
+      ? `the URL contains ${check.value ?? ''}`
+      : check.kind === 'title_contains'
+        ? `the title contains ${check.value ?? ''}`
+        : check.kind === 'text_present'
+          ? `the page shows ${check.value ?? ''}`
+          : check.kind === 'element_visible'
+            ? `${target} is visible`
+            : check.kind === 'element_count'
+              ? `${target} appears ${check.count ?? 0} time(s)`
+              : `${target} has ${check.attribute ?? ''}=${check.value ?? ''}`;
+  return check.negate ? `NOT ${body}` : body;
+}
+
 function summarise(step: UseCaseStep): string {
   if (step.description) return step.description;
   if (step.action === 'navigate') return `go to ${step.url}`;
@@ -31,7 +49,11 @@ interface Props {
   onRemove?: (stepId: string) => void;
   /** Saves a single step field (a wrong recorded URL, a typo'd typed value)
    * as a new draft version. Absent means read-only, same as today. */
-  onEditField?: (stepId: string, field: 'url' | 'value', value: string) => void;
+  onEditField?: (
+    stepId: string,
+    field: 'url' | 'value' | 'expect_text',
+    value: string,
+  ) => void;
   /** Saves a rewritten locator ladder as a new draft version.
    *
    * A recorded ladder is what codegen happened to write, and a healed one is
@@ -69,6 +91,11 @@ export function UseCaseSteps({
   // Which step's ladder is open. Separate from `editing` above because the
   // two edit different things and a step can want either.
   const [editingLocators, setEditingLocators] = useState<string | null>(null);
+  // And a third, for what the step expects the element to say. Its own slot
+  // because a step can carry both a typed value and an expectation, and one
+  // draft string cannot hold an edit to each.
+  const [editingExpect, setEditingExpect] = useState<string | null>(null);
+  const [expectDraft, setExpectDraft] = useState('');
 
   const startEdit = (step: UseCaseStep) => {
     const field = editableField(step);
@@ -81,6 +108,11 @@ export function UseCaseSteps({
     const field = editableField(step);
     if (field && onEditField) onEditField(step.id, field, draft);
     setEditing(null);
+  };
+
+  const saveExpect = (step: UseCaseStep) => {
+    if (onEditField) onEditField(step.id, 'expect_text', expectDraft.trim());
+    setEditingExpect(null);
   };
 
   if (steps.length === 0) {
@@ -141,6 +173,11 @@ export function UseCaseSteps({
                 )}
               </div>
 
+              {/* Why the step exists, under the mechanics rather than beside
+                  them: it is a whole clause, and inline it pushed the locator
+                  off the end of the row at any realistic width. */}
+              {step.intent && <p className="step-intent">{step.intent}</p>}
+
               {editing === step.id ? (
                 <div className="step-detail step-detail-edit">
                   <span className="label">{step.action === 'navigate' ? 'url' : 'value'}</span>
@@ -167,6 +204,68 @@ export function UseCaseSteps({
                     <code>{step.value ?? step.url}</code>
                   </div>
                 )
+              )}
+
+              {/* A condition is not a detail of the step, it decides whether
+                  the step happens at all -- so it reads above the mechanics
+                  rather than below them with the outputs. */}
+              {step.when && (
+                <div className="step-detail">
+                  <span className="label">only when</span>
+                  <span>{describeAssertion(step.when)}</span>
+                </div>
+              )}
+
+              {/* What the element said when this was recorded. Only checked for
+                  a locator that does not match on text, which is exactly the
+                  kind that can land on a different control without failing. */}
+              {step.locators.length > 0 && (step.expect_text || onEditField) && (
+                <div className={'step-detail' + (editingExpect === step.id ? ' step-detail-edit' : '')}>
+                  <span className="label">expects</span>
+                  {editingExpect === step.id ? (
+                    <>
+                      <input
+                        autoFocus
+                        value={expectDraft}
+                        placeholder="what the element says"
+                        onChange={(e) => setExpectDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') saveExpect(step);
+                          if (e.key === 'Escape') setEditingExpect(null);
+                        }}
+                      />
+                      <button type="button" className="linkish" onClick={() => saveExpect(step)}>
+                        Save
+                      </button>
+                      <button type="button" className="link" onClick={() => setEditingExpect(null)}>
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {step.expect_text ? (
+                        <code>{step.expect_text}</code>
+                      ) : (
+                        <span className="hint">
+                          nothing recorded, so a positional locator is acted on unchecked
+                        </span>
+                      )}
+                      {onEditField && (
+                        <button
+                          type="button"
+                          className="link"
+                          title="Check this text before acting. Use the locator checker to see what the element says now."
+                          onClick={() => {
+                            setEditingExpect(step.id);
+                            setExpectDraft(step.expect_text ?? '');
+                          }}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
               )}
 
               {step.fields.length > 0 && (

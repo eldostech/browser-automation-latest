@@ -15,7 +15,7 @@
 import type { ReactNode } from 'react';
 
 export type SpinnerState = 'working' | 'validating' | 'waiting' | 'success' | 'error';
-export type SpinnerLayout = 'inline' | 'block' | 'overlay';
+export type SpinnerLayout = 'inline' | 'block' | 'overlay' | 'blocking';
 
 const DEFAULT_LABEL: Record<SpinnerState, string> = {
   working: 'Working…',
@@ -93,9 +93,15 @@ interface BrandSpinnerProps {
 /**
  * `inline`: sits mid-sentence, next to a button label or a heading.
  * `block`: replaces a panel's content while there is nothing else to show.
- * `overlay`: dims and covers whatever is still on screen underneath it --
- * use this specifically when the user must not act again until it clears.
- * The parent needs `position: relative` (add the `.spinner-host` class).
+ * `overlay`: dims one panel, from inside it. The parent needs
+ * `position: relative` (add the `.spinner-host` class), and the panel needs to
+ * be roughly a screenful -- an overlay centres itself in its host, so on a
+ * host taller than the window the spinner lands below the fold.
+ * `blocking`: dims the *window* and centres itself in the viewport. For an
+ * action the whole screen has to wait for. This is the one to reach for on a
+ * long page: `overlay` on a full page view put the spinner at the centre of
+ * the document, which meant clicking Run at the top of a use case dimmed the
+ * screen and showed nothing until you scrolled half a page down to find it.
  */
 export function BrandSpinner({
   state = 'working',
@@ -106,13 +112,17 @@ export function BrandSpinner({
   className,
 }: BrandSpinnerProps) {
   const resolvedSize = size ?? (layout === 'inline' ? 16 : 40);
+  // A blocking wait speaks over whatever else is announcing itself: the
+  // screen is unusable until it clears, which is not polite news.
+  const urgent = layout === 'blocking';
   const announced = typeof label === 'string' ? label : DEFAULT_LABEL[state];
 
   return (
     <span
       className={`brand-spinner ${layout} ${state}${className ? ` ${className}` : ''}`}
-      role="status"
-      aria-live="polite"
+      role={urgent ? 'alert' : 'status'}
+      aria-live={urgent ? 'assertive' : 'polite'}
+      aria-busy={state === 'working' || state === 'validating'}
     >
       <Mark state={state} size={resolvedSize} />
       {label !== undefined && <span className="spinner-label">{label}</span>}

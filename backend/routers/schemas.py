@@ -91,7 +91,27 @@ class DeclaredFieldPayload(BaseModel):
         return stripped
 
 
-class CreateRunRequest(BaseModel):
+class ModelOverride(BaseModel):
+    """Which model this request should spend on, if not the configured one.
+
+    On the request rather than in configuration, and rather than in a "current
+    model" somewhere on the server, because comparing two models means running
+    two at once. A setting would serialise that, and two people trying
+    different models in the same workspace would silently overwrite each other.
+
+    Both fields optional and independent. Naming only a provider takes that
+    provider's default, which is useful for Bedrock and refused for OpenRouter,
+    where a provider fronting hundreds of models has no sensible default to
+    pick on your behalf.
+    """
+
+    #: "bedrock" or "openrouter". Validated in `llm.ModelChoice.resolve` rather
+    #: than by an enum here, so adding a provider is one list in one file.
+    provider: str | None = Field(default=None, max_length=40)
+    model: str | None = Field(default=None, max_length=200)
+
+
+class CreateRunRequest(ModelOverride):
     task: str = Field(min_length=1, max_length=8000)
     start_url: str | None = None
 
@@ -189,11 +209,21 @@ class DistillRequest(BaseModel):
     save_credential_as: str | None = Field(default=None, max_length=120)
 
 
-class RepairRequest(BaseModel):
+class RepairRequest(ModelOverride):
     """Which failure to mend. Either is enough to find the rest."""
 
     execution_id: str | None = None
     run_id: str | None = None
+
+
+class DescribeRequest(ModelOverride):
+    """Write down what a use case does, in plain language.
+
+    No arguments of its own: what to describe is the use case, and which model
+    writes it is the only choice. Kept a body rather than a bare POST so the
+    model override has somewhere to live -- somebody comparing models wants to
+    compare this too.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +312,7 @@ class TargetRequest(BaseModel):
     description: str = Field(default="", max_length=300)
 
 
-class ExecuteRequest(BaseModel):
+class ExecuteRequest(ModelOverride):
     inputs: dict[str, Any] = Field(default_factory=dict)
     #: Run against this address instead of the use case's target. For a one-off
     #: against a branch deployment or one customer's tenant, where a standing
@@ -347,7 +377,7 @@ class MappingRequest(BaseModel):
     version: int | None = None
 
 
-class BatchRequestBody(BaseModel):
+class BatchRequestBody(ModelOverride):
     """Rows arrive as an uploaded dataset, CSV text, a base64 .xlsx workbook,
     or JSON objects.
 
@@ -399,7 +429,7 @@ __all__ = [
 ]
 
 
-class StartAgentSessionRequest(BaseModel):
+class StartAgentSessionRequest(ModelOverride):
     """Start an agent working on a task in a browser.
 
     Budgets are on the request rather than only in configuration because they

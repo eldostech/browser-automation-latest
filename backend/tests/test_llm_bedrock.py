@@ -75,15 +75,20 @@ def test_default_models_are_inference_profiles_not_bare_model_ids(field):
     assert model.startswith(("us.", "eu.", "apac.", "global.")), model
 
 
-def test_no_api_key_setting_exists_at_all():
+def test_bedrock_needs_no_api_key_setting():
     """Bedrock authenticates with AWS credentials, so there is nothing to set.
 
-    An unused ANTHROPIC_API_KEY in .env is now ignored rather than quietly
-    looking like configuration that matters.
+    An unused ANTHROPIC_API_KEY in .env is ignored rather than quietly looking
+    like configuration that matters. `OPENROUTER_API_KEY` is a real setting
+    now, and only the second provider reads it.
     """
     assert not hasattr(Settings(_env_file=None), "anthropic_api_key")
-    assert not hasattr(Settings(_env_file=None), "llm_provider")
     assert build_llm(settings()).provider == "bedrock"
+
+
+def test_bedrock_is_still_what_a_deployment_gets_by_default():
+    """Adding a second provider must not move an existing installation onto it."""
+    assert Settings(_env_file=None).llm_provider == "bedrock"
 
 
 # --- construction ----------------------------------------------------------

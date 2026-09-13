@@ -26,10 +26,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from agent import Budget
 from agent.manager import AgentSessions, AgentUnavailable
 from auth.rbac import Permission
+from llm import ModelChoice
 from auth.service import Principal
 from credentials import Vault
 from deps import WorkspaceData, get_vault, require
 from services import resolve_secrets
+from redaction import scrub_credentials
 from routers.schemas import (
     AgentDecisionRequest,
     SaveAgentSessionRequest,
@@ -53,6 +55,7 @@ VaultDep = Annotated[Vault, Depends(get_vault)]
 @router.post("", status_code=201)
 async def start_session(
     body: StartAgentSessionRequest,
+    request: Request,
     sessions: SessionsDep,
     data: WorkspaceData,
     vault: VaultDep,
@@ -77,9 +80,36 @@ async def start_session(
     # layer at the moment of typing and redacted out of every event.
     secrets = await resolve_secrets(body, data, vault)
 
+    # The other half of keeping credentials out of the log, and the half no
+    # redactor could do: a value nobody declared. A task pasted in as "User: x
+    # / Password : y" becomes the run row, the `run_started` event, the use
+    # case's own description and the first message sent to a model, and none of
+    # those know that string is a password. So it is recognised here, before
+    # the first write, and replaced -- with `{{secret.slot}}` when a bound
+    # credential has a slot for it, which is the literal the recorder is
+    # already instructed to type.
+    scrubbed = scrub_credentials(body.task.strip(), slots=secrets.keys())
+    if scrubbed.secrets and not secrets:
+        # Refused rather than started, because this session could not sign in
+        # anyway: the value is not going to be stored or sent, and there is no
+        # credential bound to use instead. Better to say so now than to spend a
+        # budget discovering it.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This task has a "
+                + ", ".join(scrubbed.labels)
+                + " typed into it. Credentials do not belong in a task: the text is "
+                "stored with the run, shown in the timeline and sent to the model. "
+                "Save it once under Credentials, pick it under 'Sign in as', and "
+                "write the task without it -- the recorder is given the slot names "
+                "and types the values itself."
+            ),
+        )
+
     try:
         session = await sessions.start(
-            task=body.task.strip(),
+            task=scrubbed.text,
             start_url=start_url,
             allowed_domains=(allowed,),
             workspace_id=principal.workspace_id,
@@ -96,6 +126,7 @@ async def start_session(
             name=body.name.strip(),
             owner_id=principal.user_id,
             owner_email=principal.email,
+            model=_chosen_model(request, body),
         )
     except AgentUnavailable as exc:
         # 501, like the recorder answers on a machine with no display: this
@@ -108,9 +139,23 @@ async def start_session(
         actor_email=principal.email,
         resource_type="agent_session",
         resource_id=session.id,
-        detail={"task": body.task[:200], "may_write": body.may_write},
+        detail={
+            "task": scrubbed.text[:200],
+            "may_write": body.may_write,
+            "credentials_removed": scrubbed.labels or None,
+        },
     )
-    return session.summary()
+    summary = session.summary()
+    if scrubbed.found:
+        # Said back, because a person who typed a password into a task has a
+        # habit to change and a value to rotate. Silently cleaning it up would
+        # leave them believing it was never stored anywhere.
+        summary["notice"] = (
+            "A credential typed into the task was replaced with the bound "
+            "credential's slots before anything was stored. Nothing here kept the "
+            "value, but whatever you pasted it from still has it."
+        )
+    return summary
 
 
 @router.get("")
@@ -269,3 +314,13 @@ async def _start_url(body: StartAgentSessionRequest, data: WorkspaceData) -> str
 def _host(url: str) -> str:
     parts = urlsplit(url if "//" in url else f"//{url}")
     return (parts.netloc or url).split("@")[-1].split(":")[0] or url
+
+
+def _chosen_model(request: Request, body: Any) -> "ModelChoice | None":
+    """Which model this session should drive on, or ``None`` for the default."""
+    if not body.provider and not body.model:
+        return None
+    try:
+        return ModelChoice.resolve(request.app.state.settings, body.provider, body.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

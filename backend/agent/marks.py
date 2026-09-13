@@ -83,6 +83,13 @@ class Described:
     ref: str
     role: str
     name: str
+    #: What this element *says*, for a replay to check it found the same one.
+    #:
+    #: Not the same as `name`, in the one case that matters: where the rung
+    #: was borrowed from a named control inside an anonymous wrapper, this is
+    #: that control's name, because that is the text the page will still be
+    #: showing. See `Step.expect_text` for what a replay does with it.
+    text: str = ""
     #: Ranked, semantic first. The same shape a recorded step carries.
     ladder: list[Locator] = field(default_factory=list)
     #: How many elements the leading rung matches. One is what you want.
@@ -115,6 +122,7 @@ class Described:
             "ref": self.ref,
             "role": self.role,
             "name": self.name,
+            "text": self.text,
             "locators": [loc.model_dump(mode="json", exclude_none=True) for loc in self.ladder],
             "describe": self.ladder[0].describe() if self.ladder else "",
             "matches": self.matches,
@@ -278,6 +286,7 @@ def describe_element(snapshot: Snapshot, ref: str) -> Described:
         ref=ref,
         role=node.role,
         name=node.name,
+        text=((inside.name if inside is not None else "") or node.name or node.text or "")[:200],
         ladder=ladder,
         matches=matches,
         shadowed_by=_shadowing(snapshot, node),

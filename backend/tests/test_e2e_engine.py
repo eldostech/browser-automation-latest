@@ -298,6 +298,69 @@ CUSTOMER_SEARCH = """<!doctype html>
 """
 
 
+#: A table header under a cookie banner, which is the shape a real recording
+#: failed on: the header is found, visible and enabled, and a fixed overlay
+#: sits on top of it, so every click is intercepted until the timeout.
+COVERED = """<!doctype html>
+<html><head><title>Recalls</title>
+<style>
+  #consent { position: fixed; inset: 0; background: rgba(0,0,0,0.35); z-index: 9; }
+</style></head><body>
+  <div id="consent"></div>
+  <table>
+    <thead><tr>
+      <th onclick="document.getElementById('log').textContent='sorted'">Make</th>
+    </tr></thead>
+    <!-- A body row, because Chrome exposes a `columnheader` only for a table
+         that has one -- without it the header is not in the tree at all and
+         this fixture would prove something else entirely. -->
+    <tbody><tr><td>RAM</td></tr></tbody>
+  </table>
+  <p id="log"></p>
+</body></html>
+"""
+
+#: A styled radio: the input is in the accessibility tree with its name, and
+#: it is the label that can be clicked. Real, and the shape that cost a whole
+#: recording -- a profile picker drawn exactly this way.
+#:
+#: `width: 0` rather than `display: none`, because a radio that is display:none
+#: is absent from the accessibility tree too and the recording would never have
+#: named it. Nothing catches this except trying the action.
+STYLED_RADIO = """<!doctype html>
+<html><head><title>Who are you?</title>
+<style>
+  input[type=radio] { position: absolute; width: 0; height: 0; opacity: 0; }
+  label { display: block; padding: 12px; border: 1px solid #ccc; }
+</style></head><body>
+  <form>
+    <label for="nayra">Nayra Asati
+      <input type="radio" id="nayra" name="who" aria-label="Nayra Asati">
+    </label>
+  </form>
+  <p id="log"></p>
+  <script>
+    document.getElementById('nayra').addEventListener('click', function () {
+      document.getElementById('log').textContent = 'chosen';
+    });
+  </script>
+</body></html>
+"""
+
+#: The same markup as when it was recorded, with a different control in the
+#: same place. A CSS path still matches exactly one element here, which is
+#: precisely why it is dangerous: the step succeeds against the wrong button.
+REBUILT = """<!doctype html>
+<html><head><title>Rebuilt</title></head><body>
+  <div class="toolbar">
+    <button type="button" onclick="document.title='WRONG'">Delete permanently</button>
+  </div>
+  <a id="receipt" href="/receipt/A-1001.pdf">Receipt</a>
+  <p id="log"></p>
+</body></html>
+"""
+
+
 @pytest.fixture(scope="module")
 def site(tmp_path_factory):
     """A two-page static site on a random port."""
@@ -318,6 +381,9 @@ def site(tmp_path_factory):
     (root / "payment-frame.html").write_text(PAYMENT_FRAME, encoding="utf-8")
     (root / "new-tab.html").write_text(NEW_TAB, encoding="utf-8")
     (root / "search.html").write_text(CUSTOMER_SEARCH, encoding="utf-8")
+    (root / "rebuilt.html").write_text(REBUILT, encoding="utf-8")
+    (root / "styled-radio.html").write_text(STYLED_RADIO, encoding="utf-8")
+    (root / "covered.html").write_text(COVERED, encoding="utf-8")
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -1363,3 +1429,212 @@ async def test_a_failed_templated_locator_reports_what_it_looked_for(site):
     assert not results[0].ok
     assert "Tried: role=option name=\"Umbrella PLC\"" in error, error
     assert "{{input.customer_name}}" in error, "and which template produced it"
+
+
+# --- a positional rung that finds the wrong control ------------------------
+
+
+def rebuilt_use_case(site, *, expect_text: str):
+    """One step, addressed by a CSS path, with what it used to say."""
+    from usecase import Locator, Step, UseCase
+
+    return UseCase(
+        name="rebuilt",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/rebuilt.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="css", selector=".toolbar > button")],
+                expect_text=expect_text,
+            ),
+        ],
+    )
+
+
+async def test_a_css_rung_that_lands_on_a_renamed_control_refuses_to_act(site):
+    """The failure that is worse than a failure: the rung matches exactly one
+    element, so before this the step clicked it and reported success.
+
+    A snapshot fake cannot express this -- an accessibility tree has no CSS --
+    so the check that catches it has to be proved here.
+    """
+    _, _, results = await execute(
+        rebuilt_use_case(site, expect_text="Remove from list"), site, [{}], step_timeout=2.0
+    )
+
+    assert not results[0].ok
+    assert "not the one that was recorded" in results[0].error
+    assert "Delete permanently" in results[0].error
+
+
+async def test_the_same_step_acts_when_the_control_still_says_the_same_thing(site):
+    _, _, results = await execute(
+        rebuilt_use_case(site, expect_text="Delete permanently"), site, [{}], step_timeout=2.0
+    )
+
+    assert results[0].ok, results[0].error
+
+
+# --- asserting on an attribute ---------------------------------------------
+
+
+async def test_an_assertion_can_read_an_attribute(site):
+    """The identifier a later step needs is in the link, not in the words a
+    person sees."""
+    from usecase import Assertion, Locator, Step, UseCase
+
+    def checking(value: str) -> UseCase:
+        return UseCase(
+            name="attr",
+            status="ready",
+            allowed_domains=["127.0.0.1"],
+            row_steps=[
+                Step(id="s1", action="navigate", url=f"{site}/rebuilt.html"),
+                Step(
+                    id="s2",
+                    action="assert",
+                    **{
+                        "assert": Assertion(
+                            kind="attribute_contains",
+                            locator=Locator(strategy="role", role="link", name="Receipt"),
+                            attribute="href",
+                            value=value,
+                            timeout_ms=2_000,
+                        )
+                    },
+                ),
+            ],
+        )
+
+    _, _, held = await execute(checking("/receipt/A-1001"), site, [{}], step_timeout=3.0)
+    _, _, failed = await execute(checking("/receipt/A-9999"), site, [{}], step_timeout=3.0)
+
+    assert held[0].ok, held[0].error
+    assert not failed[0].ok
+    assert "A-1001" in failed[0].error, "the failure says what the attribute actually holds"
+
+
+# --- a rung that resolves and cannot be acted on ---------------------------
+
+
+def styled_radio_use_case(site, *, with_the_servers_rung: bool):
+    """The recording as it was made, with and without the rung this adds.
+
+    The first locator is what the accessibility tree said. The second is what
+    the MCP server reported having run, which is the label -- and the only
+    thing on the page a person can actually click.
+    """
+    from usecase import Locator, Step, UseCase
+
+    ladder = [Locator(strategy="role", role="radio", name="Nayra Asati", exact=True)]
+    if with_the_servers_rung:
+        ladder.append(Locator(strategy="css", selector="label", has_text="Nayra Asati"))
+
+    return UseCase(
+        name="who are you",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/styled-radio.html"),
+            Step(id="s2", action="click", locators=ladder, timeout_ms=2_000),
+        ],
+    )
+
+
+async def test_a_recording_of_only_the_tree_rung_fails_the_way_it_did_in_production(site):
+    """The bug, reproduced. The rung resolves -- there is exactly one radio
+    with that name -- and the click cannot be performed, so the step fails
+    having found the element it was looking for."""
+    _, _, results = await execute(
+        styled_radio_use_case(site, with_the_servers_rung=False),
+        site, [{}], step_timeout=3.0,
+    )
+
+    assert not results[0].ok
+    assert "Timeout" in results[0].error or "timeout" in results[0].error
+
+
+async def test_the_rung_the_server_ran_performs_it(site):
+    """And the step succeeds, against the element a person clicks."""
+    executor, _, results = await execute(
+        styled_radio_use_case(site, with_the_servers_rung=True),
+        site, [{}], step_timeout=6.0,
+    )
+
+    assert results[0].ok, results[0].error
+    # The fall-through is reported as drift, because it is: the recording's
+    # preferred locator no longer performs and somebody should know.
+    assert executor.locator_drift.get("s2") == 1
+
+
+async def test_a_failure_on_every_rung_says_they_were_all_found(site):
+    """"no element matched" said of three rungs that all matched sends
+    somebody looking for a locator problem they do not have."""
+    from usecase import Locator, Step, UseCase
+
+    use_case = UseCase(
+        name="who are you",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/styled-radio.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[
+                    Locator(strategy="role", role="radio", name="Nayra Asati", exact=True),
+                    Locator(strategy="css", selector="input#nayra"),
+                ],
+                timeout_ms=2_000,
+            ),
+        ],
+    )
+
+    _, _, results = await execute(use_case, site, [{}], step_timeout=6.0)
+
+    assert not results[0].ok
+    assert "none could be acted on" in results[0].error
+
+
+# --- a failure that says why, not only that ---------------------------------
+
+
+async def test_a_covered_control_reports_what_is_covering_it(site):
+    """The permanent fix for a failure that kept coming back. Before this the
+    stored reason was "TimeoutError: Locator.click: Timeout 30000ms exceeded"
+    and nothing else: the element had been found and something was on top of
+    it, and the record did not say so."""
+    from usecase import Locator, Step, UseCase
+
+    use_case = UseCase(
+        name="recalls",
+        status="ready",
+        allowed_domains=["127.0.0.1"],
+        row_steps=[
+            Step(id="s1", action="navigate", url=f"{site}/covered.html"),
+            Step(
+                id="s2",
+                action="click",
+                locators=[Locator(strategy="role", role="columnheader", name="Make")],
+                timeout_ms=2_000,
+            ),
+        ],
+    )
+
+    _, sink, results = await execute(use_case, site, [{}], step_timeout=3.0)
+
+    assert not results[0].ok
+    assert "covering it" in results[0].error, results[0].error
+    assert "consent" in results[0].error, "and names what is covering it"
+
+    # And the log itself is on the failure event, for a repair to read.
+    failed = [
+        event
+        for event in sink.events
+        if getattr(event, "kind", "") == "step_failed"
+    ]
+    assert failed, "a failed step records its context"
+    assert "intercepts pointer events" in (failed[-1].detail or {}).get("call_log", "")

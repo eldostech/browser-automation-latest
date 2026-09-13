@@ -40,10 +40,12 @@ from prompt_loader import HEAL, HEAL_REQUEST, load, render
 from snapshot import (
     Node,
     Snapshot,
+    parse as parse_snapshot,
     container_of,
     count_matches,
     index_among,
     locator_for,
+    named_controls,
     ordinal_suffix,
 )
 from usecase import Locator, Step
@@ -273,8 +275,10 @@ class StepHealer:
                             step=step.summary(),
                             action=step.action,
                             wanted=wanted,
+                            purpose=_purpose(step),
                             page_url=snapshot.page_url or "(unknown)",
                             candidates=listing,
+                            was_working=_as_it_was(step),
                             past_fixes=as_prompt(past),
                         ),
                     }
@@ -371,6 +375,38 @@ class StepHealer:
         if not repair.pending:
             return
         await self.memory.remember(**repair.pending)
+
+
+def _purpose(step: Step) -> str:
+    """What the step was for, as a prompt line, or nothing.
+
+    A whole line rather than a bare value so a step that has no recorded
+    purpose leaves no empty bullet behind -- every recording made before
+    `Step.intent` existed, and every codegen recording, takes that path.
+    """
+    return f"- what it is for: {step.intent}" if step.intent else ""
+
+
+def _as_it_was(step: Step) -> str:
+    """The controls that were on the page when this step worked.
+
+    The whole reason `Step.recorded_page` exists. Given only the current page,
+    a repair is choosing between forty plausible controls; given both, most
+    breakages are a renamed control that is obvious side by side and close to
+    invisible from the new page alone.
+
+    Rendered as the same kind of list as the candidates, so the two can be read
+    against each other rather than one being a tree and the other a list. No
+    indices on this one: nothing here is selectable, because none of it is on
+    the page any more.
+    """
+    lines = named_controls(step.recorded_page, _INTERESTING, MAX_CANDIDATES)
+    if not lines:
+        return ""
+    return (
+        "Controls that were on this page when the step was recorded and "
+        "working:\n\n" + "\n".join(lines)
+    )
 
 
 def _words(value: str) -> set[str]:

@@ -125,18 +125,36 @@ def test_a_typo_in_a_typed_setting_fails_at_load(tmp_path):
 def test_a_setting_that_no_longer_exists_is_ignored_not_fatal(tmp_path):
     """An old .env keeps working.
 
-    LLM_PROVIDER, ANTHROPIC_API_KEY and BEDROCK_API are gone; a stale line for
-    any of them must not stop the backend starting.
+    ANTHROPIC_API_KEY and BEDROCK_API are gone; a stale line for either must
+    not stop the backend starting.
     """
-    env = write_env(
-        tmp_path,
-        "LLM_PROVIDER=anthropic\nANTHROPIC_API_KEY=sk-ant-stale\nBEDROCK_API=mantle\n",
-    )
+    env = write_env(tmp_path, "ANTHROPIC_API_KEY=sk-ant-stale\nBEDROCK_API=mantle\n")
     settings = Settings(_env_file=env)
 
-    assert not hasattr(settings, "llm_provider")
     assert not hasattr(settings, "anthropic_api_key")
     assert not hasattr(settings, "bedrock_api")
+
+
+def test_a_provider_value_from_an_older_version_starts_on_the_default(tmp_path):
+    """`LLM_PROVIDER` existed, was removed when this went Bedrock-only, and is
+    back now that there are two providers again.
+
+    An operator upgrading across all of that may still have
+    `LLM_PROVIDER=anthropic` in a file nobody has opened in months, and a
+    backend that will not start because of one dead line is worse than one that
+    starts on its default and says so in the log.
+    """
+    env = write_env(tmp_path, "LLM_PROVIDER=anthropic\n")
+
+    assert Settings(_env_file=env).llm_provider == "bedrock"
+
+
+def test_a_provider_typo_still_fails_at_load(tmp_path):
+    """Forgiving one historical value is not the same as accepting anything."""
+    env = write_env(tmp_path, "LLM_PROVIDER=bedrok\n")
+
+    with pytest.raises(Exception, match="llm_provider"):
+        Settings(_env_file=env)
 
 
 def test_defaults_apply_with_no_dotenv_file(tmp_path):

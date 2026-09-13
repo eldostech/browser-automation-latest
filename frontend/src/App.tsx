@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from './lib/api';
 import { session, type CurrentUser } from './lib/session';
 import { HealingMemory } from './components/HealingMemory';
+import { CredentialsPanel } from './components/CredentialsPanel';
 import { Targets } from './components/Targets';
 import { Help } from './components/Help';
 import { NewUseCase } from './components/NewUseCase';
 import { RunHistory } from './components/RunHistory';
 import { SignIn } from './components/SignIn';
+import { ModelBadge, ModelPicker } from './components/ModelPicker';
 import { RunView } from './components/RunView';
 import { UseCaseList } from './components/UseCaseList';
 import { UseCaseView } from './components/UseCaseView';
@@ -16,6 +18,7 @@ type View =
   | { name: 'history' }
   | { name: 'memory' }
   | { name: 'targets' }
+  | { name: 'credentials' }
   | { name: 'run'; runId: string }
   | { name: 'usecases' }
   | { name: 'usecase'; usecaseId: string }
@@ -35,6 +38,7 @@ function viewFromHash(): View {
   if (hash === 'history') return { name: 'history' };
   if (hash === 'memory') return { name: 'memory' };
   if (hash === 'targets') return { name: 'targets' };
+  if (hash === 'credentials') return { name: 'credentials' };
   if (hash === 'usecases') return { name: 'usecases' };
   if (hash === 'help/technical') return { name: 'help', section: 'technical' };
   if (hash === 'help' || hash === 'help/user') return { name: 'help', section: 'user' };
@@ -48,6 +52,7 @@ function hashFor(view: View): string {
   if (view.name === 'history') return '#/history';
   if (view.name === 'memory') return '#/memory';
   if (view.name === 'targets') return '#/targets';
+  if (view.name === 'credentials') return '#/credentials';
   if (view.name === 'help') return view.section === 'technical' ? '#/help/technical' : '#/help';
   return '#/record';
 }
@@ -60,6 +65,7 @@ export default function App() {
     queue?: { queued?: number; running?: number };
   } | null>(null);
   const [environment, setEnvironment] = useState('');
+  const [pickingModel, setPickingModel] = useState(false);
 
   const navigate = useCallback((next: View) => {
     setView(next);
@@ -146,6 +152,10 @@ export default function App() {
                 ? 'backend unreachable'
                 : `backend ${health.status} - ${running} running, ${queued} queued`}
           </span>
+          {/* Which model everything this browser starts will spend on. In the
+              chrome rather than buried in a settings page: a person comparing
+              models needs to see which one is in play without going to look. */}
+          <ModelBadge onOpen={() => setPickingModel(true)} />
           <span className="who" title={`${user.email} (${user.role})`}>
             {user.email} <span className="role-chip">{user.role}</span>
           </span>
@@ -200,6 +210,14 @@ export default function App() {
           </button>
           <button
             type="button"
+            className={view.name === 'credentials' ? 'active' : ''}
+            onClick={() => navigate({ name: 'credentials' })}
+            title="Sign-ins a recording or a batch can use, stored encrypted"
+          >
+            Credentials
+          </button>
+          <button
+            type="button"
             className={view.name === 'memory' ? 'active' : ''}
             onClick={() => navigate({ name: 'memory' })}
             title="Locators that broke, and what fixed them"
@@ -208,6 +226,12 @@ export default function App() {
           </button>
         </nav>
       </header>
+
+      {pickingModel && (
+        <div className="model-picker-shell">
+          <ModelPicker onClose={() => setPickingModel(false)} />
+        </div>
+      )}
 
       <main
         className={
@@ -230,6 +254,26 @@ export default function App() {
         {view.name === 'memory' && <HealingMemory />}
 
         {view.name === 'targets' && <Targets />}
+
+        {/* Its own page, not only a panel inside a use case. A credential that
+            can be created *before* a recording is the difference between
+            picking one under "Sign in as" and pasting a password into the task
+            -- and a password in the task is stored with the run and sent to a
+            model. */}
+        {view.name === 'credentials' && (
+          <section className="card">
+            <header>
+              <h2>Credentials</h2>
+              <span className="hint">
+                Write-only. Values are encrypted at rest and no screen or endpoint ever
+                shows one again. Create one here, then pick it when you record or run.
+              </span>
+            </header>
+            <div className="body">
+              <CredentialsPanel />
+            </div>
+          </section>
+        )}
 
         {view.name === 'history' && (
           <RunHistory onOpen={(runId) => navigate({ name: 'run', runId })} />

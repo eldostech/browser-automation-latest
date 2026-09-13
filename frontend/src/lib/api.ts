@@ -17,6 +17,7 @@ import type {
   CredentialSummary,
   DatasetSummary,
   Locator,
+  ModelCatalogue,
   LocatorCheckReport,
   MappingResult,
   RememberedFix,
@@ -32,6 +33,7 @@ import type {
   UseCase,
   UseCaseSummary,
 } from './events';
+import { modelFields } from './model';
 import { session, type CurrentUser } from './session';
 
 /** Empty by default: Vite (dev) and nginx (prod) proxy /api to the backend. */
@@ -201,6 +203,26 @@ export const api = {
       body: JSON.stringify(definition),
     }),
 
+  // -- models ---------------------------------------------------------------
+  /** Every model this deployment can reach, with prices the provider publishes.
+   *
+   * Behind `usecase:read`: choosing which model to try is ordinary work for
+   * anyone allowed to run a use case, and the reply carries no credential.
+   */
+  models: () => request<ModelCatalogue>('/api/models'),
+
+  /** Can this deployment actually call that model? One tiny request.
+   *
+   * A key without credit, a model needing its own provider agreement, an id
+   * that has been retired -- none of those are visible in a catalogue, and all
+   * of them look identical to a broken workflow three steps into a run.
+   */
+  checkModel: (provider: string, model: string) =>
+    request<{ provider: string; model: string; ok: boolean; error?: string }>(
+      '/api/models/check',
+      { method: 'POST', body: JSON.stringify({ provider, model }) },
+    ),
+
   /** What these locators match on a real page, right now.
    *
    * Nothing is saved. This exists because editing a locator without it is
@@ -256,7 +278,10 @@ export const api = {
       error: string | null;
       llm_calls: number;
       llm_tokens: number;
-    }>(`/api/usecases/${id}/execute`, { method: 'POST', body: JSON.stringify(payload) }),
+    }>(`/api/usecases/${id}/execute`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...modelFields() }),
+    }),
 
   listExecutions: (usecaseId: string) =>
     request<{ executions: ExecutionRecord[] }>(`/api/usecases/${usecaseId}/executions`),
@@ -278,7 +303,45 @@ export const api = {
       applied?: string[];
       unfixable_reason?: string;
       llm_tokens: number;
-    }>(`/api/usecases/${id}/repair`, { method: 'POST', body: JSON.stringify(payload) }),
+    }>(`/api/usecases/${id}/repair`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...modelFields() }),
+    }),
+
+  /**
+   * This use case as a Playwright Python script, to read or run elsewhere.
+   *
+   * One way only. The document is what TRACE runs and what a repair edits, so
+   * an exported file that the platform read back would be a second source of
+   * truth that drifts from the first.
+   */
+  exportPython: (id: string, version?: number) =>
+    request<{ usecase_id: string; filename: string; script: string }>(
+      `/api/usecases/${id}/export/python` + (version ? `?version=${version}` : ''),
+    ),
+
+  /**
+   * Write down what a use case does, in plain language. One LLM call.
+   *
+   * An agent recording gets this at the end of its own session. This is the
+   * same pass on demand, for a codegen recording -- which has no model in it
+   * and so no account of itself -- and for anything recorded before this
+   * existed. Saved at the status it already had: the prose changes nothing
+   * that runs.
+   */
+  describeUseCase: (id: string) =>
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      instructions: string;
+      steps_described: number;
+      warnings: string[];
+      llm_tokens: number;
+    }>(`/api/usecases/${id}/describe`, {
+      method: 'POST',
+      body: JSON.stringify({ ...modelFields() }),
+    }),
 
   /**
    * The finished step trail, with each step's screenshot and the baseline's.
@@ -490,7 +553,7 @@ export const api = {
   ) =>
     request<{ batch_id: string; total: number; columns: string[]; warnings: string[] }>(
       `/api/usecases/${id}/batch`,
-      { method: 'POST', body: JSON.stringify(payload) },
+      { method: 'POST', body: JSON.stringify({ ...payload, ...modelFields() }) },
     ),
 
   getBatch: (batchId: string) => request<BatchDetail>(`/api/batches/${batchId}`),
@@ -540,7 +603,7 @@ export const api = {
   startAgentSession: (body: StartAgentSession) =>
     request<AgentSessionDetail>('/api/agent-sessions', {
       method: 'POST',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, ...modelFields() }),
     }),
 
   getAgentSession: (sessionId: string) =>

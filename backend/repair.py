@@ -36,11 +36,16 @@ from snapshot import (
     Snapshot,
     count_matches,
     locator_for,
+    named_controls,
     parse as parse_snapshot,
 )
 from usecase import Assertion, Locator, UseCase
 
 log = logging.getLogger(__name__)
+
+#: Written as a constant because these strings are assembled inside long
+#: prompt sections, where an inline escape is the easiest thing to get wrong.
+NEWLINE = "\n"
 
 #: Roles worth offering as repair candidates. Structural wrappers are noise.
 _INTERESTING = frozenset(
@@ -145,6 +150,16 @@ class FailureContext:
     error: str
     snapshot: Snapshot
     page_url: str | None = None
+    #: Playwright's own account of the failed action: what it waited for and
+    #: what stopped it. Empty for a run from before this was recorded, and for
+    #: a failure that was not an action -- an assertion, a bad URL.
+    #:
+    #: The difference it makes: a timeout's first line names a locator and
+    #: nothing else, so a repair given only that answers by re-spelling the
+    #: locator. It happened -- the one change proposed for a covered column
+    #: header was `exact` turned off. The log says "a div intercepts pointer
+    #: events", which is a different problem with a different fix.
+    call_log: str = ""
     inputs: dict[str, Any] = field(default_factory=dict)
     #: Whether the run got far enough to fail *on a step*. False means it died
     #: before that -- the browser would not start, or setup never completed --
@@ -187,6 +202,46 @@ def candidates(snapshot: Snapshot) -> list[Node]:
         if len(chosen) >= MAX_CANDIDATES:
             break
     return chosen
+
+
+def _tried(call_log: str) -> str:
+    """Playwright's account of the failed action, as a prompt section.
+
+    Nothing when there is none, so a run from before this was recorded asks
+    exactly as it did before.
+    """
+    if not call_log.strip():
+        return ""
+    return "## What the browser tried, and what stopped it" + NEWLINE * 2 + call_log.strip()
+
+
+def _purpose(step: Any) -> str:
+    """What the failing step was for, as a prompt line, or nothing."""
+    intent = getattr(step, "intent", "") if step is not None else ""
+    return f"- what it is for: {intent}" if intent else ""
+
+
+def _as_it_was(step: Any) -> str:
+    """The controls that were on the page when the failing step last worked.
+
+    Repair needs this more than healing does, and got it later. Healing runs
+    seconds after the failure with the recording fresh; a repair can happen
+    weeks later, driven by somebody who was not there when it was recorded --
+    and from the failed page alone, "which of these forty controls did they
+    mean" is a guess.
+
+    Unnumbered, unlike the candidate listing right above it in the prompt.
+    Nothing here is selectable: none of it is on the page any more, and a
+    numbered entry would invite a fix pointing at a control that is gone.
+    """
+    page = getattr(step, "recorded_page", "") if step is not None else ""
+    lines = named_controls(page, _INTERESTING, MAX_CANDIDATES)
+    if not lines:
+        return ""
+    return (
+        "## Controls that were on this page when the step was recorded and "
+        "working\n\n" + "\n".join(lines)
+    )
 
 
 def _nearby_context(nodes: list[Node], index: int) -> str:
@@ -259,6 +314,7 @@ def gather_context(
     """
     snapshot_text = ""
     page_url: str | None = None
+    call_log = ""
     reached_a_step = False
 
     for event in events:
@@ -268,6 +324,7 @@ def gather_context(
             if detail.get("snapshot"):
                 snapshot_text = str(detail["snapshot"])
                 page_url = detail.get("page_url") or page_url
+            call_log = str(detail.get("call_log") or "") or call_log
         elif getattr(event, "type", None) == "tool_result" and not snapshot_text:
             text = getattr(event, "text", "") or ""
             if "### Snapshot" in text:
@@ -280,6 +337,7 @@ def gather_context(
         error=str(execution.get("error") or "the run failed without recording a reason"),
         snapshot=parsed,
         page_url=page_url or parsed.page_url,
+        call_log=call_log,
         inputs=execution.get("inputs") or {},
         reached_a_step=reached_a_step,
     )
@@ -296,6 +354,11 @@ def _describe_steps(usecase: UseCase) -> str:
             locator = step.locators[0].describe() if step.locators else "-"
             value = f" value={step.value!r}" if step.value else ""
             lines.append(f"  [{phase}] {step.id}: {step.action} {locator}{value}")
+            # Indented under its own step rather than inline: these are whole
+            # sentences, and run together with the mechanics they made every
+            # line unreadable at forty steps.
+            if step.intent:
+                lines.append(f"      for: {step.intent}")
     return "\n".join(lines) or "  (none)"
 
 
@@ -418,10 +481,13 @@ class UseCaseDoctor:
                             if step and step.locators
                             else "(no locator recorded)"
                         ),
+                        purpose=_purpose(step),
+                        call_log=_tried(context.call_log),
                         page_url=context.page_url or "(unknown)",
                         allowed_domains=", ".join(context.usecase.allowed_domains) or "(none)",
                         steps=_describe_steps(context.usecase),
                         candidates=listing,
+                        was_working=_as_it_was(step),
                         past_fixes=as_prompt(past),
                     ),
                 }

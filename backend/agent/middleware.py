@@ -69,10 +69,28 @@ class BudgetMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
 
     state_schema = AuthorGraphState
 
-    def __init__(self, spend: Spend, *, model_name: str, marks: Marks) -> None:
+    def __init__(
+        self,
+        spend: Spend,
+        *,
+        model_name: str,
+        marks: Marks,
+        provider: str = "bedrock",
+        rates: "tuple[float, float] | None" = None,
+    ) -> None:
         super().__init__()
         self.spend = spend
         self.model_name = model_name
+        #: Which provider is answering. Two things need it: the prompt-cache
+        #: hint below, which only Bedrock understands, and the access-error
+        #: message, which named Bedrock whatever had actually refused the call.
+        self.provider = provider
+        #: The provider's own price for this model, when it publishes one.
+        #: Without it an OpenRouter session is costed from a default that
+        #: happens to be Claude Sonnet's -- and the USD ceiling is enforced
+        #: against that number, so a cheap model would stop early and an
+        #: expensive one would not stop at all.
+        self.rates = rates
         #: For the stop message only -- see `abefore_model`. Read, never
         #: written: this middleware does not track progress, it reports it.
         self.marks = marks
@@ -113,13 +131,28 @@ class BudgetMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
         # identical on every turn of a loop that resends its whole history
         # every time. See the measured session in `llm.py`'s docstring for
         # why this is not an optimisation somebody can skip.
-        request.model_settings = {**request.model_settings, "cache_control": {"ttl": "5m"}}
+        #
+        # Bedrock's, and only Bedrock's. `ChatOpenAI` hands its keyword
+        # arguments to the OpenAI SDK, which refuses one it does not know --
+        # so sending this to OpenRouter did not merely miss the saving, it
+        # failed the call with `AsyncCompletions.create() got an unexpected
+        # keyword argument 'cache_control'` on the first turn of every
+        # session. `LangChainLLM.run_turn` guards its own copy of this; the
+        # authoring loop reaches the model through `create_agent` instead and
+        # needed the same guard here.
+        if self.provider == "bedrock":
+            request.model_settings = {
+                **request.model_settings,
+                "cache_control": {"ttl": "5m"},
+            }
 
         started = time.monotonic()
         try:
             response = await handler(request)
         except Exception as exc:  # noqa: BLE001 - narrowed by translate_access_error
-            raise translate_access_error(exc, model=self.model_name) from exc
+            raise translate_access_error(
+                exc, model=self.model_name, provider=self.provider
+            ) from exc
         finally:
             log.info(
                 "model turn",
@@ -133,7 +166,7 @@ class BudgetMiddleware(AgentMiddleware[AuthorGraphState, Any, Any]):
         for message in response.result:
             usage = usage_of(message)
             if usage.get("input_tokens") or usage.get("output_tokens"):
-                self.spend.turn(usage, self.model_name)
+                self.spend.turn(usage, self.model_name, rates=self.rates)
         return response
 
 
