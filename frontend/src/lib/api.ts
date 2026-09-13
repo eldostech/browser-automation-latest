@@ -433,11 +433,33 @@ export const api = {
    * preserved, so re-importing a revision appends a version rather than
    * duplicating the use case.
    */
-  importUseCase: (definition: Record<string, unknown>) =>
-    request<{ usecase_id: string; version: number; status: string; imported_by: string }>(
-      '/api/usecases/import',
-      { method: 'POST', body: JSON.stringify(definition) },
-    ),
+  importUseCase: (document: Record<string, unknown>) =>
+    request<{
+      usecase_id: string;
+      version: number;
+      status: string;
+      imported_by: string;
+      from: string;
+      /** What this environment still has to supply before it can run. */
+      warnings: string[];
+    }>('/api/usecases/import', { method: 'POST', body: JSON.stringify(document) }),
+
+  /**
+   * One use case as a document another environment can import.
+   *
+   * A wrapper around the definition, carrying where it came from and when,
+   * because the definition itself forbids extra fields and a person doing a
+   * promotion needs to know what they are holding. Nothing sensitive is in it:
+   * secrets are slots, and each environment supplies its own values.
+   */
+  exportUseCase: (id: string, version?: number) =>
+    request<{
+      trace_export: number;
+      exported_at: string;
+      exported_by: string;
+      source: { environment: string; usecase_id: string; version: number; name: string };
+      definition: Record<string, unknown>;
+    }>(`/api/usecases/${id}/export` + (version ? `?version=${version}` : '')),
 
   /**
    * Turn what a discovery run extracted into a dataset the next pass can run on.

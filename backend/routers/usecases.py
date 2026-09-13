@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -102,7 +103,21 @@ async def import_usecase(
     Re-importing appends a version rather than duplicating, which makes
     promoting a revision the same gesture as promoting it the first time.
     """
-    incoming = {**body}
+    # Either shape: the envelope `GET /usecases/{id}/export` produces, or a
+    # bare definition. The bare form is what this endpoint took before an
+    # export existed, and a document somebody assembled by hand is a bare
+    # definition too.
+    envelope = body if isinstance(body.get("definition"), dict) else {}
+    if envelope and int(envelope.get("trace_export") or 1) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This export was written by a newer version of TRACE "
+                f"(envelope {envelope.get('trace_export')}). Upgrade this "
+                "deployment, or export again from a matching one."
+            ),
+        )
+    incoming = {**(envelope.get("definition") if envelope else body)}
     incoming["status"] = "draft"
     incoming["allow_scripts"] = False
     # A run id from the source environment names a run that does not exist in
@@ -128,24 +143,77 @@ async def import_usecase(
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    warnings = await _promotion_gaps(use_case, data)
+
     await data.audit(
         "usecase.import",
         actor_id=principal.user_id,
         actor_email=principal.email,
         resource_type="usecase",
         resource_id=usecase_id,
-        detail={"version": version, "name": use_case.name},
+        detail={
+            "version": version,
+            "name": use_case.name,
+            "from": (envelope.get("source") or {}).get("environment") or None,
+            "gaps": len(warnings),
+        },
     )
     log.info(
         "use case imported",
-        extra={"usecase_id": usecase_id, "version": version},
+        extra={"usecase_id": usecase_id, "version": version, "gaps": len(warnings)},
     )
     return {
         "usecase_id": usecase_id,
         "version": version,
         "status": use_case.status,
         "imported_by": principal.email,
+        "from": (envelope.get("source") or {}).get("environment") or "",
+        # What this environment still has to supply. Warnings rather than
+        # refusals: an import is how a document *arrives*, and refusing it
+        # would leave somebody with nowhere to fix the gap from.
+        "warnings": warnings,
     }
+
+
+async def _promotion_gaps(use_case: UseCase, data: WorkspaceData) -> list[str]:
+    """What this environment still needs before the import can run.
+
+    The reason this is worth doing at all: a definition carries `base_url`, the
+    address it was recorded against, as the fallback for `{{env.base_url}}`
+    when no target answers. So a use case promoted from dev into UAT *runs*,
+    and runs against dev -- silently, correctly by its own lights, and wrongly
+    by every other measure. Nothing warned about that before.
+    """
+    gaps: list[str] = []
+
+    targets = {row.get("name") for row in await data.list_targets()}
+    if use_case.target and use_case.target not in targets:
+        gaps.append(
+            f"This use case runs against the target named {use_case.target!r}, and this "
+            "environment has no target by that name. Until you add one, it will fall "
+            f"back to the address it was recorded against ({use_case.base_url or 'none'}) "
+            "-- which is very likely the wrong environment. Add the target under "
+            "Targets, or pick a different one on this use case."
+        )
+    elif not use_case.target and use_case.base_url:
+        gaps.append(
+            f"No target is named, so this will run against {use_case.base_url}, the "
+            "address it was recorded against. If that is another environment, choose a "
+            "target for it before running anything."
+        )
+
+    if use_case.secrets:
+        slots = {slot for row in await data.list_credentials() for slot in (row.get("slots") or [])}
+        missing = sorted(spec.name for spec in use_case.secrets if spec.name not in slots)
+        if missing:
+            gaps.append(
+                "No credential here has "
+                + ", ".join(repr(name) for name in missing)
+                + ". Credentials never travel with a use case -- each environment keeps "
+                "its own -- so save one under Credentials before running this."
+            )
+
+    return gaps
 
 
 @router.get("/usecases/{usecase_id}")
@@ -327,6 +395,52 @@ async def set_scripts(
         },
     )
     return {"usecase_id": usecase_id, "scripts_enabled": body.enabled, "by": principal.email}
+
+
+@router.get("/usecases/{usecase_id}/export")
+async def export_usecase(
+    usecase_id: str,
+    request: Request,
+    data: WorkspaceData,
+    principal: Annotated[Principal, Depends(require(Permission.USECASE_READ))],
+    version: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
+    """One use case as a document that can be imported somewhere else.
+
+    The other half of `POST /usecases/import`, which existed on its own: a
+    definition could arrive from another environment but there was no way to
+    get one out except reading the API by hand.
+
+    A wrapper around the definition rather than the bare definition, because a
+    person doing a promotion needs to know what they are holding -- which
+    environment it came from, which version, and when. The definition itself is
+    `extra="forbid"`, so provenance cannot live inside it without becoming part
+    of what a replay validates.
+
+    Nothing sensitive travels, and that is a property of the document rather
+    than of this endpoint: secrets in a definition are *slots* -- names, never
+    values -- and each environment supplies its own. The addresses are bound to
+    `{{env.base_url}}`, which the receiving deployment answers for itself.
+    """
+    definition = await data.get_usecase(usecase_id, version)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="No such use case.")
+
+    settings = request.app.state.settings
+    return {
+        # Version of the *envelope*, not of the use case. An importer that
+        # meets a number it does not know can say so instead of guessing.
+        "trace_export": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_by": principal.email,
+        "source": {
+            "environment": getattr(settings, "environment", "") or "unnamed",
+            "usecase_id": usecase_id,
+            "version": int(definition.get("version") or version or 1),
+            "name": definition.get("name") or "",
+        },
+        "definition": definition,
+    }
 
 
 @router.get("/usecases/{usecase_id}/export/python")

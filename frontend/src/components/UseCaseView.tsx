@@ -26,6 +26,11 @@ import { session } from '../lib/session';
 import { UseCaseSteps } from './UseCaseSteps';
 import { BrandSpinner } from './BrandSpinner';
 
+/** A use case name as a file name, safe on every platform. */
+function suggestedName(name: string): string {
+  return name.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'use_case';
+}
+
 /** Actions the screen waits for, and what to say while it does. */
 const BLOCKING: Record<
   string,
@@ -512,6 +517,29 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
       );
     }, 'exportScript');
 
+  // Downloaded rather than shown: it is a file whose job is to be carried to
+  // another environment. Built from a blob so no second endpoint has to serve
+  // it as an attachment.
+  const promote = () =>
+    act(async () => {
+      const document = await api.exportUseCase(usecaseId);
+      const name = `${suggestedName(document.source.name)}.trace.json`;
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(document, null, 2)], { type: 'application/json' }),
+      );
+      const link = window.document.createElement('a');
+      link.href = url;
+      link.download = name;
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice(
+        `Exported ${name} (v${document.source.version} from ` +
+          `${document.source.environment}). Import it from the Use cases screen in the ` +
+          `other environment. It carries no credentials: secrets are slot names, and ` +
+          `each environment keeps its own values.`,
+      );
+    }, 'promote');
+
   const describe = () =>
     act(async () => {
       const result = await api.describeUseCase(usecaseId);
@@ -701,6 +729,19 @@ export function UseCaseView({ usecaseId, onBack, onOpenRun }: Props) {
               ? 'Written from the recording. Read it against the steps.'
               : 'Nothing recorded says what this workflow is for.'}
           </span>
+          <button
+            type="button"
+            className="ghost"
+            onClick={promote}
+            disabled={busy}
+            title="Download this use case to import into another environment"
+          >
+            {busyAction === 'promote' ? (
+              <BrandSpinner state="working" label="Packaging…" />
+            ) : (
+              'Export for another environment'
+            )}
+          </button>
           <button type="button" className="ghost" onClick={exportScript} disabled={busy}>
             {busyAction === 'exportScript' ? (
               <BrandSpinner state="working" label="Writing it out…" />

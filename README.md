@@ -708,6 +708,58 @@ through a ladder would be the engine reimplemented in generated code. It is a
 good starting point and a worse runner than the engine, and the file says so at
 the top where somebody will read it.
 
+#### Moving a use case between environments
+
+Record once, against dev, and move the document. Re-recording in each
+environment produces three documents that drift apart, which is the thing this
+exists to prevent.
+
+**Export** is on the use case screen and downloads a `.trace.json` file.
+**Import** is on the Use cases screen and takes that file. It works in every
+direction: dev to UAT, UAT to production, and back from UAT into dev when you
+want to reproduce something.
+
+What does not travel, and why. It always arrives as a **draft**, because
+publishing re-validates and an approval given in dev is not an approval in
+UAT. Permission to run JavaScript always arrives **off**, because that is
+granted by a person who has read the code, and code approved against dev's data
+should not execute against production's. Credentials never travel at all:
+a definition carries secret *slot names*, and each environment keeps its own
+values under its own key.
+
+The id is preserved, so one use case is the same use case everywhere and a run
+in UAT lines up against the run in dev it came from. Importing a revision
+appends a version rather than making a second use case.
+
+**The import tells you what this environment still needs.** That matters more
+than it sounds. A definition carries the address it was recorded against as a
+fallback, so a use case promoted from dev into UAT will happily run against
+dev unless a target answers for it. The import names that, names any credential
+slot nothing here can fill, and says nothing at all when the environment is
+ready.
+
+#### Which models you can pick
+
+The picker lists what your AWS account can actually reach, which is usually far
+more than the three Claude models the configuration names: Bedrock is asked
+what it carries, and cross-region models are offered by the inference profile
+id that actually runs rather than by a bare model id that would fail the moment
+you chose it. If the account cannot list models, the configured list still
+works and the picker says which IAM permission is missing. `BEDROCK_DISCOVER=false`
+stops it asking.
+
+A listed model is not a proven one, and the difference matters: a region can
+carry a model your account has not been granted. The check button beside each
+one makes a single tiny call, which is the only thing that can tell you.
+
+**OpenRouter can be switched off entirely.** `OPENROUTER_ENABLED=false` and
+nothing in this application contacts a third party for a model: the provider
+cannot be chosen, no client can be built for it, and its model catalogue is
+never fetched, which is itself a request to openrouter.ai and the easiest one
+to forget. Set it false before taking the application anywhere that must not
+send a byte outside its own infrastructure. The picker still shows OpenRouter,
+greyed out, saying why.
+
 #### Credentials
 
 Save a sign-in once, under **Credentials**, and pick it under "Sign in as" when

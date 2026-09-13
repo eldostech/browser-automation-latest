@@ -783,3 +783,127 @@ async def test_an_older_version_can_be_exported(client: TestClient):
 
 async def test_exporting_an_unknown_use_case_is_a_404(client: TestClient):
     assert client.get("/api/usecases/nope/export/python").status_code == 404
+
+
+# --- promoting a use case between environments ----------------------------
+#
+# The import endpoint existed on its own: a definition could arrive from
+# another environment and there was no way to get one out. And the hazard
+# nobody was warned about: a definition carries `base_url`, the address it was
+# recorded against, as the fallback when no target answers -- so a use case
+# promoted from dev into UAT runs, and runs against dev.
+
+
+async def test_a_use_case_can_be_exported_as_a_document(client: TestClient):
+    usecase_id = await seed_usecase(client)
+
+    body = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    assert body["trace_export"] == 1
+    assert body["source"]["usecase_id"] == usecase_id
+    assert body["definition"]["name"] == "Sign in and open a record"
+    assert body["exported_by"], "who exported it, for whoever receives it"
+
+
+async def test_the_document_carries_slots_and_never_a_value(client: TestClient):
+    """The property that makes promotion safe, and it belongs to the document
+    rather than to the endpoint: each environment supplies its own values."""
+    usecase_id = await seed_usecase(client)
+
+    body = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    assert [s["name"] for s in body["definition"]["secrets"]] == ["username", "password"]
+    assert "value" not in str(body["definition"]["secrets"])
+
+
+async def test_an_exported_document_can_be_imported_back(client: TestClient):
+    """The round trip, which is the whole feature: dev to UAT and back again
+    for testing."""
+    usecase_id = await seed_usecase(client)
+    document = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    landed = client.post("/api/usecases/import", json=document)
+
+    assert landed.status_code == 201, landed.text
+    assert landed.json()["usecase_id"] == usecase_id, "the same use case, not a copy"
+    assert landed.json()["version"] == 2, "a version, not a duplicate"
+    assert landed.json()["status"] == "draft"
+
+
+async def test_a_bare_definition_still_imports(client: TestClient):
+    """What this endpoint took before an export existed, and what a document
+    assembled by hand looks like."""
+    usecase_id = await seed_usecase(client)
+    definition = client.get(f"/api/usecases/{usecase_id}").json()["definition"]
+
+    landed = client.post("/api/usecases/import", json=definition)
+
+    assert landed.status_code == 201, landed.text
+
+
+async def test_an_export_from_a_newer_build_is_refused_with_the_reason(client: TestClient):
+    response = client.post(
+        "/api/usecases/import",
+        json={"trace_export": 99, "definition": {"name": "x"}},
+    )
+
+    assert response.status_code == 422
+    assert "newer version" in response.json()["detail"]
+
+
+async def test_importing_says_a_named_target_is_missing_here(client: TestClient):
+    """The dangerous case. Without the target, this runs against the address it
+    was recorded against, which is another environment."""
+    usecase_id = await seed_usecase(
+        client, target="vendor-dev", base_url="https://dev.vendor.example"
+    )
+    document = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    landed = client.post("/api/usecases/import", json=document).json()
+
+    said = " ".join(landed["warnings"])
+    assert "vendor-dev" in said
+    assert "https://dev.vendor.example" in said, "and where it would go instead"
+    assert "wrong environment" in said
+
+
+async def test_importing_says_which_credential_slots_are_missing(client: TestClient):
+    """Credentials never travel, so the first question in a new environment is
+    which ones it still needs."""
+    usecase_id = await seed_usecase(client)
+    document = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    landed = client.post("/api/usecases/import", json=document).json()
+
+    said = " ".join(landed["warnings"])
+    assert "username" in said and "password" in said
+    assert "never travel" in said
+
+
+async def test_nothing_is_flagged_once_the_environment_can_answer(client: TestClient):
+    """A promotion that is ready to run says nothing, which is what makes the
+    warnings worth reading when they appear."""
+    usecase_id = await seed_usecase(
+        client, target="vendor", base_url="https://dev.vendor.example"
+    )
+    # A target is saved by name, under PUT -- promoting is the one flow where
+    # "the environment already answers for this" is the point.
+    client.put("/api/targets/vendor", json={"base_url": "https://uat.vendor.example"})
+    # This app is built without a credentials key, so the vault refuses. The
+    # slots are written straight into the store instead: what is under test is
+    # the import's reading of them, not the vault.
+    from conftest import app_workspace
+
+    store = await app_workspace(client.app)
+    await store.save_credential(
+        "cred-1", "vendor", ["username", "password"], b"ciphertext", owner_id=None
+    )
+    document = client.get(f"/api/usecases/{usecase_id}/export").json()
+
+    landed = client.post("/api/usecases/import", json=document).json()
+
+    assert landed["warnings"] == []
+
+
+async def test_exporting_an_unknown_use_case_is_a_404(client: TestClient):
+    assert client.get("/api/usecases/nope/export").status_code == 404

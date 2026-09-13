@@ -76,6 +76,26 @@ with a purpose per step onto `Step.intent`. Neither pass can add, remove or
 alter a step; both are failure-tolerant, because the recording is the expensive
 part and prose is not allowed to cost one.
 
+**OpenRouter can be switched off completely, and that is a kill switch rather
+than a preference.** `OPENROUTER_ENABLED=false` means the provider is not
+resolvable (`ModelChoice.resolve`), not buildable (`build_llm`, `chat_model`),
+and its catalogue is never fetched -- that last one being an HTTP request to
+openrouter.ai and the path most easily forgotten, since `prices_for` reads it
+from the costing layer. `Settings.openrouter_available` is the single predicate
+so "disabled" and "no key" cannot drift apart, `LLM_PROVIDER=openrouter` with
+it false is refused at startup, and `tests/test_models.py` asserts every path
+refuses. Asked for by an operator taking this into a company: off has to mean
+no packet, not "no feature I can think of".
+
+**Bedrock models are discovered, with the configured list kept.** `catalog.py`
+reads `ListFoundationModels` *and* `ListInferenceProfiles`, because a model
+whose only inference type is `INFERENCE_PROFILE` cannot be invoked by its own
+id and the `us.`-prefixed profile is what runs. Discovery is additive and
+degrades to `BEDROCK_MODELS` with the missing IAM permission named; the check
+button is the only thing that can tell "listed by the region" from "invokable
+by this account". `conftest.test_settings` forces `bedrock_discover` off, since
+the suite's guarantee is that a default run makes no network call.
+
 **Two model providers, chosen per request.** `llm.ModelChoice` is a
 `(provider, model)` pair; `llm.ModelPool` caches a client per choice. Bedrock is
 a configured list, OpenRouter is a live catalogue (`catalog.py`, fetched and
@@ -128,6 +148,19 @@ to catch up after a reconnect.
 - **`engine.py` must never import `llm`.** `UseCaseExecutor` has no parameter that
   could accept a model client; a healer is *injected*. `tests/test_e2e_engine.py`
   and `tests/test_healing.py` assert the absence of `import llm` in the source.
+- **A promotion is a document, and the import says what is still missing.**
+  `GET /usecases/{id}/export` wraps the definition with where it came from;
+  `POST /usecases/import` takes that envelope or a bare definition, forces
+  `status=draft` and `allow_scripts=false`, drops `source_run_id`, and keeps
+  the id so a revision appends a version rather than duplicating. Nothing
+  sensitive travels: secrets are slot *names* and each environment supplies its
+  own values. The hazard worth knowing is quieter than a failure -- a
+  definition carries `base_url` as the fallback when no target answers, so a
+  use case promoted from dev into UAT *runs*, against dev. `_promotion_gaps`
+  therefore reports a named target this deployment does not have, a missing
+  target where only a recorded address remains, and credential slots nothing
+  here can fill. Warnings, not refusals: an import is how a document arrives,
+  and refusing it leaves nowhere to fix the gap from.
 - **Tenancy is enforced by construction.** Scoped operations live on
   `WorkspaceStore` (`store.workspace(id)`), never on `Store`. Adding a scoped query
   to `Store` removes the guarantee that a forgotten filter cannot compile. Only
